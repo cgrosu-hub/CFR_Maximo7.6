@@ -1,9 +1,10 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.5-LAYER-OVER-BALANCE
+# VERSIUNE: 5.6-VOIDRECEIPT
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
+# VOIDRECEIPT anuleaza stoc pe acelasi pret (preferinta: receptia cea mai recenta).
 # Conventie: N + MOTIV=ORDINE_DATE daca deficitul poate fi asociat unor intrari
 # ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
 # ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
@@ -80,7 +81,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.5-LAYER-OVER-BALANCE"
+VERSION = "5.6-VOIDRECEIPT"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -94,7 +95,8 @@ COST_TOLERANCE = ExactNumber("0.0005")
 QTY_TOLERANCE = ExactNumber("0.000001")
 ENTRY_TYPES = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 EXIT_TYPES = ("ISSUE", "SHIPTRANSFER", "TRANSFER")
-AMBIGUOUS_TYPES = ("SHIPCANCEL", "VOIDRECEIPT", "VOIDSHIPRECEIPT", "SHIPRETURN", "RECBALADJ")
+VOID_TYPES = ("VOIDRECEIPT",)
+AMBIGUOUS_TYPES = ("SHIPCANCEL", "VOIDSHIPRECEIPT", "SHIPRETURN", "RECBALADJ")
 def txt(value):
     return "" if value is None else string_type(value)
 
@@ -180,6 +182,26 @@ def consume(layers, required):
             layer["qty"] -= take
     layers[:] = [layer for layer in layers if layer["qty"] > QTY_TOLERANCE]
     return allocations
+
+def consume_at_cost(layers, required, cost, newest_first=False):
+    # VOIDRECEIPT anuleaza pe pret; newest_first leaga de receptia recenta anulata.
+    allocations = []
+    indexes = range(len(layers) - 1, -1, -1) if newest_first else range(len(layers))
+    for index in indexes:
+        if required <= QTY_TOLERANCE:
+            break
+        layer = layers[index]
+        if far(layer["cost"], cost, COST_TOLERANCE):
+            continue
+        take = min(required, layer["qty"])
+        if take > ZERO:
+            allocation = dict(layer)
+            allocation["qty"] = take
+            allocations.append(allocation)
+            required -= take
+            layer["qty"] -= take
+    layers[:] = [layer for layer in layers if layer["qty"] > QTY_TOLERANCE]
+    return allocations, required
 
 def info_plaintext(value):
     value = txt(value).replace("<!-- RICH TEXT -->", "")
@@ -426,6 +448,24 @@ def audit_rows(rows):
                 local_prices.add(expected)
                 local_started=True
                 continue
+            if kind in VOID_TYPES:
+                if qty>=-QTY_TOLERANCE:
+                    rec["reason"]="VOIDRECEIPT fara cantitate negativa"
+                    continue
+                required=-qty
+                available=sum((l["qty"] for l in layers if not far(l["cost"],cost,COST_TOLERANCE)),ZERO)
+                if available+QTY_TOLERANCE<required:
+                    rec["reason"]="Stoc pe pret insuficient pentru VOIDRECEIPT"
+                    continue
+                allocations,short=consume_at_cost(layers,required,cost,newest_first=True)
+                if short>QTY_TOLERANCE or not allocations:
+                    rec["reason"]="VOIDRECEIPT nu a putut anula stocul pe pret"
+                    continue
+                rec["allocations"]=allocations
+                rec["expected"]=cost
+                rec["status"]="OK"
+                local_started=True
+                continue
             if kind in AMBIGUOUS_TYPES:
                 structural="Tip %s fara alocare verificabila in jurnal" % kind
                 rec["reason"]=structural
@@ -591,6 +631,8 @@ def description_visible(old, record, summary):
     status=record["status"]
     if status=="DATE_ORDER":
         info="OK: pret compatibil %s; intrare ulterioara cu RefID anterior; data iesirii de verificat (conventie)" % fmt_ro(record["expected"])
+    elif status=="OK" and row.get("kind")=="VOIDRECEIPT":
+        info="OK: VOIDRECEIPT anuleaza %s buc. la %s" % (fmt_ro(-row["qty"]),fmt_ro(record["expected"]))
     elif status=="OK":
         info="OK: FIFO LOCAL asteptat %s" % fmt_ro(record["expected"])
     elif status=="BAD":
@@ -857,8 +899,8 @@ def informative_reconciliation(inventory,rows,script_service):
         close_set(ms)
 
 def check_layer_beats_negative_balance():
-    def row(ident, date, ref, kind, qty, cost, balance):
-        return {"id":ident,"group":"G","date":date,"ref_id":ref,"ref_mbo":"MATRECTRANS",
+    def row(ident, date, ref, kind, qty, cost, balance, mbo="MATRECTRANS"):
+        return {"id":ident,"group":"G","date":date,"ref_id":ref,"ref_mbo":mbo,
                 "kind":kind,"qty":ExactNumber(qty),"cost":ExactNumber(cost),"balance":ExactNumber(balance)}
     audit=audit_rows([
         row(1,"2026-06-01 00:00:00.000000000",300,"SHIPTRANSFER","-10","9.098","-10"),
@@ -877,6 +919,18 @@ def check_layer_beats_negative_balance():
     ])
     if blocked["records"][2]["status"]!="UNVERIFIED":
         raise ValueError("self-check: iesirea fara stoc nu trebuie certificata")
+    voided=audit_rows([
+        row(1,"2026-09-07 00:00:00.000000000",10,"RECEIPT","50319","9.846","50319"),
+        row(2,"2026-09-11 00:00:00.000000000",20,"RECEIPT","172","9.846","50491"),
+        row(3,"2026-09-11 00:00:00.000000000",30,"VOIDRECEIPT","-172","9.846","50319"),
+        row(4,"2026-09-12 00:00:00.000000000",40,"ISSUE","-542","9.846","49777","MATUSETRANS"),
+    ])
+    if voided["records"][3]["status"]!="OK":
+        raise ValueError("self-check: VOIDRECEIPT trebuie sa fie OK")
+    if not voided["records"][3]["allocations"] or voided["records"][3]["allocations"][0].get("source_ref_id")!=20:
+        raise ValueError("self-check: VOIDRECEIPT trebuie sa anuleze receptia recenta")
+    if voided["records"][4]["status"]!="OK":
+        raise ValueError("self-check: ISSUE dupa VOIDRECEIPT trebuie verificat")
 
 def run_local(inventory,script_service):
     from psdi.mbo import MboConstants
