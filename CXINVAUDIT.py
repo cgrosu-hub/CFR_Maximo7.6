@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.7-LAYERS-SITUATION
+# VERSIUNE: 5.8-LAYERS-TOTALURI
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -9,7 +9,7 @@
 # ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
 # ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
 # MATRECTRANS se citeste numai pentru FROMSTORELOC afisat pe intrari.
-# Popup final: SITUATIE STRATURI FIFO (CXSTOCURI) = straturi ramase (UNITCOST/SOLD/CXREF*).
+# Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
 # Scrie numai DESCRIPTION_LONGDESCRIPTION. Nu modifica date/cantitati/preturi/solduri.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
@@ -81,7 +81,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.7-LAYERS-SITUATION"
+VERSION = "5.8-LAYERS-TOTALURI"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -848,6 +848,19 @@ def price_label(value):
     rounded=fmt(value)
     return (rounded if dec(rounded)==value else txt(value)).replace(".",",")
 
+def recorded_balances_by_cost(rows):
+    last={}
+    for row in sorted(rows,key=order):
+        if row.get("cost") is None or not row.get("date"):
+            raise ValueError("Pret/data lipsa; sold final nedeterminabil")
+        last[(row.get("group") or "",row["cost"])]=row
+    totals={}
+    for key,row in last.items():
+        if row.get("balance") is None:
+            raise ValueError("Sold final lipsa")
+        totals[key[1]]=totals.get(key[1],ZERO)+row["balance"]
+    return totals
+
 def fifo_layers_situation(rows,audit,script_service):
     by_id=dict((r["id"],r) for r in rows)
     layers=list(audit.get("layers") or [])
@@ -874,6 +887,42 @@ def fifo_layers_situation(rows,audit,script_service):
         visible.append("  Primele %s straturi; detalii complete in log." % MAX_LAYER_LINES)
     visible.append("  TOTAL SOLD: %s" % fmt_ro(total))
     return "\n".join(visible)
+
+def invlifo_totals(inventory,rows,script_service):
+    # TOTALURI ca in reconcilierea veche: cantitate/valoare CXSTOCURI vs INVLIFOFIFOCOST.
+    ms=None
+    try:
+        journal=recorded_balances_by_cost(rows)
+        ms=open_scope(inventory,"INVLIFOFIFOCOST",True)
+        official,count,invalid={},0,0
+        m=ms.moveFirst()
+        while m is not None:
+            count+=1
+            if count>MAX_ROWS:
+                raise ValueError("Limita de straturi oficiale depasita")
+            price,qty=numeric_field(m,"UNITCOST"),numeric_field(m,"QUANTITY")
+            if price is None or qty is None:
+                raise ValueError("Strat oficial fara pret/cantitate")
+            invalid+=1 if price<ZERO or qty<ZERO else 0
+            official[price]=official.get(price,ZERO)+qty
+            m=ms.moveNext()
+        jq,fq=sum(journal.values(),ZERO),sum(official.values(),ZERO)
+        jv=sum((p*q for p,q in journal.items()),ZERO)
+        fv=sum((p*q for p,q in official.items()),ZERO)
+        lines=["TOTALURI",
+               "  Cantitate: CXSTOCURI %s | INVLIFOFIFOCOST %s | diferenta %s" % (fmt_ro(jq),fmt_ro(fq),fmt_ro(jq-fq)),
+               "  Valoare: CXSTOCURI %s | INVLIFOFIFOCOST %s | diferenta %s" % (fmt_ro(jv),fmt_ro(fv),fmt_ro(jv-fv))]
+        if count==0:
+            lines.append("  INVLIFOFIFOCOST nu are randuri. Comparatia foloseste zero.")
+        if invalid:
+            lines.append("  INVLIFOFIFOCOST cu pret sau cantitate negativa: %s." % invalid)
+        script_service.log_info("CXINVAUDIT TOTALURI: "+" | ".join(lines))
+        return "\n".join(lines)
+    except Exception as exc:
+        script_service.log_info("CXINVAUDIT TOTALURI indisponibile: "+txt(exc))
+        return "TOTALURI INDISPONIBILE: %s. Auditul local ramane valabil." % txt(exc)
+    finally:
+        close_set(ms)
 
 def check_layer_beats_negative_balance():
     def row(ident, date, ref, kind, qty, cost, balance, mbo="MATRECTRANS"):
@@ -953,6 +1002,7 @@ def run_local(inventory,script_service):
             root.save()
         message=local_summary(audit,unknown)
         message+="\n\n"+fifo_layers_situation(rows,audit,script_service)
+        message+="\n\n"+invlifo_totals(inventory,rows,script_service)
         script_service.log_info("CXINVAUDIT "+VERSION+": "+message.replace("\n"," | "))
     finally:
         close_set(verify)
