@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.8-LAYERS-TOTALURI
+# VERSIUNE: 5.9-INVLIFO-ALIGN
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -10,7 +10,9 @@
 # ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
 # MATRECTRANS se citeste numai pentru FROMSTORELOC afisat pe intrari.
 # Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
-# Scrie numai DESCRIPTION_LONGDESCRIPTION. Nu modifica date/cantitati/preturi/solduri.
+# Daca INVBALANCES.CURBAL == total straturi CXSTOCURI: aliniaza INVLIFOFIFOCOST
+# (sterge surplus/duplicate, actualizeaza cantitati, creeaza lipsa) la acele straturi.
+# Scrie DESCRIPTION_LONGDESCRIPTION; pe conditia de mai sus si INVLIFOFIFOCOST.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -81,7 +83,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.8-LAYERS-TOTALURI"
+VERSION = "5.9-INVLIFO-ALIGN"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -861,23 +863,40 @@ def recorded_balances_by_cost(rows):
         totals[key[1]]=totals.get(key[1],ZERO)+row["balance"]
     return totals
 
-def fifo_layers_situation(rows,audit,script_service):
+def normalize_ref_mbo(value):
+    text=txt(value).strip()
+    if not text or text=="-":
+        return None
+    return text
+
+def desired_fifo_layers(rows,audit):
     by_id=dict((r["id"],r) for r in rows)
-    layers=list(audit.get("layers") or [])
-    layers.sort(key=lambda layer:(layer.get("priority") or ("",0,0),layer.get("source") or 0))
+    layers=[]
+    for layer in list(audit.get("layers") or []):
+        src=by_id.get(layer.get("source"))
+        ref_mbo=normalize_ref_mbo(layer.get("source_ref_mbo") or (None if src is None else src.get("ref_mbo")))
+        ref_id=layer.get("source_ref_id")
+        if ref_id is None and src is not None:
+            ref_id=src.get("ref_id")
+        layers.append({
+            "cost":layer["cost"],"qty":layer["qty"],"ref_mbo":ref_mbo,"ref_id":ref_id,
+            "priority":layer.get("priority") or ("",0,0),"source":layer.get("source"),
+            "date":None if src is None else src.get("date"),"initial":bool(layer.get("initial")),
+        })
+    layers.sort(key=lambda layer:(layer["priority"],layer.get("source") or 0))
+    return layers
+
+def fifo_layers_situation(rows,audit,script_service):
+    layers=desired_fifo_layers(rows,audit)
     title="SITUATIE STRATURI FIFO (CXSTOCURI)"
     lines=[title,"  UNITCOST | SOLD | CXREFMBO | CXREFID"]
     detail=[]
     total=ZERO
     for layer in layers:
-        src=by_id.get(layer.get("source"))
-        mbo=layer.get("source_ref_mbo") or (None if src is None else src.get("ref_mbo")) or "-"
-        ref=layer.get("source_ref_id")
-        if ref is None and src is not None:
-            ref=src.get("ref_id")
         detail.append("  %s | %s | %s | %s" % (
-            price_label(layer["cost"]),fmt_ro(layer["qty"]),txt(mbo),
-            "-" if ref is None else txt(ref)))
+            price_label(layer["cost"]),fmt_ro(layer["qty"]),
+            "-" if layer["ref_mbo"] is None else txt(layer["ref_mbo"]),
+            "-" if layer["ref_id"] is None else txt(layer["ref_id"])))
         total+=layer["qty"]
     if not detail:
         detail.append("  (niciun strat ramas)")
@@ -886,7 +905,172 @@ def fifo_layers_situation(rows,audit,script_service):
     if len(detail)>MAX_LAYER_LINES:
         visible.append("  Primele %s straturi; detalii complete in log." % MAX_LAYER_LINES)
     visible.append("  TOTAL SOLD: %s" % fmt_ro(total))
-    return "\n".join(visible)
+    return "\n".join(visible),total
+
+def same_ref(left_mbo,left_id,right_mbo,right_id):
+    return normalize_ref_mbo(left_mbo)==normalize_ref_mbo(right_mbo) and left_id==right_id
+
+def plan_invlifo_alignment(desired,current):
+    # Match pe pret+REFOBJECT+REFOBJECTID; prefera QUANTITY exacta, apoi id mai mic.
+    unused=list(current)
+    updates,keeps,creates=[],[],[]
+    for layer in desired:
+        candidates=[]
+        for row in unused:
+            if far(row["cost"],layer["cost"],COST_TOLERANCE):
+                continue
+            if not same_ref(row.get("ref_mbo"),row.get("ref_id"),layer.get("ref_mbo"),layer.get("ref_id")):
+                continue
+            candidates.append(row)
+        if not candidates:
+            creates.append(layer)
+            continue
+        exact=[row for row in candidates if not far(row["qty"],layer["qty"],QTY_TOLERANCE)]
+        pool=exact or candidates
+        pool.sort(key=lambda row:(0 if not far(row["qty"],layer["qty"],QTY_TOLERANCE) else 1,row["id"]))
+        chosen=pool[0]
+        unused.remove(chosen)
+        if far(chosen["qty"],layer["qty"],QTY_TOLERANCE):
+            updates.append({"row":chosen,"qty":layer["qty"]})
+        else:
+            keeps.append(chosen)
+    return keeps,updates,unused,creates
+
+def parse_layer_date(value):
+    if not value:
+        return None
+    from java.text import SimpleDateFormat
+    from java.util import TimeZone
+    f=SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    f.setTimeZone(TimeZone.getTimeZone("UTC"))
+    return f.parse(txt(value)[:19])
+
+def read_invbalances_curbal(inventory):
+    from psdi.server import MXServer
+    from psdi.mbo import SqlFormat
+    ms=None
+    try:
+        ms=MXServer.getMXServer().getMboSet("INVBALANCES",inventory.getUserInfo())
+        condition=SqlFormat("ITEMNUM=:1 AND SITEID=:2 AND LOCATION=:3")
+        condition.setObject(1,"INVBALANCES","ITEMNUM",inventory.getString("ITEMNUM"))
+        condition.setObject(2,"INVBALANCES","SITEID",inventory.getString("SITEID"))
+        condition.setObject(3,"INVBALANCES","LOCATION",inventory.getString("LOCATION"))
+        ms.setWhere(condition.format())
+        ms.reset()
+        total,count=ZERO,0
+        m=ms.moveFirst()
+        while m is not None:
+            count+=1
+            if count>MAX_ROWS:
+                raise ValueError("Limita INVBALANCES depasita")
+            qty=numeric_field(m,"CURBAL")
+            if qty is None:
+                raise ValueError("INVBALANCES.CURBAL lipsa")
+            total+=qty
+            m=ms.moveNext()
+        if count==0:
+            raise ValueError("INVBALANCES lipsa pentru articol/gestiune")
+        return total
+    finally:
+        close_set(ms)
+
+def put_invlifo_number(mbo,field,value):
+    from psdi.mbo import MboConstants
+    flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
+    current=numeric_field(mbo,field)
+    if current is not None and not far(current,value,QTY_TOLERANCE):
+        return False
+    mbo.setValue(field,txt(value),flags)
+    written=numeric_field(mbo,field)
+    if written is None or far(written,value,QTY_TOLERANCE):
+        raise ValueError("Nu pot scrie %s=%s pe INVLIFOFIFOCOST" % (field,txt(value)))
+    return True
+
+def sync_invlifofifocost(inventory,rows,audit,script_service):
+    from psdi.mbo import MboConstants
+    flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
+    desired=desired_fifo_layers(rows,audit)
+    layers_qty=sum((layer["qty"] for layer in desired),ZERO)
+    try:
+        curbal=read_invbalances_curbal(inventory)
+    except Exception as exc:
+        msg="CORECTIE INVLIFOFIFOCOST: sarita (%s)" % txt(exc)
+        script_service.log_info("CXINVAUDIT "+msg)
+        return msg
+    if far(curbal,layers_qty,QTY_TOLERANCE):
+        msg="CORECTIE INVLIFOFIFOCOST: sarita (CURBAL %s != CXSTOCURI %s)" % (
+            fmt_ro(curbal),fmt_ro(layers_qty))
+        script_service.log_info("CXINVAUDIT "+msg)
+        return msg
+    ms=None
+    try:
+        ms=open_scope(inventory,"INVLIFOFIFOCOST",True)
+        current=[]
+        m=ms.moveFirst()
+        while m is not None:
+            if len(current)>=MAX_ROWS:
+                raise ValueError("Limita INVLIFOFIFOCOST depasita")
+            price,qty=numeric_field(m,"UNITCOST"),numeric_field(m,"QUANTITY")
+            if price is None or qty is None:
+                raise ValueError("INVLIFOFIFOCOST fara pret/cantitate")
+            current.append({
+                "id":m.getLong("INVLIFOFIFOCOSTID"),"cost":price,"qty":qty,
+                "ref_mbo":None if m.isNull("REFOBJECT") else m.getString("REFOBJECT"),
+                "ref_id":None if m.isNull("REFOBJECTID") else m.getLong("REFOBJECTID"),
+                "mbo":m,
+            })
+            m=ms.moveNext()
+        keeps,updates,deletes,creates=plan_invlifo_alignment(desired,current)
+        if not updates and not deletes and not creates:
+            msg="CORECTIE INVLIFOFIFOCOST: deja aliniat la straturile CXSTOCURI"
+            script_service.log_info("CXINVAUDIT "+msg)
+            return msg
+        for item in updates:
+            put_invlifo_number(item["row"]["mbo"],"QUANTITY",item["qty"])
+        for row in deletes:
+            row["mbo"].delete(flags)
+        for layer in creates:
+            created=ms.add()
+            created.setValue("ITEMNUM",inventory.getString("ITEMNUM"),flags)
+            created.setValue("SITEID",inventory.getString("SITEID"),flags)
+            created.setValue("LOCATION",inventory.getString("LOCATION"),flags)
+            created.setValue("ORGID",inventory.getString("ORGID"),flags)
+            created.setValue("ITEMSETID",inventory.getString("ITEMSETID"),flags)
+            created.setValue("COSTTYPE","FIFO",flags)
+            if not inventory.isNull("CONDITIONCODE"):
+                created.setValue("CONDITIONCODE",inventory.getString("CONDITIONCODE"),flags)
+            put_invlifo_number(created,"UNITCOST",layer["cost"])
+            put_invlifo_number(created,"QUANTITY",layer["qty"])
+            if layer["ref_mbo"] is None:
+                created.setValueNull("REFOBJECT",flags)
+            else:
+                created.setValue("REFOBJECT",layer["ref_mbo"],flags)
+            if layer["ref_id"] is None:
+                created.setValueNull("REFOBJECTID",flags)
+            else:
+                created.setValue("REFOBJECTID",long(layer["ref_id"]),flags)
+                if layer["ref_mbo"]:
+                    created.setValue("CONDRATE",100,flags)
+            costdate=parse_layer_date(layer.get("date"))
+            if costdate is not None:
+                created.setValue("COSTDATE",costdate,flags)
+        ms.save()
+        msg="\n".join([
+            "CORECTIE INVLIFOFIFOCOST",
+            "  Conditie: CURBAL = CXSTOCURI = %s" % fmt_ro(curbal),
+            "  Pastrate: %s" % len(keeps),
+            "  Actualizate: %s" % len(updates),
+            "  Sterse: %s" % len(deletes),
+            "  Create: %s" % len(creates),
+        ])
+        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
+        return msg
+    except Exception as exc:
+        msg="CORECTIE INVLIFOFIFOCOST ESUATA: %s" % txt(exc)
+        script_service.log_info("CXINVAUDIT "+msg)
+        return msg
+    finally:
+        close_set(ms)
 
 def invlifo_totals(inventory,rows,script_service):
     # TOTALURI ca in reconcilierea veche: cantitate/valoare CXSTOCURI vs INVLIFOFIFOCOST.
@@ -964,6 +1148,22 @@ def check_layer_beats_negative_balance():
         raise ValueError("self-check: provenienta stratului ramas e gresita")
     if layers[0].get("source_ref_mbo")!="MATRECTRANS":
         raise ValueError("self-check: CXREFMBO stratului ramas lipseste")
+    desired=[
+        {"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
+        {"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
+        {"cost":ExactNumber("17.500"),"qty":ExactNumber("570"),"ref_mbo":None,"ref_id":None},
+    ]
+    current=[
+        {"id":1,"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
+        {"id":2,"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
+        {"id":3,"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
+        {"id":4,"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
+        {"id":5,"cost":ExactNumber("17.500"),"qty":ExactNumber("570"),"ref_mbo":None,"ref_id":None},
+        {"id":6,"cost":ExactNumber("12.640"),"qty":ExactNumber("100"),"ref_mbo":None,"ref_id":None},
+    ]
+    keeps,updates,deletes,creates=plan_invlifo_alignment(desired,current)
+    if updates or creates or len(keeps)!=3 or sorted(r["id"] for r in deletes)!=[2,4,6]:
+        raise ValueError("self-check: alinierea INVLIFOFIFOCOST nu elimina duplicatele corect")
 
 def run_local(inventory,script_service):
     from psdi.mbo import MboConstants
@@ -1001,7 +1201,9 @@ def run_local(inventory,script_service):
         if changed:
             root.save()
         message=local_summary(audit,unknown)
-        message+="\n\n"+fifo_layers_situation(rows,audit,script_service)
+        layers_text,unused_total=fifo_layers_situation(rows,audit,script_service)
+        message+="\n\n"+layers_text
+        message+="\n\n"+sync_invlifofifocost(inventory,rows,audit,script_service)
         message+="\n\n"+invlifo_totals(inventory,rows,script_service)
         script_service.log_info("CXINVAUDIT "+VERSION+": "+message.replace("\n"," | "))
     finally:
