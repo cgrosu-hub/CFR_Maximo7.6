@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.6-VOIDRECEIPT
+# VERSIUNE: 5.7-LAYERS-SITUATION
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -9,7 +9,7 @@
 # ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
 # ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
 # MATRECTRANS se citeste numai pentru FROMSTORELOC afisat pe intrari.
-# INVLIFOFIFOCOST se citeste numai pentru reconcilierea informativa finala.
+# Popup final: SITUATIE STRATURI FIFO (CXSTOCURI) = straturi ramase (UNITCOST/SOLD/CXREF*).
 # Scrie numai DESCRIPTION_LONGDESCRIPTION. Nu modifica date/cantitati/preturi/solduri.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
@@ -81,11 +81,11 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.6-VOIDRECEIPT"
+VERSION = "5.7-LAYERS-SITUATION"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
-MAX_RECON_LINES = 30
+MAX_LAYER_LINES = 30
 FIX_PREFIX = "CXFIFO_FIX1|"
 BEGIN = "CXFIFO_AUDIT_V2_BEGIN"
 END = "CXFIFO_AUDIT_V2_END"
@@ -329,12 +329,13 @@ def apply_date_order_policy(group_rows,records):
         rec["reason"]="Pret compatibil cu intrare ulterioara cu RefID anterior; data iesirii trebuie verificata"
         rec["date_candidates"]=proposed
 
-def put_back(layers,qty,cost,priority,source,source_ref):
+def put_back(layers,qty,cost,priority,source,source_ref,source_ref_mbo=None):
     for layer in layers:
         if not far(layer["cost"],cost,COST_TOLERANCE) and layer.get("priority")==priority:
             layer["qty"]+=qty
             return
-    layers.append({"qty":qty,"cost":cost,"source":source,"source_ref_id":source_ref,"initial":False,"priority":priority})
+    layers.append({"qty":qty,"cost":cost,"source":source,"source_ref_id":source_ref,
+                   "source_ref_mbo":source_ref_mbo,"initial":False,"priority":priority})
     layers.sort(key=lambda layer: layer["priority"])
 
 def return_target(row,group_rows,records):
@@ -363,7 +364,7 @@ def audit_rows(rows):
     records=dict((r["id"],new_local_record(r)) for r in rows)
     if len(records)!=len(rows):
         raise ValueError("CXSTOCURIID duplicat")
-    groups,issues={},[]
+    groups,issues,remaining_layers={},[],[]
     for row in rows:
         groups.setdefault(row.get("group") or "",[]).append(row)
     ledger=ZERO
@@ -423,7 +424,8 @@ def audit_rows(rows):
                 has_initial=True
                 if balance>QTY_TOLERANCE:
                     layers.append({"qty":balance,"cost":cost,"source":row["id"],
-                                   "source_ref_id":row.get("ref_id"),"initial":True,"priority":order(row)})
+                                   "source_ref_id":row.get("ref_id"),"source_ref_mbo":row.get("ref_mbo"),
+                                   "initial":True,"priority":order(row)})
                 rec["status"]="INITIAL"
                 continue
             movement=True
@@ -444,7 +446,9 @@ def audit_rows(rows):
                 rec["status"]="BAD" if far(cost,expected,COST_TOLERANCE) else "OK"
                 rec["allocations"]=[{"qty":qty,"cost":expected,"source":source,"source_ref_id":source_ref,
                                      "initial":False,"priority":priority}]
-                put_back(layers,qty,expected,priority,source,source_ref)
+                origin=records.get(source)
+                source_mbo=None if origin is None else origin["row"].get("ref_mbo")
+                put_back(layers,qty,expected,priority,source,source_ref,source_mbo)
                 local_prices.add(expected)
                 local_started=True
                 continue
@@ -490,7 +494,8 @@ def audit_rows(rows):
                 local_started=True
                 if available>QTY_TOLERANCE:
                     layers.append({"qty":available,"cost":cost,"source":row["id"],
-                                   "source_ref_id":row.get("ref_id"),"initial":False,"priority":order(row)})
+                                   "source_ref_id":row.get("ref_id"),"source_ref_mbo":row.get("ref_mbo"),
+                                   "initial":False,"priority":order(row)})
                     layers.sort(key=lambda l:l["priority"])
                 rec["status"]="INPUT"
                 continue
@@ -526,13 +531,17 @@ def audit_rows(rows):
         if not structural:
             apply_date_order_policy(group_rows,records)
         ledger+=sum(book.values(),ZERO)
+        for layer in layers:
+            if layer["qty"]>QTY_TOLERANCE:
+                remaining_layers.append(layer)
         if structural:
             issues.append("Grupa %s: %s" % (group or "(gol)",structural))
         elif recovering:
             issues.append("Grupa %s: segment fara baza cronologica recuperata" % (group or "(gol)"))
         if had_gap or not seen_initial:
             issues.append("Grupa %s: istoric local incomplet/reluat; trecutul nu este certificat" % (group or "(gol)"))
-    return {"records":records,"issues":issues,"ledger_qty":ledger if ledger_known else None}
+    return {"records":records,"issues":issues,"ledger_qty":ledger if ledger_known else None,
+            "layers":remaining_layers}
 def generated_compact_legacy(value):
     value = info_plaintext(value)
     if "\n" in value:
@@ -822,81 +831,49 @@ def local_summary(audit,unknown_origins):
     if return_counts["Y"]:
         verdict="DIFERENTE"
     lines=["CHECK FIFO","Verdict: "+verdict,"",
-           "Iesiri","  OK: %s" % counts["N"],"  Diferenta de pret: %s" % counts["Y"],
+           "IESIRI","  OK: %s" % counts["N"],"  Diferenta de pret: %s" % counts["Y"],
            "  Neverificate: %s" % counts["U"],
            "  Iesiri cu data de verificat: %s" % date_orders,"",
-           "Intrari","  Informative: %s" % entries,
+           "INTRARI","  Informative: %s" % entries,
            "  Avertizari de sold: %s" % warnings,
            "  Provenienta necunoscuta: %s" % unknown_origins,
            "  Cantitate ramasa in CXSTOCURI: %s" % fmt_ro(audit["ledger_qty"])]
     if returns:
-        lines.extend(["","Retururi","  OK: %s" % return_counts["N"],
+        lines.extend(["","RETURURI","  OK: %s" % return_counts["N"],
                       "  Diferenta de pret: %s" % return_counts["Y"],
                       "  Neverificate: %s" % return_counts["U"]])
     return "\n".join(lines)
-
-def recorded_balances_by_cost(rows):
-    last={}
-    for row in sorted(rows,key=order):
-        if row.get("cost") is None or not row.get("date"):
-            raise ValueError("Pret/data lipsa; sold final nedeterminabil")
-        last[(row.get("group") or "",row["cost"])]=row
-    totals={}
-    for key,row in last.items():
-        if row.get("balance") is None:
-            raise ValueError("Sold final lipsa")
-        totals[key[1]]=totals.get(key[1],ZERO)+row["balance"]
-    return totals
 
 def price_label(value):
     rounded=fmt(value)
     return (rounded if dec(rounded)==value else txt(value)).replace(".",",")
 
-def informative_reconciliation(inventory,rows,script_service):
-    ms=None
-    try:
-        journal=recorded_balances_by_cost(rows)
-        ms=open_scope(inventory,"INVLIFOFIFOCOST",True)
-        official,count,invalid={},0,0
-        m=ms.moveFirst()
-        while m is not None:
-            count+=1
-            if count>MAX_ROWS:
-                raise ValueError("Limita de straturi oficiale depasita")
-            price,qty=numeric_field(m,"UNITCOST"),numeric_field(m,"QUANTITY")
-            if price is None or qty is None:
-                raise ValueError("Strat oficial fara pret/cantitate")
-            invalid+=1 if price<ZERO or qty<ZERO else 0
-            official[price]=official.get(price,ZERO)+qty
-            m=ms.moveNext()
-        lines,differences=[],0
-        for price in sorted(set(journal)|set(official)):
-            left,right=journal.get(price,ZERO),official.get(price,ZERO)
-            bad=far(left,right,QTY_TOLERANCE)
-            differences+=1 if bad else 0
-            lines.append("Pret %s [%s]\n  CXSTOCURI %s | INVLIFOFIFOCOST %s | Diferenta %s" % (
-                price_label(price),"DIFERENTA" if bad else "OK",fmt_ro(left),fmt_ro(right),fmt_ro(left-right)))
-        jq,fq=sum(journal.values(),ZERO),sum(official.values(),ZERO)
-        jv=sum((p*q for p,q in journal.items()),ZERO)
-        fv=sum((p*q for p,q in official.items()),ZERO)
-        title="COMPARATIE CXSTOCURI / INVLIFOFIFOCOST: "+("DIFERENTE" if differences or invalid else "OK")
-        totals=["","Totaluri","  Cantitate: CXSTOCURI %s | INVLIFOFIFOCOST %s | diferenta %s" % (fmt_ro(jq),fmt_ro(fq),fmt_ro(jq-fq)),
-                "  Valoare: CXSTOCURI %s | INVLIFOFIFOCOST %s | diferenta %s" % (fmt_ro(jv),fmt_ro(fv),fmt_ro(jv-fv))]
-        notes=[]
-        if count==0:
-            notes.append("INVLIFOFIFOCOST nu are randuri. Comparatia foloseste zero.")
-        if invalid:
-            notes.append("INVLIFOFIFOCOST cu pret sau cantitate negativa: %s." % invalid)
-        script_service.log_info("CXINVAUDIT RECON COMPLET: "+" | ".join([title]+lines+totals+notes))
-        visible=[title]+lines[:MAX_RECON_LINES]
-        if len(lines)>MAX_RECON_LINES:
-            visible.append("Primele %s preturi; detalii complete in log." % MAX_RECON_LINES)
-        return "\n".join(visible+totals+notes)
-    except Exception as exc:
-        script_service.log_info("CXINVAUDIT RECON indisponibila: "+txt(exc))
-        return "COMPARATIE INDISPONIBILA: %s. Auditul local ramane valabil." % txt(exc)
-    finally:
-        close_set(ms)
+def fifo_layers_situation(rows,audit,script_service):
+    by_id=dict((r["id"],r) for r in rows)
+    layers=list(audit.get("layers") or [])
+    layers.sort(key=lambda layer:(layer.get("priority") or ("",0,0),layer.get("source") or 0))
+    title="SITUATIE STRATURI FIFO (CXSTOCURI)"
+    lines=[title,"  UNITCOST | SOLD | CXREFMBO | CXREFID"]
+    detail=[]
+    total=ZERO
+    for layer in layers:
+        src=by_id.get(layer.get("source"))
+        mbo=layer.get("source_ref_mbo") or (None if src is None else src.get("ref_mbo")) or "-"
+        ref=layer.get("source_ref_id")
+        if ref is None and src is not None:
+            ref=src.get("ref_id")
+        detail.append("  %s | %s | %s | %s" % (
+            price_label(layer["cost"]),fmt_ro(layer["qty"]),txt(mbo),
+            "-" if ref is None else txt(ref)))
+        total+=layer["qty"]
+    if not detail:
+        detail.append("  (niciun strat ramas)")
+    script_service.log_info("CXINVAUDIT LAYERS: "+" | ".join([title]+detail+["TOTAL SOLD %s" % fmt_ro(total)]))
+    visible=lines+detail[:MAX_LAYER_LINES]
+    if len(detail)>MAX_LAYER_LINES:
+        visible.append("  Primele %s straturi; detalii complete in log." % MAX_LAYER_LINES)
+    visible.append("  TOTAL SOLD: %s" % fmt_ro(total))
+    return "\n".join(visible)
 
 def check_layer_beats_negative_balance():
     def row(ident, date, ref, kind, qty, cost, balance, mbo="MATRECTRANS"):
@@ -931,6 +908,13 @@ def check_layer_beats_negative_balance():
         raise ValueError("self-check: VOIDRECEIPT trebuie sa anuleze receptia recenta")
     if voided["records"][4]["status"]!="OK":
         raise ValueError("self-check: ISSUE dupa VOIDRECEIPT trebuie verificat")
+    layers=voided.get("layers") or []
+    if len(layers)!=1 or far(layers[0]["qty"],ExactNumber("49777"),QTY_TOLERANCE):
+        raise ValueError("self-check: stratul ramas dupa VOIDRECEIPT/ISSUE e gresit")
+    if far(layers[0]["cost"],ExactNumber("9.846"),COST_TOLERANCE) or layers[0].get("source_ref_id")!=10:
+        raise ValueError("self-check: provenienta stratului ramas e gresita")
+    if layers[0].get("source_ref_mbo")!="MATRECTRANS":
+        raise ValueError("self-check: CXREFMBO stratului ramas lipseste")
 
 def run_local(inventory,script_service):
     from psdi.mbo import MboConstants
@@ -968,7 +952,7 @@ def run_local(inventory,script_service):
         if changed:
             root.save()
         message=local_summary(audit,unknown)
-        message+="\n\n"+informative_reconciliation(inventory,rows,script_service)
+        message+="\n\n"+fifo_layers_situation(rows,audit,script_service)
         script_service.log_info("CXINVAUDIT "+VERSION+": "+message.replace("\n"," | "))
     finally:
         close_set(verify)
