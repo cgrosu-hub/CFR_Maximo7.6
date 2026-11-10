@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.9-INVLIFO-ALIGN
+# VERSIUNE: 5.10-INVLIFO-NOCREATE
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -11,7 +11,7 @@
 # MATRECTRANS se citeste numai pentru FROMSTORELOC afisat pe intrari.
 # Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
 # Daca INVBALANCES.CURBAL == total straturi CXSTOCURI: aliniaza INVLIFOFIFOCOST
-# (sterge surplus/duplicate, actualizeaza cantitati, creeaza lipsa) la acele straturi.
+# doar prin stergere/editare (fara create). Lipsa de randuri -> sectiune separata.
 # Scrie DESCRIPTION_LONGDESCRIPTION; pe conditia de mai sus si INVLIFOFIFOCOST.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
@@ -83,7 +83,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.9-INVLIFO-ALIGN"
+VERSION = "5.10-INVLIFO-NOCREATE"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -936,14 +936,19 @@ def plan_invlifo_alignment(desired,current):
             keeps.append(chosen)
     return keeps,updates,unused,creates
 
-def parse_layer_date(value):
-    if not value:
-        return None
-    from java.text import SimpleDateFormat
-    from java.util import TimeZone
-    f=SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-    f.setTimeZone(TimeZone.getTimeZone("UTC"))
-    return f.parse(txt(value)[:19])
+def format_missing_invlifo_creates(creates):
+    lines=["INVLIFOFIFOCOST CREARI OMISE",
+           "  Nu se creeaza randuri noi in INVLIFOFIFOCOST.",
+           "  Straturi CXSTOCURI fara corespondent existent: %s" % len(creates),
+           "  UNITCOST | SOLD | CXREFMBO | CXREFID"]
+    for layer in creates[:MAX_LAYER_LINES]:
+        lines.append("  %s | %s | %s | %s" % (
+            price_label(layer["cost"]),fmt_ro(layer["qty"]),
+            "-" if layer.get("ref_mbo") is None else txt(layer.get("ref_mbo")),
+            "-" if layer.get("ref_id") is None else txt(layer.get("ref_id"))))
+    if len(creates)>MAX_LAYER_LINES:
+        lines.append("  Primele %s straturi lipsa; restul in log." % MAX_LAYER_LINES)
+    return "\n".join(lines)
 
 def read_invbalances_curbal(inventory):
     from psdi.server import MXServer
@@ -1021,48 +1026,34 @@ def sync_invlifofifocost(inventory,rows,audit,script_service):
             })
             m=ms.moveNext()
         keeps,updates,deletes,creates=plan_invlifo_alignment(desired,current)
+        sections=[]
         if not updates and not deletes and not creates:
             msg="CORECTIE INVLIFOFIFOCOST: deja aliniat la straturile CXSTOCURI"
             script_service.log_info("CXINVAUDIT "+msg)
             return msg
-        for item in updates:
-            put_invlifo_number(item["row"]["mbo"],"QUANTITY",item["qty"])
-        for row in deletes:
-            row["mbo"].delete(flags)
-        for layer in creates:
-            created=ms.add()
-            created.setValue("ITEMNUM",inventory.getString("ITEMNUM"),flags)
-            created.setValue("SITEID",inventory.getString("SITEID"),flags)
-            created.setValue("LOCATION",inventory.getString("LOCATION"),flags)
-            created.setValue("ORGID",inventory.getString("ORGID"),flags)
-            created.setValue("ITEMSETID",inventory.getString("ITEMSETID"),flags)
-            created.setValue("COSTTYPE","FIFO",flags)
-            if not inventory.isNull("CONDITIONCODE"):
-                created.setValue("CONDITIONCODE",inventory.getString("CONDITIONCODE"),flags)
-            put_invlifo_number(created,"UNITCOST",layer["cost"])
-            put_invlifo_number(created,"QUANTITY",layer["qty"])
-            if layer["ref_mbo"] is None:
-                created.setValueNull("REFOBJECT",flags)
-            else:
-                created.setValue("REFOBJECT",layer["ref_mbo"],flags)
-            if layer["ref_id"] is None:
-                created.setValueNull("REFOBJECTID",flags)
-            else:
-                created.setValue("REFOBJECTID",long(layer["ref_id"]),flags)
-                if layer["ref_mbo"]:
-                    created.setValue("CONDRATE",100,flags)
-            costdate=parse_layer_date(layer.get("date"))
-            if costdate is not None:
-                created.setValue("COSTDATE",costdate,flags)
-        ms.save()
-        msg="\n".join([
-            "CORECTIE INVLIFOFIFOCOST",
-            "  Conditie: CURBAL = CXSTOCURI = %s" % fmt_ro(curbal),
-            "  Pastrate: %s" % len(keeps),
-            "  Actualizate: %s" % len(updates),
-            "  Sterse: %s" % len(deletes),
-            "  Create: %s" % len(creates),
-        ])
+        if updates or deletes:
+            for item in updates:
+                put_invlifo_number(item["row"]["mbo"],"QUANTITY",item["qty"])
+            for row in deletes:
+                row["mbo"].delete(flags)
+            ms.save()
+            sections.append("\n".join([
+                "CORECTIE INVLIFOFIFOCOST",
+                "  Conditie: CURBAL = CXSTOCURI = %s" % fmt_ro(curbal),
+                "  Pastrate: %s" % len(keeps),
+                "  Actualizate: %s" % len(updates),
+                "  Sterse: %s" % len(deletes),
+                "  Fara create (doar stergere/editare).",
+            ]))
+        elif creates:
+            sections.append("\n".join([
+                "CORECTIE INVLIFOFIFOCOST",
+                "  Conditie: CURBAL = CXSTOCURI = %s" % fmt_ro(curbal),
+                "  Nicio stergere/editare necesara pe randurile existente.",
+            ]))
+        if creates:
+            sections.append(format_missing_invlifo_creates(creates))
+        msg="\n\n".join(sections)
         script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
         return msg
     except Exception as exc:
@@ -1164,6 +1155,11 @@ def check_layer_beats_negative_balance():
     keeps,updates,deletes,creates=plan_invlifo_alignment(desired,current)
     if updates or creates or len(keeps)!=3 or sorted(r["id"] for r in deletes)!=[2,4,6]:
         raise ValueError("self-check: alinierea INVLIFOFIFOCOST nu elimina duplicatele corect")
+    missing_plan=plan_invlifo_alignment(
+        desired+[{"cost":ExactNumber("99.000"),"qty":ExactNumber("1"),"ref_mbo":None,"ref_id":None}],
+        [row for row in current if row["id"] in (1,3,5)])
+    if len(missing_plan[3])!=1 or missing_plan[3][0]["cost"]!=ExactNumber("99.000"):
+        raise ValueError("self-check: lipsa INVLIFOFIFOCOST trebuie semnalata fara create")
 
 def run_local(inventory,script_service):
     from psdi.mbo import MboConstants
