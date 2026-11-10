@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.9-MATRECTRANS-EXIT
+# VERSIUNE: 3.10-VOIDRECEIPT-PRIOR
 # Corecteaza doar randul CXSTOCURI apasat.
 # ISSUE pe mai multe straturi FIFO: 3 pasi (commit in script; NU Save pe ecran intre pasi).
 # PAS 1 = INVUSELINESPLIT lipsa; PAS 2 = MATUSETRANS nou (ACTUALDATE +1 min);
@@ -11,6 +11,7 @@
 # Strat INITIAL e provenienta legitima (MATRECTRANSID null pe linia corespunzatoare).
 # Daca INVUSELINE lipseste, corecteaza totusi pretul tranzactiei si jurnalul.
 # RETURN preia acelasi pret FIFO al consumului.
+# VOIDRECEIPT anterior: anulare pe pret (newest-first), ca in CXINVAUDIT — nu blocheaza ISSUE.
 # NU modifica INVUSE/INVUSELINE, receptii, stoc fizic, INVLIFOFIFOCOST ori ROWSTAMP.
 # Necesita protectia CXADDTOCXSTOCURI si teste fara concurenta in TEST.
 # Calcule Java BigDecimal; fara decimal/json/re si fara filtre de pilot.
@@ -88,7 +89,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.9-MATRECTRANS-EXIT"
+VERSION="3.10-VOIDRECEIPT-PRIOR"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -104,6 +105,7 @@ PRICE_EPS=ExactNumber("0.0005")
 FLAGS=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 ENTRIES=("RECEIPT","SHIPRECEIPT","TRANSFER")
 EXITS=("ISSUE","SHIPTRANSFER","TRANSFER")
+VOID_TYPES=("VOIDRECEIPT",)
 MATREC_EXITS=("SHIPTRANSFER","TRANSFER")
 WRITE_TABLES=("INVUSELINESPLIT","MATUSETRANS","MATRECTRANS","CXSTOCURI")
 SPLIT_COPY=("INVUSENUM","ORGID","SITEID","INVUSELINEID","FROMLOT","ROTASSETNUM","FROMBIN",
@@ -241,6 +243,26 @@ def consume(layers,required):
     layers[:]=[l for l in layers if l["qty"]>EPS]
     return allocations,max(ZERO,required)
 
+def consume_at_cost(layers,required,cost,newest_first=False):
+    # VOIDRECEIPT anuleaza pe pret; newest_first leaga de receptia recenta anulata.
+    allocations=[]
+    indexes=range(len(layers)-1,-1,-1) if newest_first else range(len(layers))
+    for index in indexes:
+        if required<=EPS:
+            break
+        layer=layers[index]
+        if different(layer["cost"],cost,PRICE_EPS):
+            continue
+        take=min(required,layer["qty"])
+        if take>ZERO:
+            a=dict(layer)
+            a["qty"]=take
+            allocations.append(a)
+            layer["qty"]-=take
+            required-=take
+    layers[:]=[l for l in layers if l["qty"]>EPS]
+    return allocations,max(ZERO,required)
+
 def issue_of_returns(rows,query):
     ids=sorted(set(r["ref"] for r in rows if r.get("kind")=="RETURN" and r.get("ref") is not None and r.get("qty") is not None and r["qty"]>ZERO))
     links={}
@@ -312,6 +334,18 @@ def replay(prior,links=None):
             if len(matches)!=1:
                 fail("Retur anterior %s fara consum unic anterior" % r["ref"])
             restore(layers,qty,matches[0]["cost"],prior)
+            started=True
+            continue
+        if kind in VOID_TYPES:
+            if qty>=-EPS:
+                fail("VOIDRECEIPT anterior fara cantitate negativa RefID=%s" % r["ref"])
+            required=-qty
+            available=sum((l["qty"] for l in layers if not different(l["cost"],cost,PRICE_EPS)),ZERO)
+            if available+EPS<required:
+                fail("Stoc pe pret insuficient pentru VOIDRECEIPT anterior RefID=%s" % r["ref"])
+            allocations,short=consume_at_cost(layers,required,cost,newest_first=True)
+            if short>EPS or not allocations:
+                fail("VOIDRECEIPT anterior nu a putut anula stocul pe pret RefID=%s" % r["ref"])
             started=True
             continue
         if qty>ZERO:
@@ -650,6 +684,18 @@ def check_matrectrans_exit_cost():
         raise ValueError("self-check: iesirea fara stoc trebuia respinsa")
     except FixError:
         pass
+    # Speta 206686: VOIDRECEIPT OK pe pret anuleaza receptia recenta; ISSUE ulterior pe FIFO vechi.
+    void_prior=[
+        row(1,"2026-06-01 00:00:00.000000000",10,"RECEIPT","100","9.501","100"),
+        row(2,"2026-06-18 00:00:00.000000000",20,"RECEIPT","200","9.099","300"),
+        row(3,"2026-06-18 00:03:00.000000000",30,"VOIDRECEIPT","-200","9.099","100"),
+        row(4,"2026-06-18 00:04:00.000000000",40,"RECEIPT","200","9.099","300"),
+    ]
+    cost,allocation=single_fifo_cost(void_prior,ExactNumber("-50"))
+    if different(cost,ExactNumber("9.501"),PRICE_EPS):
+        raise ValueError("self-check: ISSUE dupa VOIDRECEIPT trebuie sa preia 9.501")
+    if not allocation or allocation[0].get("ref")!=10:
+        raise ValueError("self-check: VOIDRECEIPT trebuie sa lase stratul vechi FIFO")
 
 def execute(context):
     check_matrectrans_exit_cost()
