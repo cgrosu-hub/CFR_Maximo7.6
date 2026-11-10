@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.10-INVLIFO-NOCREATE
+# VERSIUNE: 5.11-INVLIFO-OWNER
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -12,6 +12,8 @@
 # Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
 # Daca INVBALANCES.CURBAL == total straturi CXSTOCURI: aliniaza INVLIFOFIFOCOST
 # doar prin stergere/editare (fara create). Lipsa de randuri -> sectiune separata.
+# Scrierea INVLIFOFIFOCOST se face pe setul copil al INVENTORY (getOwner valid),
+# ca launch point-ul CXINVLFIFO sa nu cada pe None.getOwner().
 # Scrie DESCRIPTION_LONGDESCRIPTION; pe conditia de mai sus si INVLIFOFIFOCOST.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
@@ -83,7 +85,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.10-INVLIFO-NOCREATE"
+VERSION = "5.11-INVLIFO-OWNER"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -734,6 +736,14 @@ def open_scope(inventory,name,with_itemset=False):
         close_set(ms)
         raise
 
+def open_invlifofifocost(inventory):
+    # Set copil pe INVENTORY: CXINVLFIFO asteapta mbo.getOwner(); setul MXServer e fara owner.
+    ms=inventory.getMboSet("INVLIFOFIFOCOST")
+    if ms is None:
+        raise ValueError("Relatia INVENTORY.INVLIFOFIFOCOST lipseste")
+    ms.reset()
+    return ms
+
 def read_journal(ms):
     rows,mbos,currencies=[],{},set()
     m=ms.moveFirst()
@@ -1007,9 +1017,9 @@ def sync_invlifofifocost(inventory,rows,audit,script_service):
             fmt_ro(curbal),fmt_ro(layers_qty))
         script_service.log_info("CXINVAUDIT "+msg)
         return msg
-    ms=None
+    # Nu inchide setul copil al INVENTORY (UI).
     try:
-        ms=open_scope(inventory,"INVLIFOFIFOCOST",True)
+        ms=open_invlifofifocost(inventory)
         current=[]
         m=ms.moveFirst()
         while m is not None:
@@ -1060,8 +1070,6 @@ def sync_invlifofifocost(inventory,rows,audit,script_service):
         msg="CORECTIE INVLIFOFIFOCOST ESUATA: %s" % txt(exc)
         script_service.log_info("CXINVAUDIT "+msg)
         return msg
-    finally:
-        close_set(ms)
 
 def invlifo_totals(inventory,rows,script_service):
     # TOTALURI ca in reconcilierea veche: cantitate/valoare CXSTOCURI vs INVLIFOFIFOCOST.
