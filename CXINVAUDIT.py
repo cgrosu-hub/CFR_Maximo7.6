@@ -1,10 +1,12 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.18-SHIPRETURN
+# VERSIUNE: 5.19-SHIPCANCEL
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
 # VOIDRECEIPT/SHIPRETURN anuleaza stoc pe acelasi pret (receptia cea mai recenta).
+# SHIPCANCEL (qty>0) restabileste stocul anularii unui SHIPTRANSFER (RECEIPTREF sau
+# match pe cantitate/pret); pune inapoi stratul si marcheaza BADFIFO=N.
 # Tipurile ambigue NU blocheaza auditul pe randurile urmatoare din grupa.
 # Conventie: N + MOTIV=ORDINE_DATE daca deficitul poate fi asociat unor intrari
 # ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
@@ -87,7 +89,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.18-SHIPRETURN"
+VERSION = "5.19-SHIPCANCEL"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -102,7 +104,7 @@ QTY_TOLERANCE = ExactNumber("0.000001")
 ENTRY_TYPES = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 EXIT_TYPES = ("ISSUE", "SHIPTRANSFER", "TRANSFER")
 VOID_TYPES = ("VOIDRECEIPT", "SHIPRETURN")
-AMBIGUOUS_TYPES = ("SHIPCANCEL", "VOIDSHIPRECEIPT", "RECBALADJ")
+AMBIGUOUS_TYPES = ("VOIDSHIPRECEIPT", "RECBALADJ")
 def txt(value):
     return "" if value is None else string_type(value)
 
@@ -374,6 +376,35 @@ def return_target(row,group_rows,records):
         source,source_ref,priority=issue["id"],issue.get("ref_id"),order(issue)
     return expected,issue.get("ref_id"),source_ref,priority,source
 
+def shipcancel_target(row,group_rows,records):
+    # SHIPCANCEL restabileste un SHIPTRANSFER: RECEIPTREF sau match cantitate/pret.
+    receipt_ref=row.get("receipt_ref")
+    matches=[]
+    if receipt_ref is not None:
+        matches=[r for r in group_rows if r.get("ref_mbo")=="MATRECTRANS" and r.get("ref_id")==receipt_ref
+                 and r.get("kind")=="SHIPTRANSFER" and order(r)<order(row)]
+    if len(matches)!=1:
+        qty,cost=row.get("qty"),row.get("cost")
+        matches=[r for r in group_rows if r.get("kind")=="SHIPTRANSFER" and order(r)<order(row)
+                 and r.get("qty") is not None and qty is not None and not far(-r["qty"],qty,QTY_TOLERANCE)
+                 and r.get("cost") is not None and cost is not None and not far(r["cost"],cost,COST_TOLERANCE)]
+    if len(matches)!=1:
+        return None,"SHIPCANCEL fara SHIPTRANSFER unic anterior (RECEIPTREF/cantitate/pret)",None,None,None
+    ship=matches[0]
+    rec=records[ship["id"]]
+    if rec["status"] in ("OK","BAD","DATE_ORDER") and rec["expected"] is not None:
+        expected=rec["expected"]
+    elif ship.get("cost") is not None:
+        expected=ship["cost"]
+    else:
+        return None,"SHIPTRANSFER %s nu are pret verificabil" % ship.get("ref_id"),None,None,None
+    allocs=rec.get("allocations") or []
+    if allocs:
+        source,source_ref,priority=allocs[0].get("source"),allocs[0].get("source_ref_id"),allocs[0].get("priority") or order(ship)
+    else:
+        source,source_ref,priority=ship["id"],ship.get("ref_id"),order(ship)
+    return expected,ship.get("ref_id"),source_ref,priority,source
+
 def audit_rows(rows):
     records=dict((r["id"],new_local_record(r)) for r in rows)
     if len(records)!=len(rows):
@@ -454,6 +485,25 @@ def audit_rows(rows):
                     rec["reason"]="Retur fara cantitate pozitiva"
                     continue
                 expected,link_ref,source_ref,priority,source=return_target(row,group_rows,records)
+                if expected is None:
+                    rec["reason"]=link_ref
+                    continue
+                rec["expected"]=expected
+                rec["link_ref"]=link_ref
+                rec["status"]="BAD" if far(cost,expected,COST_TOLERANCE) else "OK"
+                rec["allocations"]=[{"qty":qty,"cost":expected,"source":source,"source_ref_id":source_ref,
+                                     "initial":False,"priority":priority}]
+                origin=records.get(source)
+                source_mbo=None if origin is None else origin["row"].get("ref_mbo")
+                put_back(layers,qty,expected,priority,source,source_ref,source_mbo)
+                local_prices.add(expected)
+                local_started=True
+                continue
+            if kind=="SHIPCANCEL":
+                if qty<=QTY_TOLERANCE:
+                    rec["reason"]="SHIPCANCEL fara cantitate pozitiva"
+                    continue
+                expected,link_ref,source_ref,priority,source=shipcancel_target(row,group_rows,records)
                 if expected is None:
                     rec["reason"]=link_ref
                     continue
@@ -686,8 +736,13 @@ def description_visible(old, record, summary):
         info="OK: pret compatibil %s; intrare ulterioara cu RefID anterior; data iesirii de verificat (conventie)" % fmt_ro(record["expected"])
     elif status=="OK" and row.get("kind") in VOID_TYPES:
         info="OK: %s anuleaza %s buc. la %s" % (row.get("kind"),fmt_ro(-row["qty"]),fmt_ro(record["expected"]))
+    elif status=="OK" and row.get("kind")=="SHIPCANCEL":
+        info="OK: SHIPCANCEL restabileste %s buc. la %s" % (fmt_ro(row["qty"]),fmt_ro(record["expected"]))
     elif status=="OK":
         info="OK: FIFO LOCAL asteptat %s" % fmt_ro(record["expected"])
+    elif status=="BAD" and row.get("kind")=="SHIPCANCEL":
+        info="DIFERENTA: SHIPCANCEL pret %s; asteptat %s; diferenta %s" % (
+            fmt_ro(row["cost"]),fmt_ro(record["expected"]),fmt_ro(row["cost"]-record["expected"]))
     elif status=="BAD":
         info="DIFERENTA: FIFO LOCAL pret %s; asteptat %s; diferenta %s" % (
             fmt_ro(row["cost"]),fmt_ro(record["expected"]),fmt_ro(row["cost"]-record["expected"]))
@@ -696,7 +751,10 @@ def description_visible(old, record, summary):
     else:
         info="NEVERIFICAT: "+record["reason"]
     if record.get("link_ref") is not None and status in ("OK","BAD"):
-        info+="; consum %s" % record["link_ref"]
+        if row.get("kind")=="SHIPCANCEL":
+            info+="; expediere %s" % record["link_ref"]
+        else:
+            info+="; consum %s" % record["link_ref"]
     if record.get("local_basis") and status in ("OK","BAD"):
         info+="; baza locala din intrari"
     if record.get("resumed"):
@@ -869,6 +927,28 @@ def enrich_returns(inventory,rows,script_service):
         if row.get("kind")=="RETURN" and row.get("ref_mbo")=="MATUSETRANS":
             row["issue_id"]=links.get(row.get("ref_id"))
 
+def enrich_shipcancels(inventory,rows,script_service):
+    from psdi.server import MXServer
+    pending=sorted(set(r["ref_id"] for r in rows if r.get("kind")=="SHIPCANCEL" and r.get("ref_mbo")=="MATRECTRANS" and r.get("ref_id") is not None))
+    links={}
+    for start in range(0,len(pending),500):
+        ms=None
+        try:
+            ms=MXServer.getMXServer().getMboSet("MATRECTRANS",inventory.getUserInfo())
+            ms.setWhere("MATRECTRANSID IN (%s)" % ",".join(txt(i) for i in pending[start:start+500]))
+            ms.reset()
+            m=ms.moveFirst()
+            while m is not None:
+                links[m.getLong("MATRECTRANSID")]=None if m.isNull("RECEIPTREF") else m.getLong("RECEIPTREF")
+                m=ms.moveNext()
+        except Exception as exc:
+            script_service.log_info("CXINVAUDIT legatura SHIPCANCEL indisponibila: "+txt(exc))
+        finally:
+            close_set(ms)
+    for row in rows:
+        if row.get("kind")=="SHIPCANCEL" and row.get("ref_mbo")=="MATRECTRANS":
+            row["receipt_ref"]=links.get(row.get("ref_id"))
+
 def journal_fifo_complete(audit):
     # True doar fara BADFIFO=Y/U pe pret/sold si fara ORDINE_DATE/neverificat.
     if audit.get("ledger_qty") is None:
@@ -881,8 +961,8 @@ def journal_fifo_complete(audit):
         f=flag(rec)
         if f=="Y":
             return False,"Exista BADFIFO=Y (pret sau sold CXCURBAL gresit)"
-        if f=="U" and (is_outgoing(row) or row.get("kind")=="RETURN"):
-            return False,"Exista iesiri/retururi neverificate"
+        if f=="U" and (is_outgoing(row) or row.get("kind") in ("RETURN","SHIPCANCEL")):
+            return False,"Exista iesiri/retururi/anulari neverificate"
         if row.get("kind")!="INITIAL" and not row.get("date"):
             return False,"Exista tranzactii fara data in CXSTOCURI"
     return True,"OK"
@@ -1374,6 +1454,23 @@ def check_layer_beats_negative_balance():
     sr_complete,sr_reason=journal_fifo_complete(shipret)
     if not sr_complete:
         raise ValueError("self-check: jurnalul SHIPRETURN trebuia complet OK: "+sr_reason)
+    shipcancel=audit_rows([
+        row(1,"2026-02-01 00:00:00.000000000",10,"SHIPRECEIPT","500","11.340","500"),
+        row(2,"2026-02-02 00:00:00.000000000",20,"SHIPTRANSFER","-54","11.340","446"),
+        row(3,"2026-02-02 00:00:00.000000000",21,"SHIPCANCEL","54","11.340","500"),
+        row(4,"2026-02-02 00:00:00.000000000",30,"SHIPTRANSFER","-54","11.340","446"),
+    ])
+    if shipcancel["records"][3]["status"]!="OK":
+        raise ValueError("self-check: SHIPCANCEL trebuie sa fie OK")
+    if shipcancel["records"][3].get("link_ref")!=20:
+        raise ValueError("self-check: SHIPCANCEL trebuie legat de SHIPTRANSFER anterior")
+    if flag(shipcancel["records"][3])!="N":
+        raise ValueError("self-check: SHIPCANCEL OK trebuie BADFIFO=N")
+    if shipcancel["records"][4]["status"]!="OK":
+        raise ValueError("self-check: SHIPTRANSFER dupa SHIPCANCEL trebuie verificat")
+    sc_complete,sc_reason=journal_fifo_complete(shipcancel)
+    if not sc_complete:
+        raise ValueError("self-check: jurnalul SHIPCANCEL trebuia complet OK: "+sc_reason)
     bad_complete,bad_reason=journal_fifo_complete(blocked)
     if bad_complete:
         raise ValueError("self-check: jurnalul insuficient nu trebuie sa autorizeze CURBAL")
@@ -1437,6 +1534,7 @@ def run_local(inventory,script_service):
         original=snapshot(rows)
         unknown=enrich_origins(inventory,rows,script_service)
         enrich_returns(inventory,rows,script_service)
+        enrich_shipcancels(inventory,rows,script_service)
         audit=audit_rows(rows)
         planned=dict((r["id"],description(r["old_description"],audit["records"][r["id"]],{})) for r in rows)
         verify=open_scope(inventory,"CXSTOCURI")

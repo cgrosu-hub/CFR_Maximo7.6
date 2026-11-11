@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.15-SAMECOST-NOSPLIT
+# VERSIUNE: 3.16-SHIPCANCEL
 # Corecteaza randul CXSTOCURI apasat + tranzactia sursa (MATUSETRANS/MATRECTRANS).
 # Cu INVUSELINE: FIFO pe CANTITATEA consumului apasat, nu pe toata linia; alte MATUSETRANS
 # de pe linie (chiar intercalate temporal) nu blocheaza si nu sunt rescrise.
@@ -17,6 +17,7 @@
 # Daca INVUSELINE lipseste, corecteaza totusi pretul tranzactiei si jurnalul.
 # RETURN preia acelasi pret FIFO al consumului.
 # VOIDRECEIPT/SHIPRETURN anterior: anulare pe pret (newest-first), ca in CXINVAUDIT.
+# SHIPCANCEL anterior (qty>0): restabileste stoc pe pret, ca in CXINVAUDIT.
 # Dupa corectie: recalculeaza CXCURBAL pe TOT jurnalul grupei (nu doar pretul afectat).
 # NU modifica INVUSE (decat daca e nevoie de ACTUALDATE pe linie in pasi de create),
 # receptii, stoc fizic, INVLIFOFIFOCOST ori ROWSTAMP.
@@ -96,7 +97,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.15-SAMECOST-NOSPLIT"
+VERSION="3.16-SHIPCANCEL"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -340,6 +341,18 @@ def replay(prior,links=None):
             if len(matches)!=1:
                 fail("Retur anterior %s fara consum unic anterior" % r["ref"])
             restore(layers,qty,matches[0]["cost"],prior)
+            started=True
+            continue
+        if kind=="SHIPCANCEL":
+            if qty<=ZERO:
+                fail("SHIPCANCEL anterior fara cantitate pozitiva RefID=%s" % r["ref"])
+            matches=[p for p in prior if p.get("kind")=="SHIPTRANSFER" and order(p)<order(r)
+                     and p.get("qty") is not None and not different(-p["qty"],qty)
+                     and p.get("cost") is not None and not different(p["cost"],cost,PRICE_EPS)]
+            if len(matches)==1:
+                restore(layers,qty,matches[0]["cost"],prior)
+            else:
+                restore(layers,qty,cost,prior)
             started=True
             continue
         if kind in VOID_TYPES:
