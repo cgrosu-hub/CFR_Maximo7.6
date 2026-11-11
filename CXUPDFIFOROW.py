@@ -1,6 +1,6 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.4-SHIPTRANSFER-AFTER
+# VERSIUNE: 3.5-NOVALID-DATE
 # Implicit: muta la maximul orelor din aceeasi zi (acelasi site/gestiune) + 1 minut.
 # RETURN inainte de ISSUE (ISSUEID): data = ISSUE + 1 minut (MATUSETRANS+CXSTOCURI).
 # ISSUE/SHIPTRANSFER datat gresit inaintea unei intrari, DOAR daca |qty| < suma stoc
@@ -8,6 +8,8 @@
 # data = prima intrare ulterioara + 1 minut.
 # SHIPTRANSFER: daca receptia legata (RECEIPTREF) ar ramane inaintea noii date,
 # o muta si pe ea (MATRECTRANS+CXSTOCURI) la aceeasi data — nu blocheaza.
+# ACTUALDATE/CXDOCUMENTDATE: NOACCESSCHECK+NOVALIDATION (evita BMXAA1198E pe perioada
+# deschisa cand validarea Maximo totusi respinge scrierea).
 # INITIAL: doar CXDOCUMENTDATE. INVTRANS netratat.
 
 from java.math import BigDecimal
@@ -24,7 +26,8 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
-VERSION = "3.4-SHIPTRANSFER-AFTER"
+VERSION = "3.5-NOVALID-DATE"
+DATE_FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 SUPPORTED = {
     "MATRECTRANS": ("MATRECTRANSID", "ACTUALDATE", ("RECEIPT", "TRANSFER", "SHIPTRANSFER", "SHIPRECEIPT", "RETURN", "VOIDRECEIPT", "SHIPRETURN", "SHIPCANCEL")),
     "MATUSETRANS": ("MATUSETRANSID", "ACTUALDATE", ("ISSUE", "RETURN"))
@@ -274,18 +277,18 @@ def plan_balances(all_rows, linked, new_ms, require_before=True):
 def apply_dates_and_balances(linked, changed, after, new_ms, source=None, date_field=None, extra_sources=None):
     new_date = Date(new_ms)
     if source is not None and date_field is not None:
-        source.setValue(date_field, new_date, MboConstants.NOACCESSCHECK)
+        source.setValue(date_field, new_date, DATE_FLAGS)
     for extra in (extra_sources or []):
-        extra.setValue("ACTUALDATE", new_date, MboConstants.NOACCESSCHECK)
+        extra.setValue("ACTUALDATE", new_date, DATE_FLAGS)
         if extra.getDate("ACTUALDATE").getTime() != new_ms:
             fail("Validarile au schimbat data receptiei/anularii legate")
     for r in linked:
-        r.setValue("CXDOCUMENTDATE", new_date, MboConstants.NOACCESSCHECK)
+        r.setValue("CXDOCUMENTDATE", new_date, DATE_FLAGS)
         if stamp(r) != new_ms:
             fail("Validarile au schimbat data jurnalului")
     for r in changed:
         expected = after[r.getUniqueIDValue()]
-        r.setValue("CXCURBAL", expected.doubleValue(), MboConstants.NOACCESSCHECK)
+        r.setValue("CXCURBAL", expected.doubleValue(), DATE_FLAGS)
         if different(number(r, "CXCURBAL"), expected):
             fail("Precizia CXCURBAL nu pastreaza rezultatul")
     if source is not None and date_field is not None:
