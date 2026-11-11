@@ -1,8 +1,10 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.13-SHIPRETURN
+# VERSIUNE: 3.14-CLICKED-ONLY
 # Corecteaza randul CXSTOCURI apasat + tranzactia sursa (MATUSETRANS/MATRECTRANS).
-# ISSUE pe mai multe straturi FIFO: 3 pasi (commit in script; NU Save pe ecran intre pasi).
+# Cu INVUSELINE: FIFO pe CANTITATEA consumului apasat, nu pe toata linia; alte MATUSETRANS
+# de pe linie (chiar intercalate temporal) nu blocheaza si nu sunt rescrise.
+# ISSUE pe mai multe straturi FIFO (doar pe consumul apasat): 3 pasi (commit in script).
 # PAS 1 = INVUSELINESPLIT lipsa; PAS 2 = MATUSETRANS nou (ACTUALDATE +1 min);
 # PAS 3 = CXSTOCURI nou + corectie CXQTY/CXCURBAL. Info FIFO dupa fiecare pas.
 # Save pe ecran dupa commit pe INVUSELINESPLIT = BMXAA8229W (ROWSTAMP stale).
@@ -13,9 +15,9 @@
 # Daca INVUSELINE lipseste, corecteaza totusi pretul tranzactiei si jurnalul.
 # RETURN preia acelasi pret FIFO al consumului.
 # VOIDRECEIPT/SHIPRETURN anterior: anulare pe pret (newest-first), ca in CXINVAUDIT.
-# Dupa corectie: recalculeaza CXCURBAL pe TOT jurnalul grupei (nu doar pretul afectat),
-# ca BADFIFO=Y pe sold sa fie reparat odata cu / chiar fara diferenta de pret.
-# NU modifica INVUSE/INVUSELINE, receptii, stoc fizic, INVLIFOFIFOCOST ori ROWSTAMP.
+# Dupa corectie: recalculeaza CXCURBAL pe TOT jurnalul grupei (nu doar pretul afectat).
+# NU modifica INVUSE (decat daca e nevoie de ACTUALDATE pe linie in pasi de create),
+# receptii, stoc fizic, INVLIFOFIFOCOST ori ROWSTAMP.
 # Necesita protectia CXADDTOCXSTOCURI si teste fara concurenta in TEST.
 # Calcule Java BigDecimal; fara decimal/json/re si fara filtre de pilot.
 
@@ -92,7 +94,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.13-SHIPRETURN"
+VERSION="3.14-CLICKED-ONLY"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -1144,28 +1146,30 @@ def execute(context):
             fail("Monede diferite intre jurnal si consum")
         journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
         mids=set(m["id"] for m in members)
-        targets=[r for r in journal if r["refmbo"]=="MATUSETRANS" and r["ref"] in mids]
-        jbyref=dict((r["ref"],r) for r in targets)
-        missing_journal=[mem for mem in members if mem["id"] not in jbyref]
+        line_targets=[r for r in journal if r["refmbo"]=="MATUSETRANS" and r["ref"] in mids]
+        line_jbyref=dict((r["ref"],r) for r in line_targets)
+        clicked_ref=context.getLong("CXREFID")
+        clicked_mem=next((m for m in members if m["id"]==clicked_ref),None)
+        if clicked_mem is None:
+            fail("MATUSETRANS apasat nu face parte din linia de utilizare")
         sset,splitrows=query("INVUSELINESPLIT","INVUSELINEID=%s" % lineid,MAX_SPLITS)
         splits=dict((m.getLong("INVUSELINESPLITID"),m) for m in splitrows)
-        if not targets:
-            fail("Niciun CXSTOCURI pentru consumurile liniei; nu pot determina FIFO")
-        clicked=next((r for r in targets if r["id"]==context.getLong("CXSTOCURIID")),None)
-        if clicked is None or text(clicked["mbo"].getRowStamp())!=text(context.getRowStamp()):
-            fail("Rand apasat schimbat; refresh necesar")
-        tids=set(r["id"] for r in targets)
-        positions=[i for i,r in enumerate(journal) if r["id"] in tids]
-        if any(r["id"] not in tids for r in journal[min(positions):max(positions)+1]):
-            fail("Alte miscari intercalate intre consumurile cu jurnal")
-        prior=journal[:min(positions)]
-        layers=replay(prior,issue_of_returns(prior,query))
-        allocation,short=consume(layers,total)
-        if short>EPS:
-            fail("Stoc anterior insuficient; receptiile viitoare nu autorizeaza update")
-        segments=layer_segments(allocation)
-        template=members[0]["mbo"]
-        template_j=targets[0]
+        # FIFO doar pe consumul apasat; celelalte MATUSETRANS de pe linie raman neschimbate.
+        members=[clicked_mem]
+        total=clicked_mem["old_qty"]
+        missing_journal=[clicked_mem] if clicked_mem["id"] not in line_jbyref else []
+        targets=[line_jbyref[clicked_mem["id"]]] if not missing_journal else []
+        jbyref=dict((r["ref"],r) for r in targets)
+        clicked=None
+        if targets:
+            clicked=targets[0]
+            if clicked["id"]!=context.getLong("CXSTOCURIID") or text(clicked["mbo"].getRowStamp())!=text(context.getRowStamp()):
+                fail("Rand apasat schimbat; refresh necesar")
+        elif context.getLong("CXSTOCURIID") not in set(r["id"] for r in line_targets):
+            # PAS 3 pe consum fara jurnal: randul ecran trebuie sa fie tot din linie.
+            pass
+        template=clicked_mem["mbo"]
+        template_j=targets[0] if targets else (line_targets[0] if line_targets else None)
         template_split=None if template.isNull("INVUSELINESPLITID") else splits.get(template.getLong("INVUSELINESPLITID"))
         plans=[]
         def plan_number(m,field,value):
@@ -1193,8 +1197,11 @@ def execute(context):
                 m.setValue(f,long(value),FLAGS)
         def receipt_label(receipt):
             return "INITIAL" if receipt is None else text(receipt)
-        # PAS 3: MATUSETRANS exista, CXSTOCURI lipseste
+        # PAS 3: MATUSETRANS apasat exista, CXSTOCURI lipseste
         if missing_journal:
+            if template_j is None:
+                fail("Nu exista sablon CXSTOCURI pe linie pentru PAS 3")
+            info_row=context
             for mem in missing_journal:
                 jm=cxset.addAtEnd(FLAGS)
                 for f in ("ITEMNUM","LOCATION","ORGID","SITEID","COMMODITYGROUP","CURRENCYCODE",
@@ -1208,7 +1215,6 @@ def execute(context):
                 jm.setValue("CXREFID",long(mem["id"]),FLAGS)
                 jm.setValue("HASLD",1,FLAGS)
                 if mem["mbo"].isNull("MATRECTRANSID"):
-                    # INITIAL: fara receptie; CURBAL de pe tranzactie daca exista
                     bal=number(mem["mbo"],"CURBAL",True)
                     if bal is not None:
                         put_number(jm,"CXCURBAL",bal)
@@ -1219,19 +1225,10 @@ def execute(context):
                 set_info(jm,"CXFIFOFIX PAS 3/3: CXSTOCURI creat pentru MATUSETRANS %s. Ruleaza Check FIFO." % mem["id"])
                 service.log_info("CXFIFOFIXISSUE PAS3 create CXSTOCURI for MATUSETRANS %s qty=%s cost=%s" % (
                     mem["id"],fmt(-mem["old_qty"]),fmt(mem["old_cost"])))
-            for mem in members:
-                if mem["id"] not in jbyref:
-                    continue
-                jr=jbyref[mem["id"]]
-                plan_number(jr["mbo"],"CXQTY",-mem["old_qty"])
-                plan_number(jr["mbo"],"UNITCOST",mem["old_cost"])
-                if not mem["mbo"].isNull("MATRECTRANSID"):
-                    bal=layer_balance(query,mem["mbo"].getLong("MATRECTRANSID"),mem["date"],mem["id"],-mem["old_qty"],[])
-                    plan_number(jr["mbo"],"CXCURBAL",bal)
-            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 3/3: jurnal completat pentru %s MATUSETRANS. Ruleaza Check FIFO." % len(missing_journal))
-            plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
+            info=set_info(info_row,"CXFIFOFIX PAS 3/3: jurnal completat pentru MATUSETRANS %s. Ruleaza Check FIFO." % clicked_ref)
+            plans.append((info_row,"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
-            operation="PAS3 INVUSEID=%s INVUSELINEID=%s" % (invuseid,lineid)
+            operation="PAS3 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
             service.log_info("CXFIFOFIXISSUE PLAN "+VERSION+" "+operation)
             tx=MXServer.getMXServer().createMXTransaction()
             cxset.setFlag(MboConstants.NOSAVE,False)
@@ -1245,9 +1242,7 @@ def execute(context):
             commit_started=True
             tx.commit()
             committed=True
-            message="PAS 3/3 SALVAT: create %s randuri CXSTOCURI pentru MATUSETRANS fara jurnal.\nNu apasa Save pe ecran (deja comis). Ruleaza Check FIFO." % len(missing_journal)
-            for mem in missing_journal:
-                message+="\nCXSTOCURI nou pentru MATUSETRANS %s: %s la %s." % (mem["id"],fmt(-mem["old_qty"]),fmt(mem["old_cost"]))
+            message="PAS 3/3 SALVAT: creat CXSTOCURI pentru MATUSETRANS %s.\nNu apasa Save pe ecran (deja comis). Ruleaza Check FIFO." % clicked_ref
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
             try:
                 if not refresh_table():
@@ -1255,8 +1250,16 @@ def execute(context):
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
             return message
-        if len(targets)!=len(members) or set(r["ref"] for r in targets)!=mids:
-            fail("Lipseste randul unic CXSTOCURI pentru fiecare MATUSETRANS")
+        positions=[i for i,r in enumerate(journal) if r["id"]==clicked["id"]]
+        if len(positions)!=1:
+            fail("Consumul apasat nu are un singur rand in jurnal")
+        pos=positions[0]
+        prior=journal[:pos]
+        layers=replay(prior,issue_of_returns(prior,query))
+        allocation,short=consume(layers,total)
+        if short>EPS:
+            fail("Stoc anterior insuficient; receptiile viitoare nu autorizeaza update")
+        segments=layer_segments(allocation)
         recovery=False
         for mem in members:
             r=jbyref[mem["id"]]
@@ -1289,9 +1292,7 @@ def execute(context):
                     c["new_split"]=True
             if any(c.get("new_split") for c in creates) and template_split is None:
                 fail("Split sablon lipsa pentru PAS 1")
-        source_base=number(members[0]["mbo"],"CURBAL",True)
-        if source_base is None and any(not m["mbo"].isNull("CURBAL") for m in members):
-            fail("CURBAL sursa partial: prima baza lipseste")
+        source_base=number(template,"CURBAL",True)
         running=source_base
         for a in mapped:
             a["source_balance"]=running
@@ -1301,7 +1302,7 @@ def execute(context):
             c["source_balance"]=running
             if running is not None:
                 running-=c["qty"]
-        # PAS 1: doar INVUSELINESPLIT noi/ajustate
+        # PAS 1: doar INVUSELINESPLIT noi/ajustate (pentru consumul apasat)
         if creates and any(c.get("new_split") for c in creates):
             for a in mapped:
                 m=a["member"]["mbo"]
@@ -1333,7 +1334,7 @@ def execute(context):
             info=set_info(clicked["mbo"],"CXFIFOFIX PAS 1/3: INVUSELINESPLIT actualizat (%s noi). Fara Save; reapeasa butonul 2." % len(created_split_ids))
             plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
-            operation="PAS1 INVUSEID=%s INVUSELINEID=%s" % (invuseid,lineid)
+            operation="PAS1 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
             service.log_info("CXFIFOFIXISSUE PLAN "+VERSION+" "+operation)
             tx=MXServer.getMXServer().createMXTransaction()
             sset.setFlag(MboConstants.NOSAVE,False)
@@ -1359,7 +1360,7 @@ def execute(context):
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
             return message
-        # PAS 2: creeaza MATUSETRANS, fara CXSTOCURI
+        # PAS 2: creeaza MATUSETRANS suplimentare doar pentru straturile consumului apasat
         if creates:
             for a in mapped:
                 m=a["member"]["mbo"]
@@ -1427,7 +1428,7 @@ def execute(context):
             info=set_info(clicked["mbo"],"CXFIFOFIX PAS 2/3: MATUSETRANS noi %s (ACTUALDATE +N min). Fara Save; reapeasa butonul 2 pentru PAS 3." % ids)
             plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
-            operation="PAS2 INVUSEID=%s INVUSELINEID=%s" % (invuseid,lineid)
+            operation="PAS2 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
             service.log_info("CXFIFOFIXISSUE PLAN "+VERSION+" "+operation)
             tx=MXServer.getMXServer().createMXTransaction()
             for name,ms in (("INVUSELINESPLIT",sset),("MATUSETRANS",mset),("CXSTOCURI",cxset)):
@@ -1453,7 +1454,7 @@ def execute(context):
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
             return message
-        # cale normala: un strat / deja suficiente MATUSETRANS
+        # cale normala: un strat FIFO pe consumul apasat
         changes={}
         for a in mapped:
             jr=jbyref[a["member"]["id"]]
@@ -1472,15 +1473,14 @@ def execute(context):
             if a["source_balance"] is not None:
                 plan_number(m,"CURBAL",a["source_balance"])
             plan_receipt(m,a["receipt"])
-            # ponytail: fara creates nu atingem INVUSELINESPLIT (evita BMXAA8229W);
-            # pretul pe split ramane eventual desincronizat pana la un PAS de split real.
+            # fara creates nu atingem INVUSELINESPLIT (evita BMXAA8229W)
         for r in journal:
             if r["id"] in changes:
                 plan_number(r["mbo"],"CXQTY",changes[r["id"]]["qty"])
                 plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
             plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
         if not plans:
-            return "MATUSETRANS si CXSTOCURI sunt deja conforme planului local; nimic modificat."
+            return "MATUSETRANS %s si CXSTOCURI sunt deja conforme planului local; nimic modificat." % clicked_ref
         planned_tables=set(m.getName().upper() for m,f,k,v,old in plans)
         sets_by_name={"MATUSETRANS":mset,"CXSTOCURI":cxset}
         select_write_sets(planned_tables,sets_by_name)
@@ -1497,7 +1497,8 @@ def execute(context):
                     fail("Date schimbate concurent pe "+name)
             finally:
                 close(check)
-        operation="INVUSEID=%s INVUSELINEID=%s user=%s" % (invuseid,lineid,user.getUserName())
+        operation="INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s user=%s" % (
+            invuseid,lineid,clicked_ref,user.getUserName())
         service.log_info("CXFIFOFIXISSUE PLAN "+VERSION+" "+operation+" tabele="+",".join(sorted(planned_tables)))
         for m,f,kind,value,old in plans:
             service.log_info("CXFIFOFIXISSUE PLAN %s ID=%s %s: %s -> %s" % (m.getName(),m.getUniqueIDValue(),f,old,text(value)))
@@ -1521,12 +1522,13 @@ def execute(context):
         commit_started=True
         tx.commit()
         committed=True
-        message="SALVAT: INVUSE=%s; linie=%s; cantitate consum=%s; valoare FIFO=%s; actualizari=%s." % (
-            doc.getString("INVUSENUM"),lineid,fmt(total),fmt(new_total),len(plans))
+        message="SALVAT: MATUSETRANS %s; INVUSE=%s; linie=%s; cantitate=%s; valoare FIFO=%s; actualizari=%s." % (
+            clicked_ref,doc.getString("INVUSENUM"),lineid,fmt(total),fmt(new_total),len(plans))
         if recovery:
             message+="\nSincronizare stare partiala: s-au completat numai diferentele fata de plan."
         for a in mapped:
             message+="\nMATUSETRANS %s: %s la %s; receptie %s." % (a["member"]["id"],fmt(-a["qty"]),fmt(a["cost"]),receipt_label(a["receipt"]))
+        message+="\nCelelalte consumuri de pe linie nu au fost modificate; apasa pe fiecare rand BADFIFO=Y separat."
         message+="\nReturul se corecteaza cand selectezi randul lui."
         try:
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+operation+" "+message.replace("\n"," | "))
