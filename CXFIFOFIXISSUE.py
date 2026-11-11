@@ -1,10 +1,12 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.14-CLICKED-ONLY
+# VERSIUNE: 3.15-SAMECOST-NOSPLIT
 # Corecteaza randul CXSTOCURI apasat + tranzactia sursa (MATUSETRANS/MATRECTRANS).
 # Cu INVUSELINE: FIFO pe CANTITATEA consumului apasat, nu pe toata linia; alte MATUSETRANS
 # de pe linie (chiar intercalate temporal) nu blocheaza si nu sunt rescrise.
-# ISSUE pe mai multe straturi FIFO (doar pe consumul apasat): 3 pasi (commit in script).
+# Daca alocarea FIFO are UN SINGUR pret (chiar din mai multe receptii), NU face split:
+# actualizeaza doar pretul/cantitatea pe consumul apasat (MATRECTRANSID = prima receptie).
+# Split 3 pasi doar cand consumul apasat cere PRETRURI FIFO diferite.
 # PAS 1 = INVUSELINESPLIT lipsa; PAS 2 = MATUSETRANS nou (ACTUALDATE +1 min);
 # PAS 3 = CXSTOCURI nou + corectie CXQTY/CXCURBAL. Info FIFO dupa fiecare pas.
 # Save pe ecran dupa commit pe INVUSELINESPLIT = BMXAA8229W (ROWSTAMP stale).
@@ -94,7 +96,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.14-CLICKED-ONLY"
+VERSION="3.15-SAMECOST-NOSPLIT"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -458,6 +460,17 @@ def layer_segments(allocations):
             segments.append({"qty":a["qty"],"cost":a["cost"],"receipt":receipt,"initial":is_initial,"source_cxid":a.get("cxid")})
     if not segments:
         fail("Nu exista alocare FIFO")
+    # Un singur pret FIFO pe consum => un singur segment (fara split pe receptii).
+    # MATRECTRANSID pastreaza prima receptie din alocare; cantitatile se cumuleaza.
+    costs=[]
+    for seg in segments:
+        if not any(not different(seg["cost"],c,PRICE_EPS) for c in costs):
+            costs.append(seg["cost"])
+    if len(costs)==1:
+        total_qty=sum((seg["qty"] for seg in segments),ZERO)
+        first=segments[0]
+        return [{"qty":total_qty,"cost":first["cost"],"receipt":first["receipt"],
+                 "initial":first["initial"],"source_cxid":first.get("source_cxid")}]
     return segments
 
 def map_members(segments,members):
@@ -681,6 +694,22 @@ def check_matrectrans_exit_cost():
         raise ValueError("self-check: SHIPTRANSFER nu preia pretul receptiei anterioare")
     if not allocation or allocation[0].get("ref")!=400:
         raise ValueError("self-check: sursa FIFO gresita pentru SHIPTRANSFER")
+    same_cost_alloc=[
+        {"qty":ExactNumber("10"),"cost":ExactNumber("8.320"),"ref":100,"refmbo":"MATRECTRANS","cxid":1,"initial":False},
+        {"qty":ExactNumber("10"),"cost":ExactNumber("8.320"),"ref":200,"refmbo":"MATRECTRANS","cxid":2,"initial":False},
+    ]
+    merged=layer_segments(same_cost_alloc)
+    if len(merged)!=1 or different(merged[0]["qty"],ExactNumber("20")) or different(merged[0]["cost"],ExactNumber("8.320"),PRICE_EPS):
+        raise ValueError("self-check: acelasi pret FIFO trebuie un singur segment, fara split")
+    if merged[0]["receipt"]!=100:
+        raise ValueError("self-check: receptia pastrata pe segmentul unic trebuie sa fie prima")
+    mixed=layer_segments([
+        {"qty":ExactNumber("10"),"cost":ExactNumber("8.320"),"ref":100,"refmbo":"MATRECTRANS","cxid":1,"initial":False},
+        {"qty":ExactNumber("10"),"cost":ExactNumber("9.360"),"ref":200,"refmbo":"MATRECTRANS","cxid":2,"initial":False},
+    ])
+    if len(mixed)!=2:
+        raise ValueError("self-check: preturi FIFO diferite trebuie sa pastreze splitul")
+
     try:
         single_fifo_cost([
             row(1,"2026-06-01 00:00:00.000000000",1,"SHIPTRANSFER","-1","9","-1"),
