@@ -1,7 +1,7 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.10-VOIDRECEIPT-PRIOR
-# Corecteaza doar randul CXSTOCURI apasat.
+# VERSIUNE: 3.11-CXCURBAL-FULL
+# Corecteaza randul CXSTOCURI apasat + tranzactia sursa (MATUSETRANS/MATRECTRANS).
 # ISSUE pe mai multe straturi FIFO: 3 pasi (commit in script; NU Save pe ecran intre pasi).
 # PAS 1 = INVUSELINESPLIT lipsa; PAS 2 = MATUSETRANS nou (ACTUALDATE +1 min);
 # PAS 3 = CXSTOCURI nou + corectie CXQTY/CXCURBAL. Info FIFO dupa fiecare pas.
@@ -12,6 +12,8 @@
 # Daca INVUSELINE lipseste, corecteaza totusi pretul tranzactiei si jurnalul.
 # RETURN preia acelasi pret FIFO al consumului.
 # VOIDRECEIPT anterior: anulare pe pret (newest-first), ca in CXINVAUDIT — nu blocheaza ISSUE.
+# Dupa corectie: recalculeaza CXCURBAL pe TOT jurnalul grupei (nu doar pretul afectat),
+# ca BADFIFO=Y pe sold sa fie reparat odata cu / chiar fara diferenta de pret.
 # NU modifica INVUSE/INVUSELINE, receptii, stoc fizic, INVLIFOFIFOCOST ori ROWSTAMP.
 # Necesita protectia CXADDTOCXSTOCURI si teste fara concurenta in TEST.
 # Calcule Java BigDecimal; fara decimal/json/re si fara filtre de pilot.
@@ -89,7 +91,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.10-VOIDRECEIPT-PRIOR"
+VERSION="3.11-CXCURBAL-FULL"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -790,8 +792,6 @@ def execute(context):
             value=money(qty_doc*cost)
             changes={ij["id"]:{"qty":qty_journal,"cost":cost}}
             after=ledger(journal,changes)
-            affected=set([ij["cost"],cost])
-            affected_rows=[r for r in journal if r["cost"] in affected or r["id"] in changes]
             plans=[]
             def plan_number(m,field,value):
                 old=number(m,field,True)
@@ -803,7 +803,7 @@ def execute(context):
                 plan_number(rm,f,value)
             if not rm.isNull("LINECOST2"):
                 plan_number(rm,"LINECOST2",value)
-            for r in affected_rows:
+            for r in journal:
                 if r["id"] in changes:
                     plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
                 plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
@@ -907,8 +907,6 @@ def execute(context):
             value=money(qty*cost)
             changes={rj["id"]:{"qty":qty,"cost":cost}}
             after=ledger(journal,changes)
-            affected=set([rj["cost"],cost])
-            affected_rows=[r for r in journal if r["cost"] in affected or r["id"] in changes]
             plans=[]
             def plan_number(m,field,value):
                 old=number(m,field,True)
@@ -920,7 +918,7 @@ def execute(context):
                 plan_number(rm,f,-value)
             if not rm.isNull("LINECOST2"):
                 plan_number(rm,"LINECOST2",-value)
-            for r in affected_rows:
+            for r in journal:
                 if r["id"] in changes:
                     plan_number(r["mbo"],"CXQTY",changes[r["id"]]["qty"])
                     plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
@@ -1022,8 +1020,6 @@ def execute(context):
             value=money((-qty)*cost)
             changes={ij["id"]:{"qty":qty,"cost":cost}}
             after=ledger(journal,changes)
-            affected=set([ij["cost"],cost])
-            affected_rows=[r for r in journal if r["cost"] in affected or r["id"] in changes]
             plans=[]
             def plan_number(m,field,value):
                 old=number(m,field,True)
@@ -1035,7 +1031,7 @@ def execute(context):
                 plan_number(first,f,value)
             if not first.isNull("LINECOST2"):
                 plan_number(first,"LINECOST2",value)
-            for r in affected_rows:
+            for r in journal:
                 if r["id"] in changes:
                     plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
                 plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
@@ -1463,8 +1459,6 @@ def execute(context):
             jr=jbyref[a["member"]["id"]]
             changes[jr["id"]]={"qty":-a["qty"],"cost":a["cost"]}
         after=ledger(journal,changes)
-        affected=set([r["cost"] for r in targets]+[a["cost"] for a in mapped])
-        affected_rows=[r for r in journal if r["cost"] in affected or r["id"] in changes]
         for a in mapped:
             m=a["member"]["mbo"]
             plan_number(m,"QUANTITY",-a["qty"])
@@ -1480,7 +1474,7 @@ def execute(context):
             plan_receipt(m,a["receipt"])
             # ponytail: fara creates nu atingem INVUSELINESPLIT (evita BMXAA8229W);
             # pretul pe split ramane eventual desincronizat pana la un PAS de split real.
-        for r in affected_rows:
+        for r in journal:
             if r["id"] in changes:
                 plan_number(r["mbo"],"CXQTY",changes[r["id"]]["qty"])
                 plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])

@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.15-PLAIN-POPUP
+# VERSIUNE: 5.16-BADFIFO-SOLD
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -8,11 +8,10 @@
 # Conventie: N + MOTIV=ORDINE_DATE daca deficitul poate fi asociat unor intrari
 # ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
 # ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
-# MATRECTRANS se citeste numai pentru FROMSTORELOC afisat pe intrari.
+# BADFIFO=Y pe diferenta de pret SAU pe sold CXCURBAL gresit/lipsa.
 # Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
-# INVBALANCES.CURBAL se actualizeaza doar daca tot CXSTOCURI e OK FIFO
-# (data/pret/cantitate); apoi, daca CURBAL == straturi, aliniaza INVLIFOFIFOCOST
-# prin stergere/editare/reutilizare (fara create).
+# INVBALANCES.CURBAL = TOTAL SOLD straturi, doar daca nu exista BADFIFO=Y/U;
+# apoi aliniaza INVLIFOFIFOCOST (sum QUANTITY) la aceleasi straturi.
 # Scrierea INVLIFOFIFOCOST se face pe setul copil al INVENTORY (getOwner valid).
 # QUANTITY/UNITCOST/CURBAL se scriu cu MaxType Locale.US.
 # Popup Check FIFO: text simplu (fara wrapper HTML de latime).
@@ -87,7 +86,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.15-PLAIN-POPUP"
+VERSION = "5.16-BADFIFO-SOLD"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -260,11 +259,15 @@ def ordinary_entry(row):
     return row.get("kind") in ENTRY_TYPES and row.get("qty") is not None and row["qty"] > QTY_TOLERANCE
 
 def flag(record):
+    # Y = pret gresit SAU sold CXCURBAL gresit/lipsa.
     row=record["row"]
+    sold_bad=bool(record.get("balance_bad") or record.get("balance_missing"))
     if ordinary_entry(row):
-        return None
+        return "Y" if sold_bad else None
     if row.get("kind")=="INITIAL" or record["status"]=="N/A":
-        return "NA"
+        return "Y" if sold_bad else "NA"
+    if sold_bad:
+        return "Y"
     if record["status"] in ("OK","DATE_ORDER"):
         return "N"
     if record["status"]=="BAD" and record["expected"] is not None:
@@ -575,14 +578,17 @@ def generated_compact_info(value):
     value = info_plaintext(value)
     if "\n" in value:
         return False
-    if value.startswith("FROMSTORELOC=") and " | " not in value:
-        return bool(value[len("FROMSTORELOC="):].strip())
-    prefix = "INITIAL: FIFO LOCAL "
-    if value.startswith(prefix):
-        parts = value[len(prefix):].split(" buc. la ")
-        if len(parts) != 2:
+    if value.startswith("FROMSTORELOC="):
+        parts = value.split(" | ")
+        if len(parts) == 1:
+            return bool(value[len("FROMSTORELOC="):].strip())
+        return parts[-1] in ("BADFIFO=Y", "BADFIFO=N", "BADFIFO=U", "BADFIFO=NA") and bool(
+            parts[0][len("FROMSTORELOC="):].strip())
+    def initial_qty_cost_ok(body):
+        parts_ic = body.split(" buc. la ")
+        if len(parts_ic) != 2:
             return False
-        for part in parts:
+        for part in parts_ic:
             if part == "necunoscut":
                 continue
             try:
@@ -592,6 +598,19 @@ def generated_compact_info(value):
             except Exception:
                 return False
         return True
+    prefix = "INITIAL: FIFO LOCAL "
+    if value.startswith(prefix) and " | " not in value:
+        return initial_qty_cost_ok(value[len(prefix):])
+    parts = value.split(" | ")
+    if parts and parts[-1] in ("BADFIFO=Y", "BADFIFO=N", "BADFIFO=U", "BADFIFO=NA"):
+        core = " | ".join(parts[:-1])
+        if core.startswith(prefix) and " | ATENTIE SOLD:" not in core:
+            return initial_qty_cost_ok(core[len(prefix):])
+        if core.startswith(prefix) and " | ATENTIE SOLD:" in core:
+            head = core.split(" | ATENTIE SOLD:")[0]
+            return initial_qty_cost_ok(head[len(prefix):]) and parts[-1] == "BADFIFO=Y"
+        if core == "INITIAL: BAZA NECONCLUDENTA; vezi rezumatul auditului":
+            return True
     if value == "INITIAL: BAZA NECONCLUDENTA; vezi rezumatul auditului":
         return True
     parts = value.split(" | ")
@@ -638,11 +657,23 @@ def description_visible(old, record, summary):
     if info_plaintext(kept):
         raise ValueError("CXSTOCURIID=%s contine note manuale; descrierea nu este suprascrisa" % row["id"])
     if ordinary_entry(row):
-        return "FROMSTORELOC="+(txt(row.get("from_location")).strip() or "NEIDENTIFICAT")
+        info="FROMSTORELOC="+(txt(row.get("from_location")).strip() or "NEIDENTIFICAT")
+        if record.get("balance_missing"):
+            info+=" | ATENTIE SOLD: CXCURBAL lipsa | BADFIFO=Y"
+        elif record["balance_bad"]:
+            info+=" | ATENTIE SOLD: inregistrat %s; calculat %s | BADFIFO=Y" % (
+                fmt_ro(row.get("balance")),fmt_ro(record["balance_expected"]))
+        return info
     if row.get("kind")=="INITIAL":
         if record["status"]!="INITIAL":
-            return "INITIAL: BAZA NECONCLUDENTA; vezi rezumatul auditului"
-        return "INITIAL: FIFO LOCAL %s buc. la %s" % (fmt_ro(row.get("balance")),fmt_ro(row.get("cost")))
+            return "INITIAL: BAZA NECONCLUDENTA; vezi rezumatul auditului | BADFIFO=U"
+        info="INITIAL: FIFO LOCAL %s buc. la %s" % (fmt_ro(row.get("balance")),fmt_ro(row.get("cost")))
+        if record.get("balance_missing"):
+            return info+" | ATENTIE SOLD: CXCURBAL lipsa | BADFIFO=Y"
+        if record["balance_bad"]:
+            return info+" | ATENTIE SOLD: inregistrat %s; calculat %s | BADFIFO=Y" % (
+                fmt_ro(row.get("balance")),fmt_ro(record["balance_expected"]))
+        return info+" | BADFIFO=NA"
     status=record["status"]
     if status=="DATE_ORDER":
         info="OK: pret compatibil %s; intrare ulterioara cu RefID anterior; data iesirii de verificat (conventie)" % fmt_ro(record["expected"])
@@ -832,19 +863,19 @@ def enrich_returns(inventory,rows,script_service):
             row["issue_id"]=links.get(row.get("ref_id"))
 
 def journal_fifo_complete(audit):
-    # True doar daca data/pret/cantitate sunt OK pe tot jurnalul (fara ORDINE_DATE).
-    # Nu blocheaza pe "istoric incomplet" informativ; blocheaza pe status/flag/sold.
+    # True doar fara BADFIFO=Y/U pe pret/sold si fara ORDINE_DATE/neverificat.
     if audit.get("ledger_qty") is None:
         return False,"Sold CXSTOCURI nedeterminabil"
     for rec in audit["records"].values():
         status=rec.get("status")
-        if status in ("BAD","UNVERIFIED","DATE_ORDER"):
-            return False,"Exista tranzactii FIFO necorecte (pret/data/neverificate)"
-        if rec.get("balance_bad") or rec.get("balance_missing"):
-            return False,"Exista neconcordante de cantitate/sold in CXSTOCURI"
+        if status in ("UNVERIFIED","DATE_ORDER"):
+            return False,"Exista tranzactii FIFO necorecte (data/neverificate)"
         row=rec["row"]
-        if (is_outgoing(row) or row.get("kind")=="RETURN") and flag(rec) in ("Y","U"):
-            return False,"Iesiri/retururi cu pret gresit sau neverificate"
+        f=flag(rec)
+        if f=="Y":
+            return False,"Exista BADFIFO=Y (pret sau sold CXCURBAL gresit)"
+        if f=="U" and (is_outgoing(row) or row.get("kind")=="RETURN"):
+            return False,"Exista iesiri/retururi neverificate"
         if row.get("kind")!="INITIAL" and not row.get("date"):
             return False,"Exista tranzactii fara data in CXSTOCURI"
     return True,"OK"
@@ -855,24 +886,27 @@ def local_summary(audit,unknown_origins):
     counts=dict((f,sum(1 for r in exits if flag(r)==f)) for f in ("N","Y","U"))
     date_orders=sum(1 for r in exits if r["status"]=="DATE_ORDER")
     structural=sum(1 for r in records if r["status"]=="UNVERIFIED" and not is_outgoing(r["row"]))
-    verdict="DIFERENTE" if counts["Y"] else ("NECONCLUDENT" if counts["U"] or structural else ("N CU EXCEPTII ORDINE_DATE" if date_orders else "OK"))
-    warnings=sum(1 for r in records if r["balance_bad"] or r["balance_missing"])
+    sold_flags=sum(1 for r in records if r.get("balance_bad") or r.get("balance_missing"))
+    entry_bad=sum(1 for r in records if ordinary_entry(r["row"]) and flag(r)=="Y")
+    verdict="DIFERENTE" if counts["Y"] or entry_bad or sold_flags else (
+        "NECONCLUDENT" if counts["U"] or structural else (
+            "N CU EXCEPTII ORDINE_DATE" if date_orders else "OK"))
     entries=sum(1 for r in records if ordinary_entry(r["row"]))
     returns=[r for r in records if r["row"].get("kind")=="RETURN"]
     return_counts=dict((f,sum(1 for r in returns if flag(r)==f)) for f in ("N","Y","U"))
     if return_counts["Y"]:
         verdict="DIFERENTE"
     lines=["CHECK FIFO","Verdict: "+verdict,"",
-           "IESIRI","  OK: %s" % counts["N"],"  Diferenta de pret: %s" % counts["Y"],
+           "IESIRI","  OK: %s" % counts["N"],"  Diferente pret/sold: %s" % counts["Y"],
            "  Neverificate: %s" % counts["U"],
            "  Iesiri cu data de verificat: %s" % date_orders,"",
            "INTRARI","  Informative: %s" % entries,
-           "  Avertizari de sold: %s" % warnings,
+           "  Sold CXCURBAL gresit (BADFIFO=Y): %s" % sold_flags,
            "  Provenienta necunoscuta: %s" % unknown_origins,
            "  Cantitate ramasa in CXSTOCURI: %s" % fmt_ro(audit["ledger_qty"])]
     if returns:
         lines.extend(["","RETURURI","  OK: %s" % return_counts["N"],
-                      "  Diferenta de pret: %s" % return_counts["Y"],
+                      "  Diferente pret/sold: %s" % return_counts["Y"],
                       "  Neverificate: %s" % return_counts["U"]])
     return "\n".join(lines)
 
@@ -894,14 +928,6 @@ def sync_invbalances_curbal(inventory,target_qty,audit,script_service):
     layers_qty=sum((layer["qty"] for layer in (audit.get("layers") or [])),ZERO)
     if target_qty is None:
         target_qty=layers_qty
-    if audit.get("ledger_qty") is not None and far(audit["ledger_qty"],target_qty,QTY_TOLERANCE):
-        msg="\n".join([
-            "ACTUALIZARE INVBALANCES.CURBAL: sarita",
-            "  Motiv: sold ledger CXSTOCURI (%s) != total straturi (%s)" % (
-                fmt_ro(audit["ledger_qty"]),fmt_ro(target_qty)),
-        ])
-        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
-        return msg
     ms=None
     try:
         ms=MXServer.getMXServer().getMboSet("INVBALANCES",inventory.getUserInfo())
@@ -1325,6 +1351,13 @@ def check_layer_beats_negative_balance():
     bad_complete,bad_reason=journal_fifo_complete(blocked)
     if bad_complete:
         raise ValueError("self-check: jurnalul insuficient nu trebuie sa autorizeze CURBAL")
+    sold_rec=voided["records"][4]
+    sold_rec["balance_bad"]=True
+    if flag(sold_rec)!="Y":
+        raise ValueError("self-check: sold gresit trebuie BADFIFO=Y")
+    sold_rec["balance_bad"]=False
+    if flag(sold_rec)!="N":
+        raise ValueError("self-check: ISSUE OK fara sold gresit trebuie BADFIFO=N")
     desired=[
         {"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
         {"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
