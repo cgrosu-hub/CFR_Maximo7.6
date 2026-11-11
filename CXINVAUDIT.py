@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.14-CURBAL-POPUP
+# VERSIUNE: 5.15-PLAIN-POPUP
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -15,7 +15,7 @@
 # prin stergere/editare/reutilizare (fara create).
 # Scrierea INVLIFOFIFOCOST se face pe setul copil al INVENTORY (getOwner valid).
 # QUANTITY/UNITCOST/CURBAL se scriu cu MaxType Locale.US.
-# Popup Check FIFO: HTML min-width ~50% mai lat decat dialogul implicit.
+# Popup Check FIFO: text simplu (fara wrapper HTML de latime).
 # Scrie DESCRIPTION_LONGDESCRIPTION; pe conditiile de mai sus INVBALANCES/INVLIFO.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
@@ -87,12 +87,11 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.14-CURBAL-POPUP"
+VERSION = "5.15-PLAIN-POPUP"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
 MAX_LAYER_LINES = 30
-POPUP_MIN_WIDTH_PX = 720
 FIX_PREFIX = "CXFIFO_FIX1|"
 BEGIN = "CXFIFO_AUDIT_V2_BEGIN"
 END = "CXFIFO_AUDIT_V2_END"
@@ -877,18 +876,6 @@ def local_summary(audit,unknown_origins):
                       "  Neverificate: %s" % return_counts["U"]])
     return "\n".join(lines)
 
-def html_escape(value):
-    return (txt(value).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-            .replace('"',"&quot;"))
-
-def format_check_fifo_popup(message):
-    # ~50% mai lat decat dialogul tipic Maximo (~480px). Necesita mesaj HTML-friendly.
-    body=html_escape(message).replace("\n","<br/>")
-    return ("<!-- RICH TEXT -->"
-            "<div style=\"min-width:%spx;width:%spx;max-width:95vw;"
-            "white-space:normal;font-family:Consolas,monospace;font-size:12px;"
-            "line-height:1.35;\">%s</div>" % (POPUP_MIN_WIDTH_PX,POPUP_MIN_WIDTH_PX,body))
-
 def sync_invbalances_curbal(inventory,target_qty,audit,script_service):
     from psdi.server import MXServer
     from psdi.mbo import MboConstants,SqlFormat
@@ -1425,7 +1412,7 @@ def run_local(inventory,script_service):
 
 if "mbo" in globals() and "service" in globals():
     try:
-        result=format_check_fifo_popup(run_local(mbo,service))
+        result=run_local(mbo,service)
     except ValueError as exc:
-        result=format_check_fifo_popup("Audit local oprit: "+txt(exc))
+        result="Audit local oprit: "+txt(exc)
     service.error("CXCHECKFIFO","RESULT",[result])
