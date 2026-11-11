@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.16-BADFIFO-SOLD
+# VERSIUNE: 5.17-INITIAL-N
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -9,12 +9,12 @@
 # ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
 # ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
 # BADFIFO=Y pe diferenta de pret SAU pe sold CXCURBAL gresit/lipsa.
+# INITIAL valid: BADFIFO=N; mai multe INITIAL pe aceeasi data cu preturi diferite = OK
+# (straturi de deschidere). Refuza doar INITIAL duplicat pe acelasi pret / dupa miscari.
 # Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
 # INVBALANCES.CURBAL = TOTAL SOLD straturi, doar daca nu exista BADFIFO=Y/U;
 # apoi aliniaza INVLIFOFIFOCOST (sum QUANTITY) la aceleasi straturi.
-# Scrierea INVLIFOFIFOCOST se face pe setul copil al INVENTORY (getOwner valid).
-# QUANTITY/UNITCOST/CURBAL se scriu cu MaxType Locale.US.
-# Popup Check FIFO: text simplu (fara wrapper HTML de latime).
+# Scrierea INVLIFOFIFOCOST pe setul copil al INVENTORY; MaxType Locale.US.
 # Scrie DESCRIPTION_LONGDESCRIPTION; pe conditiile de mai sus INVBALANCES/INVLIFO.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
@@ -86,7 +86,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.16-BADFIFO-SOLD"
+VERSION = "5.17-INITIAL-N"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -259,12 +259,16 @@ def ordinary_entry(row):
     return row.get("kind") in ENTRY_TYPES and row.get("qty") is not None and row["qty"] > QTY_TOLERANCE
 
 def flag(record):
-    # Y = pret gresit SAU sold CXCURBAL gresit/lipsa.
+    # Y = pret gresit SAU sold CXCURBAL gresit/lipsa. INITIAL valid = N.
     row=record["row"]
     sold_bad=bool(record.get("balance_bad") or record.get("balance_missing"))
     if ordinary_entry(row):
         return "Y" if sold_bad else None
-    if row.get("kind")=="INITIAL" or record["status"]=="N/A":
+    if row.get("kind")=="INITIAL":
+        if sold_bad:
+            return "Y"
+        return "N" if record["status"]=="INITIAL" else "U"
+    if record["status"]=="N/A":
         return "Y" if sold_bad else "NA"
     if sold_bad:
         return "Y"
@@ -419,9 +423,11 @@ def audit_rows(rows):
                 rec["reason"]=structural
                 continue
             if kind=="INITIAL":
+                # Mai multe INITIAL in aceeasi data cu preturi diferite = straturi de deschidere OK.
+                # Ambiguu doar: dupa miscari, pret/sold invalid, sau acelasi pret duplicat.
                 if (movement or cost is None or cost<ZERO or balance is None or balance<ZERO or
-                    cost in openings or (row["date"] in initial_dates and initial_dates[row["date"]]!=cost)):
-                    structural="INITIAL incomplet/negativ/duplicat/dupa miscari sau ordine ambigua"
+                    cost in openings):
+                    structural="INITIAL incomplet/negativ/duplicat/dupa miscari"
                     rec["reason"]=structural
                     for prior in group_rows:
                         if records[prior["id"]]["status"]=="INITIAL":
@@ -673,7 +679,7 @@ def description_visible(old, record, summary):
         if record["balance_bad"]:
             return info+" | ATENTIE SOLD: inregistrat %s; calculat %s | BADFIFO=Y" % (
                 fmt_ro(row.get("balance")),fmt_ro(record["balance_expected"]))
-        return info+" | BADFIFO=NA"
+        return info+" | BADFIFO=N"
     status=record["status"]
     if status=="DATE_ORDER":
         info="OK: pret compatibil %s; intrare ulterioara cu RefID anterior; data iesirii de verificat (conventie)" % fmt_ro(record["expected"])

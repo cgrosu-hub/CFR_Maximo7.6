@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.11-CXCURBAL-FULL
+# VERSIUNE: 3.12-INITIAL-MULTI
 # Corecteaza randul CXSTOCURI apasat + tranzactia sursa (MATUSETRANS/MATRECTRANS).
 # ISSUE pe mai multe straturi FIFO: 3 pasi (commit in script; NU Save pe ecran intre pasi).
 # PAS 1 = INVUSELINESPLIT lipsa; PAS 2 = MATUSETRANS nou (ACTUALDATE +1 min);
@@ -9,6 +9,7 @@
 # Cale normala (fara creates): NU atinge INVUSELINESPLIT — doar MATUSETRANS+CXSTOCURI.
 # SHIPTRANSFER/TRANSFER de iesire din MATRECTRANS: doar MATRECTRANS+CXSTOCURI (fara split).
 # Strat INITIAL e provenienta legitima (MATRECTRANSID null pe linia corespunzatoare).
+# Mai multe INITIAL pe aceeasi data cu preturi diferite = OK (straturi de deschidere).
 # Daca INVUSELINE lipseste, corecteaza totusi pretul tranzactiei si jurnalul.
 # RETURN preia acelasi pret FIFO al consumului.
 # VOIDRECEIPT anterior: anulare pe pret (newest-first), ca in CXINVAUDIT — nu blocheaza ISSUE.
@@ -91,7 +92,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.11-CXCURBAL-FULL"
+VERSION="3.12-INITIAL-MULTI"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -312,10 +313,9 @@ def replay(prior,links=None):
             fail("Data lipsa/pret negativ in istoricul anterior")
         kind,qty,cost=r["kind"],r["qty"],r["cost"]
         if kind=="INITIAL":
+            # Mai multe INITIAL aceeasi data / preturi diferite = straturi deschidere OK.
             if movement or cost in opening or r["balance"] is None or r["balance"]<ZERO:
                 fail("INITIAL ambiguu")
-            if r["date"] in opening_dates and opening_dates[r["date"]]!=cost:
-                fail("Ordine INITIAL cu preturi diferite neconfirmata")
             opening.add(cost)
             opening_dates[r["date"]]=cost
             if r["balance"]>EPS:
