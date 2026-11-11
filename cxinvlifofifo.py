@@ -9,8 +9,14 @@
 #   INVTRANS.TRANSDATE
 # Nu depinde de lantul getOwner(): Check FIFO salveaza INVLIFOFIFOCOST
 # de pe INVENTORY, unde getOwner()/getOwner().getOwner() pot fi None.
+# COSTDATE e read-only / cheie: se scrie doar la add sau daca e null.
+# Update-urile de QUANTITY din Check FIFO nu trebuie sa atinga COSTDATE.
 #
 ################################################
+
+from psdi.mbo import MboConstants
+
+FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 
 service.log_info('*** Starting Script CXINVLIFOFIFO ***')
 
@@ -19,14 +25,30 @@ def lookup_ref(name, id_field, ref_id):
     try:
         return ms.getMbo(0)
     finally:
-        # ponytail: set temporar pe acelasi MBO; cleanup e suficient, fara close agresiv.
         try:
             ms.cleanup()
         except Exception:
             pass
 
+def set_costdate(value):
+    # BMXAA0019I pe update: COSTDATE read-only / parte din cheie.
+    if value is None:
+        return False
+    if not mbo.toBeAdded() and not mbo.isNull("COSTDATE"):
+        service.log_info('*** CXINVLIFOFIFO: COSTDATE deja setat pe update; neschimbat ***')
+        return False
+    try:
+        mbo.setValue("COSTDATE", value, FLAGS)
+        return True
+    except Exception:
+        service.log_info('*** CXINVLIFOFIFO: COSTDATE nu poate fi scris (read-only/cheie) ***')
+        return False
+
 if mbo.isNull("REFOBJECT") or mbo.isNull("REFOBJECTID"):
     service.log_info('*** CXINVLIFOFIFO: fara REFOBJECT/REFOBJECTID; COSTDATE neschimbat ***')
+elif not mbo.toBeAdded() and not mbo.isNull("COSTDATE"):
+    # Check FIFO (si alte update-uri pe cantitate): nu atinge Data costului.
+    service.log_info('*** CXINVLIFOFIFO: update pe rand existent; COSTDATE neschimbat ***')
 else:
     refObj = mbo.getString("REFOBJECT")
     refId = mbo.getLong("REFOBJECTID")
@@ -38,10 +60,10 @@ else:
         service.log_info('*** Avem matrectrans record***')
         try:
             src = lookup_ref("MATRECTRANS", "MATRECTRANSID", refId)
-            if src is not None and src.getString("ISSUETYPE") != "ISSUE":
-                mbo.setValue("COSTDATE", src.getDate("ACTUALDATE"))
-            elif src is None:
+            if src is None:
                 service.log_info('*** MATRECTRANS %s negasit; COSTDATE neschimbat ***' % refId)
+            elif src.getString("ISSUETYPE") != "ISSUE":
+                set_costdate(src.getDate("ACTUALDATE"))
         except Exception:
             service.log_info('*** Err set costdate from matrectrans***')
 
@@ -50,13 +72,13 @@ else:
         service.log_info('*** Avem MATUSETRANS record***')
         try:
             src = lookup_ref("MATUSETRANS", "MATUSETRANSID", refId)
-            # USETYPE pe unele configuratii; ISSUETYPE e campul standard Maximo.
-            use_type = src.getString("ISSUETYPE") if src is not None and not src.isNull("ISSUETYPE") else (
-                src.getString("USETYPE") if src is not None and not src.isNull("USETYPE") else "")
-            if src is not None and use_type != "ISSUE":
-                mbo.setValue("COSTDATE", src.getDate("ACTUALDATE"))
-            elif src is None:
+            if src is None:
                 service.log_info('*** MATUSETRANS %s negasit; COSTDATE neschimbat ***' % refId)
+            else:
+                use_type = src.getString("ISSUETYPE") if not src.isNull("ISSUETYPE") else (
+                    src.getString("USETYPE") if not src.isNull("USETYPE") else "")
+                if use_type != "ISSUE":
+                    set_costdate(src.getDate("ACTUALDATE"))
         except Exception:
             service.log_info('*** Err set costdate from matusetrans***')
 
@@ -65,12 +87,13 @@ else:
         service.log_info('*** Avem INVUSELINE record***')
         try:
             src = lookup_ref("INVUSELINE", "INVUSELINEID", refId)
-            use_type = src.getString("USETYPE") if src is not None and not src.isNull("USETYPE") else (
-                src.getString("ISSUETYPE") if src is not None and not src.isNull("ISSUETYPE") else "")
-            if src is not None and use_type != "ISSUE":
-                mbo.setValue("COSTDATE", src.getDate("ACTUALDATE"))
-            elif src is None:
+            if src is None:
                 service.log_info('*** INVUSELINE %s negasit; COSTDATE neschimbat ***' % refId)
+            else:
+                use_type = src.getString("USETYPE") if not src.isNull("USETYPE") else (
+                    src.getString("ISSUETYPE") if not src.isNull("ISSUETYPE") else "")
+                if use_type != "ISSUE":
+                    set_costdate(src.getDate("ACTUALDATE"))
         except Exception:
             service.log_info('*** Err set costdate from invuseline***')
 
@@ -79,9 +102,9 @@ else:
         service.log_info('*** Avem INVTRANS record***')
         try:
             src = lookup_ref("INVTRANS", "INVTRANSID", refId)
-            if src is not None and not src.isNull("TRANSDATE"):
-                mbo.setValue("COSTDATE", src.getDate("TRANSDATE"))
-            elif src is None:
+            if src is None:
                 service.log_info('*** INVTRANS %s negasit; COSTDATE neschimbat ***' % refId)
+            elif not src.isNull("TRANSDATE"):
+                set_costdate(src.getDate("TRANSDATE"))
         except Exception:
             service.log_info('*** Err set costdate from invtrans***')
