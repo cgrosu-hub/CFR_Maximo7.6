@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.11-INVLIFO-OWNER
+# VERSIUNE: 5.12-INVLIFO-QTY-US
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -14,6 +14,7 @@
 # doar prin stergere/editare (fara create). Lipsa de randuri -> sectiune separata.
 # Scrierea INVLIFOFIFOCOST se face pe setul copil al INVENTORY (getOwner valid),
 # ca launch point-ul CXINVLFIFO sa nu cada pe None.getOwner().
+# QUANTITY/UNITCOST se scriu cu MaxType Locale.US (evita 30.745 -> 30745 in RO).
 # Scrie DESCRIPTION_LONGDESCRIPTION; pe conditia de mai sus si INVLIFOFIFOCOST.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
@@ -85,7 +86,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.11-INVLIFO-OWNER"
+VERSION = "5.12-INVLIFO-QTY-US"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -990,15 +991,27 @@ def read_invbalances_curbal(inventory):
         close_set(ms)
 
 def put_invlifo_number(mbo,field,value):
+    # String + locale RO: "30.745" poate deveni 30745. MaxType US pastreaza zecimalul.
     from psdi.mbo import MboConstants
+    from psdi.util import MaxType
+    from java.util import Locale, TimeZone
     flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
     current=numeric_field(mbo,field)
     if current is not None and not far(current,value,QTY_TOLERANCE):
         return False
-    mbo.setValue(field,txt(value),flags)
+    mv=mbo.getMboValue(field)
+    if mv.isReadOnly() and not mbo.toBeAdded():
+        raise ValueError("Campul %s este read-only pe INVLIFOFIFOCOST" % field)
+    typed=MaxType.createMaxType(Locale.US,TimeZone.getTimeZone("UTC"),mv.getType())
+    typed.setScale(mv.getScale())
+    typed.setValue(txt(value))
+    if far(dec(typed.asString()),value,QTY_TOLERANCE):
+        raise ValueError("Precizia %s nu pastreaza %s pe INVLIFOFIFOCOST" % (field,txt(value)))
+    mbo.setValue(field,typed,flags)
     written=numeric_field(mbo,field)
     if written is None or far(written,value,QTY_TOLERANCE):
-        raise ValueError("Nu pot scrie %s=%s pe INVLIFOFIFOCOST" % (field,txt(value)))
+        raise ValueError("Nu pot scrie %s=%s pe INVLIFOFIFOCOST (citit %s)" % (
+            field,txt(value),"null" if written is None else txt(written)))
     return True
 
 def sync_invlifofifocost(inventory,rows,audit,script_service):
