@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.13-INVLIFO-REUSE
+# VERSIUNE: 5.14-CURBAL-POPUP
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -10,12 +10,13 @@
 # ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
 # MATRECTRANS se citeste numai pentru FROMSTORELOC afisat pe intrari.
 # Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
-# Daca INVBALANCES.CURBAL == total straturi CXSTOCURI: aliniaza INVLIFOFIFOCOST
-# prin stergere/editare (fara create). Surplusul se reutilizeaza: se pastreaza un
-# rand si se actualizeaza UNITCOST/QUANTITY/COSTDATE/REFOBJECT/REFOBJECTID.
+# INVBALANCES.CURBAL se actualizeaza doar daca tot CXSTOCURI e OK FIFO
+# (data/pret/cantitate); apoi, daca CURBAL == straturi, aliniaza INVLIFOFIFOCOST
+# prin stergere/editare/reutilizare (fara create).
 # Scrierea INVLIFOFIFOCOST se face pe setul copil al INVENTORY (getOwner valid).
-# QUANTITY/UNITCOST se scriu cu MaxType Locale.US (evita 30.745 -> 30745 in RO).
-# Scrie DESCRIPTION_LONGDESCRIPTION; pe conditia de mai sus si INVLIFOFIFOCOST.
+# QUANTITY/UNITCOST/CURBAL se scriu cu MaxType Locale.US.
+# Popup Check FIFO: HTML min-width ~50% mai lat decat dialogul implicit.
+# Scrie DESCRIPTION_LONGDESCRIPTION; pe conditiile de mai sus INVBALANCES/INVLIFO.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -86,11 +87,12 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.13-INVLIFO-REUSE"
+VERSION = "5.14-CURBAL-POPUP"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
 MAX_LAYER_LINES = 30
+POPUP_MIN_WIDTH_PX = 720
 FIX_PREFIX = "CXFIFO_FIX1|"
 BEGIN = "CXFIFO_AUDIT_V2_BEGIN"
 END = "CXFIFO_AUDIT_V2_END"
@@ -830,6 +832,24 @@ def enrich_returns(inventory,rows,script_service):
         if row.get("kind")=="RETURN" and row.get("ref_mbo")=="MATUSETRANS":
             row["issue_id"]=links.get(row.get("ref_id"))
 
+def journal_fifo_complete(audit):
+    # True doar daca data/pret/cantitate sunt OK pe tot jurnalul (fara ORDINE_DATE).
+    # Nu blocheaza pe "istoric incomplet" informativ; blocheaza pe status/flag/sold.
+    if audit.get("ledger_qty") is None:
+        return False,"Sold CXSTOCURI nedeterminabil"
+    for rec in audit["records"].values():
+        status=rec.get("status")
+        if status in ("BAD","UNVERIFIED","DATE_ORDER"):
+            return False,"Exista tranzactii FIFO necorecte (pret/data/neverificate)"
+        if rec.get("balance_bad") or rec.get("balance_missing"):
+            return False,"Exista neconcordante de cantitate/sold in CXSTOCURI"
+        row=rec["row"]
+        if (is_outgoing(row) or row.get("kind")=="RETURN") and flag(rec) in ("Y","U"):
+            return False,"Iesiri/retururi cu pret gresit sau neverificate"
+        if row.get("kind")!="INITIAL" and not row.get("date"):
+            return False,"Exista tranzactii fara data in CXSTOCURI"
+    return True,"OK"
+
 def local_summary(audit,unknown_origins):
     records=list(audit["records"].values())
     exits=[r for r in records if is_outgoing(r["row"])]
@@ -856,6 +876,108 @@ def local_summary(audit,unknown_origins):
                       "  Diferenta de pret: %s" % return_counts["Y"],
                       "  Neverificate: %s" % return_counts["U"]])
     return "\n".join(lines)
+
+def html_escape(value):
+    return (txt(value).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            .replace('"',"&quot;"))
+
+def format_check_fifo_popup(message):
+    # ~50% mai lat decat dialogul tipic Maximo (~480px). Necesita mesaj HTML-friendly.
+    body=html_escape(message).replace("\n","<br/>")
+    return ("<!-- RICH TEXT -->"
+            "<div style=\"min-width:%spx;width:%spx;max-width:95vw;"
+            "white-space:normal;font-family:Consolas,monospace;font-size:12px;"
+            "line-height:1.35;\">%s</div>" % (POPUP_MIN_WIDTH_PX,POPUP_MIN_WIDTH_PX,body))
+
+def sync_invbalances_curbal(inventory,target_qty,audit,script_service):
+    from psdi.server import MXServer
+    from psdi.mbo import MboConstants,SqlFormat
+    from psdi.util import MaxType
+    from java.util import Locale,TimeZone
+    flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
+    ok,reason=journal_fifo_complete(audit)
+    if not ok:
+        msg="\n".join([
+            "ACTUALIZARE INVBALANCES.CURBAL: sarita",
+            "  Motiv: %s" % reason,
+            "  CURBAL se actualizeaza doar cand toate tranzactiile CXSTOCURI sunt OK FIFO (data/pret/cantitate).",
+        ])
+        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
+        return msg
+    layers_qty=sum((layer["qty"] for layer in (audit.get("layers") or [])),ZERO)
+    if target_qty is None:
+        target_qty=layers_qty
+    if audit.get("ledger_qty") is not None and far(audit["ledger_qty"],target_qty,QTY_TOLERANCE):
+        msg="\n".join([
+            "ACTUALIZARE INVBALANCES.CURBAL: sarita",
+            "  Motiv: sold ledger CXSTOCURI (%s) != total straturi (%s)" % (
+                fmt_ro(audit["ledger_qty"]),fmt_ro(target_qty)),
+        ])
+        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
+        return msg
+    ms=None
+    try:
+        ms=MXServer.getMXServer().getMboSet("INVBALANCES",inventory.getUserInfo())
+        condition=SqlFormat("ITEMNUM=:1 AND SITEID=:2 AND LOCATION=:3")
+        condition.setObject(1,"INVBALANCES","ITEMNUM",inventory.getString("ITEMNUM"))
+        condition.setObject(2,"INVBALANCES","SITEID",inventory.getString("SITEID"))
+        condition.setObject(3,"INVBALANCES","LOCATION",inventory.getString("LOCATION"))
+        ms.setWhere(condition.format())
+        ms.reset()
+        rows=[]
+        m=ms.moveFirst()
+        while m is not None:
+            if len(rows)>=MAX_ROWS:
+                raise ValueError("Limita INVBALANCES depasita")
+            qty=numeric_field(m,"CURBAL")
+            if qty is None:
+                raise ValueError("INVBALANCES.CURBAL lipsa")
+            rows.append({"mbo":m,"qty":qty,"id":m.getUniqueIDValue()})
+            m=ms.moveNext()
+        if not rows:
+            raise ValueError("INVBALANCES lipsa pentru articol/gestiune")
+        current_total=sum((r["qty"] for r in rows),ZERO)
+        if not far(current_total,target_qty,QTY_TOLERANCE):
+            msg="\n".join([
+                "ACTUALIZARE INVBALANCES.CURBAL: deja aliniat",
+                "  CURBAL = CXSTOCURI = %s" % fmt_ro(target_qty),
+            ])
+            script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
+            return msg
+        nonzero=[r for r in rows if abs(r["qty"])>QTY_TOLERANCE]
+        if len(rows)>1 and len(nonzero)>1:
+            msg="\n".join([
+                "ACTUALIZARE INVBALANCES.CURBAL: sarita",
+                "  Motiv: %s randuri INVBALANCES cu sold; actualizare automata nesigura" % len(nonzero),
+                "  CURBAL cumulat %s -> tinta %s" % (fmt_ro(current_total),fmt_ro(target_qty)),
+            ])
+            script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
+            return msg
+        target_row=nonzero[0] if nonzero else rows[0]
+        old=target_row["qty"]
+        mv=target_row["mbo"].getMboValue("CURBAL")
+        typed=MaxType.createMaxType(Locale.US,TimeZone.getTimeZone("UTC"),mv.getType())
+        typed.setScale(mv.getScale())
+        typed.setValue(txt(target_qty))
+        target_row["mbo"].setValue("CURBAL",typed,flags)
+        written=numeric_field(target_row["mbo"],"CURBAL")
+        if written is None or far(written,target_qty,QTY_TOLERANCE):
+            raise ValueError("Nu pot scrie CURBAL=%s (citit %s)" % (
+                txt(target_qty),"null" if written is None else txt(written)))
+        ms.save()
+        msg="\n".join([
+            "ACTUALIZARE INVBALANCES.CURBAL",
+            "  Conditie: CXSTOCURI complet OK FIFO (data/pret/cantitate)",
+            "  INVBALANCESID=%s: %s -> %s" % (target_row["id"],fmt_ro(old),fmt_ro(target_qty)),
+        ])
+        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
+        return msg
+    except Exception as exc:
+        msg="ACTUALIZARE INVBALANCES.CURBAL ESUATA: %s" % txt(exc)
+        script_service.log_info("CXINVAUDIT "+msg)
+        return msg
+    finally:
+        close_set(ms)
 
 def price_label(value):
     rounded=fmt(value)
@@ -1210,6 +1332,12 @@ def check_layer_beats_negative_balance():
         raise ValueError("self-check: provenienta stratului ramas e gresita")
     if layers[0].get("source_ref_mbo")!="MATRECTRANS":
         raise ValueError("self-check: CXREFMBO stratului ramas lipseste")
+    ok_complete,ok_reason=journal_fifo_complete(voided)
+    if not ok_complete:
+        raise ValueError("self-check: jurnalul VOIDRECEIPT trebuia considerat complet OK: "+ok_reason)
+    bad_complete,bad_reason=journal_fifo_complete(blocked)
+    if bad_complete:
+        raise ValueError("self-check: jurnalul insuficient nu trebuie sa autorizeze CURBAL")
     desired=[
         {"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
         {"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
@@ -1279,8 +1407,9 @@ def run_local(inventory,script_service):
         if changed:
             root.save()
         message=local_summary(audit,unknown)
-        layers_text,unused_total=fifo_layers_situation(rows,audit,script_service)
+        layers_text,layers_total=fifo_layers_situation(rows,audit,script_service)
         message+="\n\n"+layers_text
+        message+="\n\n"+sync_invbalances_curbal(inventory,layers_total,audit,script_service)
         message+="\n\n"+sync_invlifofifocost(inventory,rows,audit,script_service)
         message+="\n\n"+invlifo_totals(inventory,rows,script_service)
         script_service.log_info("CXINVAUDIT "+VERSION+": "+message.replace("\n"," | "))
@@ -1296,7 +1425,7 @@ def run_local(inventory,script_service):
 
 if "mbo" in globals() and "service" in globals():
     try:
-        result=run_local(mbo,service)
+        result=format_check_fifo_popup(run_local(mbo,service))
     except ValueError as exc:
-        result="Audit local oprit: "+txt(exc)
+        result=format_check_fifo_popup("Audit local oprit: "+txt(exc))
     service.error("CXCHECKFIFO","RESULT",[result])
