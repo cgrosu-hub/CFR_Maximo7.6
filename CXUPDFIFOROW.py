@@ -1,11 +1,13 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.3-AFTER-RECEIPT
+# VERSIUNE: 3.4-SHIPTRANSFER-AFTER
 # Implicit: muta la maximul orelor din aceeasi zi (acelasi site/gestiune) + 1 minut.
 # RETURN inainte de ISSUE (ISSUEID): data = ISSUE + 1 minut (MATUSETRANS+CXSTOCURI).
-# ISSUE datat gresit inaintea unei intrari, DOAR daca |qty| < suma stoc pe toate
-# intrarile FIFO (acelasi site/gestiune/grupa) si stocul anterior e insuficient:
+# ISSUE/SHIPTRANSFER datat gresit inaintea unei intrari, DOAR daca |qty| < suma stoc
+# pe toate intrarile FIFO (acelasi site/gestiune/grupa) si stocul anterior e insuficient:
 # data = prima intrare ulterioara + 1 minut.
+# SHIPTRANSFER: daca receptia legata (RECEIPTREF) ar ramane inaintea noii date,
+# o muta si pe ea (MATRECTRANS+CXSTOCURI) la aceeasi data — nu blocheaza.
 # INITIAL: doar CXDOCUMENTDATE. INVTRANS netratat.
 
 from java.math import BigDecimal
@@ -22,10 +24,15 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
+VERSION = "3.4-SHIPTRANSFER-AFTER"
 SUPPORTED = {
     "MATRECTRANS": ("MATRECTRANSID", "ACTUALDATE", ("RECEIPT", "TRANSFER", "SHIPTRANSFER", "SHIPRECEIPT", "RETURN", "VOIDRECEIPT", "SHIPRETURN", "SHIPCANCEL")),
     "MATUSETRANS": ("MATUSETRANSID", "ACTUALDATE", ("ISSUE", "RETURN"))
 }
+
+def after_receipt_exit(kind, table):
+    return ((kind == "ISSUE" and table == "MATUSETRANS") or
+            (kind == "SHIPTRANSFER" and table == "MATRECTRANS"))
 
 def fail(message):
     raise ValueError(message)
@@ -205,22 +212,42 @@ def validate_source(source, rows, table):
         if "CXFIFO_FIX1|" in r.getString("DESCRIPTION_LONGDESCRIPTION"):
             fail("Exista istoric de corectie de pret pe un rand legat; data nu se schimba automat")
 
-def check_shipment_order(source, new_ms):
-    if source.getName() != "MATRECTRANS":
+def check_shipment_parent(source, new_ms):
+    if source.getName() != "MATRECTRANS" or source.isNull("RECEIPTREF"):
         return
-    if not source.isNull("RECEIPTREF"):
-        parent_id = source.getLong("RECEIPTREF")
-        parent_set = source.getMboSet("$CXFIFO_PARENTDATE", "MATRECTRANS", "MATRECTRANSID=%s" % parent_id)
-        parents = rows_of(parent_set)
-        if len(parents) != 1 or parents[0].isNull("ACTUALDATE"):
-            fail("Tranzactia-parinte lipsa sau fara ACTUALDATE")
-        if parents[0].getDate("ACTUALDATE").getTime() > new_ms:
-            fail("Noua data ar fi anterioara tranzactiei-parinte")
-    if source.getString("ISSUETYPE") == "SHIPTRANSFER":
-        children = source.getMboSet("$CXFIFO_CHILDDATES", "MATRECTRANS", "RECEIPTREF=%s" % source.getLong("MATRECTRANSID"))
-        for child in rows_of(children):
-            if child.isNull("ACTUALDATE") or child.getDate("ACTUALDATE").getTime() < new_ms:
-                fail("Noua data a expedierii ar depasi o receptie/anulare legata")
+    parent_id = source.getLong("RECEIPTREF")
+    parent_set = source.getMboSet("$CXFIFO_PARENTDATE", "MATRECTRANS", "MATRECTRANSID=%s" % parent_id)
+    parents = rows_of(parent_set)
+    if len(parents) != 1 or parents[0].isNull("ACTUALDATE"):
+        fail("Tranzactia-parinte lipsa sau fara ACTUALDATE")
+    if parents[0].getDate("ACTUALDATE").getTime() > new_ms:
+        fail("Noua data ar fi anterioara tranzactiei-parinte")
+
+def linked_shipment_children_to_bump(source, new_ms):
+    # Receptii/anulari cu RECEIPTREF pe acest SHIPTRANSFER, datate inaintea noii expedieri.
+    if source.getName() != "MATRECTRANS" or source.getString("ISSUETYPE") != "SHIPTRANSFER":
+        return []
+    children = source.getMboSet("$CXFIFO_CHILDDATES", "MATRECTRANS",
+                                "RECEIPTREF=%s" % source.getLong("MATRECTRANSID"))
+    bump = []
+    for child in rows_of(children):
+        if child.isNull("ACTUALDATE"):
+            fail("Receptie/anulare legata fara ACTUALDATE MATRECTRANSID=%s" % child.getUniqueIDValue())
+        if child.getDate("ACTUALDATE").getTime() < new_ms:
+            bump.append(child)
+    return bump
+
+def journal_rows_for_refs(all_rows, table, ref_ids):
+    if not ref_ids:
+        return []
+    wanted = set(ref_ids)
+    found = []
+    for r in all_rows:
+        if r.getString("CXREFMBO") != table or r.isNull("CXREFID"):
+            continue
+        if r.getLong("CXREFID") in wanted:
+            found.append(r)
+    return found
 
 def plan_balances(all_rows, linked, new_ms, require_before=True):
     moved_ids = set(r.getUniqueIDValue() for r in linked)
@@ -244,10 +271,14 @@ def plan_balances(all_rows, linked, new_ms, require_before=True):
                if different(number(r, "CXCURBAL"), after[r.getUniqueIDValue()])]
     return after, changed
 
-def apply_dates_and_balances(linked, changed, after, new_ms, source=None, date_field=None):
+def apply_dates_and_balances(linked, changed, after, new_ms, source=None, date_field=None, extra_sources=None):
     new_date = Date(new_ms)
     if source is not None and date_field is not None:
         source.setValue(date_field, new_date, MboConstants.NOACCESSCHECK)
+    for extra in (extra_sources or []):
+        extra.setValue("ACTUALDATE", new_date, MboConstants.NOACCESSCHECK)
+        if extra.getDate("ACTUALDATE").getTime() != new_ms:
+            fail("Validarile au schimbat data receptiei/anularii legate")
     for r in linked:
         r.setValue("CXDOCUMENTDATE", new_date, MboConstants.NOACCESSCHECK)
         if stamp(r) != new_ms:
@@ -396,9 +427,9 @@ def execute(context):
                     new_ms = issue_ms + SHIFT_MS
                     date_mode = "AFTER_ISSUE"
                     daymax_blocked = False
-            # ISSUE inaintea unei receptii, doar daca |qty| < stoc total pe intrari
-            # si stocul cronologic anterior e insuficient (data gresita, nu lipsa reala).
-            if date_mode == "DAYMAX" and kind == "ISSUE" and table == "MATUSETRANS":
+            # ISSUE/SHIPTRANSFER inaintea unei intrari, doar daca |qty| < stoc total pe
+            # intrari si stocul cronologic anterior e insuficient (data gresita).
+            if date_mode == "DAYMAX" and after_receipt_exit(kind, table):
                 consumed = number(target, "CXQTY").abs()
                 inbound = total_inbound_stock(all_rows, target)
                 prior = stock_before(all_rows, target)
@@ -411,17 +442,24 @@ def execute(context):
                         require_before = False
             if date_mode == "DAYMAX" and daymax_blocked:
                 fail("Maximul zilei + un minut depaseste ziua curenta; nimic modificat")
-            check_shipment_order(source, new_ms)
+            check_shipment_parent(source, new_ms)
+            child_sources = linked_shipment_children_to_bump(source, new_ms)
+            child_ids = [c.getLong("MATRECTRANSID") for c in child_sources]
+            child_journal = journal_rows_for_refs(all_rows, "MATRECTRANS", child_ids)
+            moved = list(linked)
+            for r in child_journal:
+                if r.getUniqueIDValue() not in set(x.getUniqueIDValue() for x in moved):
+                    moved.append(r)
             for r in linked:
                 if stamp(r) != old_ms:
                     fail("Randurile aceleiasi surse au date diferite")
-            after, changed = plan_balances(all_rows, linked, new_ms, require_before)
+            after, changed = plan_balances(all_rows, moved, new_ms, require_before)
             formatter = SimpleDateFormat("dd.MM.yyyy HH:mm:ss")
             formatter.setTimeZone(timezone)
             mode_txt = {"AFTER_ISSUE": "ISSUE+1min", "AFTER_RECEIPT": "receptie+1min"}.get(date_mode, "zi+1min")
-            message = "%s/%s RefID=%s (%s): %s -> %s; jurnal date=%s; solduri=%s; sursa %s.%s" % (
+            message = "%s/%s RefID=%s (%s): %s -> %s; jurnal date=%s; solduri=%s; receptii legate=%s; sursa %s.%s" % (
                 table, kind, refid, mode_txt, formatter.format(Date(old_ms)), formatter.format(Date(new_ms)),
-                len(linked), len(changed), table, date_field)
+                len(moved), len(changed), len(child_sources), table, date_field)
             if DRY_RUN:
                 return "SIMULARE; nimic salvat. " + message
             verify = open_item(context)
@@ -436,7 +474,14 @@ def execute(context):
                 fail("Sursa modificata concurent; nimic salvat")
             close_set(verify)
             verify = None
-            apply_dates_and_balances(linked, changed, after, new_ms, source, date_field)
+            apply_dates_and_balances(moved, changed, after, new_ms, source, date_field, child_sources)
+            # ACTUALDATE pe MATRECTRANS (sursa + receptii legate) trebuie salvat explicit.
+            saved_sets = []
+            for mbo_src in [source] + list(child_sources):
+                ms = mbo_src.getThisMboSet()
+                if ms is not None and ms not in saved_sets:
+                    ms.save()
+                    saved_sets.append(ms)
             root.save()
             service.log_info("CXUPDFIFOROW user=%s CXSTOCURIID=%s; %s" % (
                 context.getUserInfo().getUserName(), target_id, message))

@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.12-INITIAL-MULTI
+# VERSIUNE: 3.13-SHIPRETURN
 # Corecteaza randul CXSTOCURI apasat + tranzactia sursa (MATUSETRANS/MATRECTRANS).
 # ISSUE pe mai multe straturi FIFO: 3 pasi (commit in script; NU Save pe ecran intre pasi).
 # PAS 1 = INVUSELINESPLIT lipsa; PAS 2 = MATUSETRANS nou (ACTUALDATE +1 min);
@@ -12,7 +12,7 @@
 # Mai multe INITIAL pe aceeasi data cu preturi diferite = OK (straturi de deschidere).
 # Daca INVUSELINE lipseste, corecteaza totusi pretul tranzactiei si jurnalul.
 # RETURN preia acelasi pret FIFO al consumului.
-# VOIDRECEIPT anterior: anulare pe pret (newest-first), ca in CXINVAUDIT — nu blocheaza ISSUE.
+# VOIDRECEIPT/SHIPRETURN anterior: anulare pe pret (newest-first), ca in CXINVAUDIT.
 # Dupa corectie: recalculeaza CXCURBAL pe TOT jurnalul grupei (nu doar pretul afectat),
 # ca BADFIFO=Y pe sold sa fie reparat odata cu / chiar fara diferenta de pret.
 # NU modifica INVUSE/INVUSELINE, receptii, stoc fizic, INVLIFOFIFOCOST ori ROWSTAMP.
@@ -92,7 +92,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.12-INITIAL-MULTI"
+VERSION="3.13-SHIPRETURN"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -108,7 +108,7 @@ PRICE_EPS=ExactNumber("0.0005")
 FLAGS=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 ENTRIES=("RECEIPT","SHIPRECEIPT","TRANSFER")
 EXITS=("ISSUE","SHIPTRANSFER","TRANSFER")
-VOID_TYPES=("VOIDRECEIPT",)
+VOID_TYPES=("VOIDRECEIPT","SHIPRETURN")
 MATREC_EXITS=("SHIPTRANSFER","TRANSFER")
 WRITE_TABLES=("INVUSELINESPLIT","MATUSETRANS","MATRECTRANS","CXSTOCURI")
 SPLIT_COPY=("INVUSENUM","ORGID","SITEID","INVUSELINEID","FROMLOT","ROTASSETNUM","FROMBIN",
@@ -340,14 +340,14 @@ def replay(prior,links=None):
             continue
         if kind in VOID_TYPES:
             if qty>=-EPS:
-                fail("VOIDRECEIPT anterior fara cantitate negativa RefID=%s" % r["ref"])
+                fail("%s anterior fara cantitate negativa RefID=%s" % (kind,r["ref"]))
             required=-qty
             available=sum((l["qty"] for l in layers if not different(l["cost"],cost,PRICE_EPS)),ZERO)
             if available+EPS<required:
-                fail("Stoc pe pret insuficient pentru VOIDRECEIPT anterior RefID=%s" % r["ref"])
+                fail("Stoc pe pret insuficient pentru %s anterior RefID=%s" % (kind,r["ref"]))
             allocations,short=consume_at_cost(layers,required,cost,newest_first=True)
             if short>EPS or not allocations:
-                fail("VOIDRECEIPT anterior nu a putut anula stocul pe pret RefID=%s" % r["ref"])
+                fail("%s anterior nu a putut anula stocul pe pret RefID=%s" % (kind,r["ref"]))
             started=True
             continue
         if qty>ZERO:

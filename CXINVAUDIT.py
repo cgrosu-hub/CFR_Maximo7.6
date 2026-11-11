@@ -1,10 +1,11 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.17-INITIAL-N
+# VERSIUNE: 5.18-SHIPRETURN
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
-# VOIDRECEIPT anuleaza stoc pe acelasi pret (preferinta: receptia cea mai recenta).
+# VOIDRECEIPT/SHIPRETURN anuleaza stoc pe acelasi pret (receptia cea mai recenta).
+# Tipurile ambigue NU blocheaza auditul pe randurile urmatoare din grupa.
 # Conventie: N + MOTIV=ORDINE_DATE daca deficitul poate fi asociat unor intrari
 # ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
 # ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
@@ -86,7 +87,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.17-INITIAL-N"
+VERSION = "5.18-SHIPRETURN"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -100,8 +101,8 @@ COST_TOLERANCE = ExactNumber("0.0005")
 QTY_TOLERANCE = ExactNumber("0.000001")
 ENTRY_TYPES = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 EXIT_TYPES = ("ISSUE", "SHIPTRANSFER", "TRANSFER")
-VOID_TYPES = ("VOIDRECEIPT",)
-AMBIGUOUS_TYPES = ("SHIPCANCEL", "VOIDSHIPRECEIPT", "SHIPRETURN", "RECBALADJ")
+VOID_TYPES = ("VOIDRECEIPT", "SHIPRETURN")
+AMBIGUOUS_TYPES = ("SHIPCANCEL", "VOIDSHIPRECEIPT", "RECBALADJ")
 def txt(value):
     return "" if value is None else string_type(value)
 
@@ -469,16 +470,16 @@ def audit_rows(rows):
                 continue
             if kind in VOID_TYPES:
                 if qty>=-QTY_TOLERANCE:
-                    rec["reason"]="VOIDRECEIPT fara cantitate negativa"
+                    rec["reason"]="%s fara cantitate negativa" % kind
                     continue
                 required=-qty
                 available=sum((l["qty"] for l in layers if not far(l["cost"],cost,COST_TOLERANCE)),ZERO)
                 if available+QTY_TOLERANCE<required:
-                    rec["reason"]="Stoc pe pret insuficient pentru VOIDRECEIPT"
+                    rec["reason"]="Stoc pe pret insuficient pentru %s" % kind
                     continue
                 allocations,short=consume_at_cost(layers,required,cost,newest_first=True)
                 if short>QTY_TOLERANCE or not allocations:
-                    rec["reason"]="VOIDRECEIPT nu a putut anula stocul pe pret"
+                    rec["reason"]="%s nu a putut anula stocul pe pret" % kind
                     continue
                 rec["allocations"]=allocations
                 rec["expected"]=cost
@@ -486,8 +487,8 @@ def audit_rows(rows):
                 local_started=True
                 continue
             if kind in AMBIGUOUS_TYPES:
-                structural="Tip %s fara alocare verificabila in jurnal" % kind
-                rec["reason"]=structural
+                # Doar acest rand; nu infecteaza structural restul grupei.
+                rec["reason"]="Tip %s fara alocare verificabila in jurnal" % kind
                 continue
             if abs(qty)<=QTY_TOLERANCE:
                 rec["status"]="N/A"
@@ -683,8 +684,8 @@ def description_visible(old, record, summary):
     status=record["status"]
     if status=="DATE_ORDER":
         info="OK: pret compatibil %s; intrare ulterioara cu RefID anterior; data iesirii de verificat (conventie)" % fmt_ro(record["expected"])
-    elif status=="OK" and row.get("kind")=="VOIDRECEIPT":
-        info="OK: VOIDRECEIPT anuleaza %s buc. la %s" % (fmt_ro(-row["qty"]),fmt_ro(record["expected"]))
+    elif status=="OK" and row.get("kind") in VOID_TYPES:
+        info="OK: %s anuleaza %s buc. la %s" % (row.get("kind"),fmt_ro(-row["qty"]),fmt_ro(record["expected"]))
     elif status=="OK":
         info="OK: FIFO LOCAL asteptat %s" % fmt_ro(record["expected"])
     elif status=="BAD":
@@ -1354,6 +1355,25 @@ def check_layer_beats_negative_balance():
     ok_complete,ok_reason=journal_fifo_complete(voided)
     if not ok_complete:
         raise ValueError("self-check: jurnalul VOIDRECEIPT trebuia considerat complet OK: "+ok_reason)
+    shipret=audit_rows([
+        row(1,"2026-01-13 00:00:00.000000000",11,"SHIPRECEIPT","400","0.440","400"),
+        row(2,"2026-01-13 10:42:00.000000000",12,"ISSUE","-400","0.440","0","MATUSETRANS"),
+        row(3,"2026-03-10 10:43:00.000000000",21,"SHIPRECEIPT","500","0.440","500"),
+        row(4,"2026-03-10 11:04:00.000000000",22,"SHIPRECEIPT","500","0.440","1000"),
+        row(5,"2026-03-10 14:42:00.000000000",31,"SHIPRETURN","-500","0.440","500"),
+        row(6,"2026-03-10 14:43:00.000000000",41,"ISSUE","-500","0.440","0","MATUSETRANS"),
+    ])
+    if shipret["records"][5]["status"]!="OK":
+        raise ValueError("self-check: SHIPRETURN trebuie sa fie OK")
+    if not shipret["records"][5]["allocations"] or shipret["records"][5]["allocations"][0].get("source_ref_id")!=22:
+        raise ValueError("self-check: SHIPRETURN trebuie sa anuleze receptia recenta")
+    if shipret["records"][6]["status"]!="OK":
+        raise ValueError("self-check: ISSUE dupa SHIPRETURN nu trebuie NEVERIFICAT")
+    if flag(shipret["records"][5])!="N" or flag(shipret["records"][6])!="N":
+        raise ValueError("self-check: SHIPRETURN/ISSUE OK trebuie BADFIFO=N")
+    sr_complete,sr_reason=journal_fifo_complete(shipret)
+    if not sr_complete:
+        raise ValueError("self-check: jurnalul SHIPRETURN trebuia complet OK: "+sr_reason)
     bad_complete,bad_reason=journal_fifo_complete(blocked)
     if bad_complete:
         raise ValueError("self-check: jurnalul insuficient nu trebuie sa autorizeze CURBAL")
