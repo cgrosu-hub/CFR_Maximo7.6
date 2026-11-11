@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.12-INVLIFO-QTY-US
+# VERSIUNE: 5.13-INVLIFO-REUSE
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -11,9 +11,9 @@
 # MATRECTRANS se citeste numai pentru FROMSTORELOC afisat pe intrari.
 # Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
 # Daca INVBALANCES.CURBAL == total straturi CXSTOCURI: aliniaza INVLIFOFIFOCOST
-# doar prin stergere/editare (fara create). Lipsa de randuri -> sectiune separata.
-# Scrierea INVLIFOFIFOCOST se face pe setul copil al INVENTORY (getOwner valid),
-# ca launch point-ul CXINVLFIFO sa nu cada pe None.getOwner().
+# prin stergere/editare (fara create). Surplusul se reutilizeaza: se pastreaza un
+# rand si se actualizeaza UNITCOST/QUANTITY/COSTDATE/REFOBJECT/REFOBJECTID.
+# Scrierea INVLIFOFIFOCOST se face pe setul copil al INVENTORY (getOwner valid).
 # QUANTITY/UNITCOST se scriu cu MaxType Locale.US (evita 30.745 -> 30745 in RO).
 # Scrie DESCRIPTION_LONGDESCRIPTION; pe conditia de mai sus si INVLIFOFIFOCOST.
 # Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
@@ -86,7 +86,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.12-INVLIFO-QTY-US"
+VERSION = "5.13-INVLIFO-REUSE"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -922,9 +922,10 @@ def same_ref(left_mbo,left_id,right_mbo,right_id):
     return normalize_ref_mbo(left_mbo)==normalize_ref_mbo(right_mbo) and left_id==right_id
 
 def plan_invlifo_alignment(desired,current):
-    # Match pe pret+REFOBJECT+REFOBJECTID; prefera QUANTITY exacta, apoi id mai mic.
+    # 1) match pe pret+REFOBJECT+REFOBJECTID
+    # 2) pentru straturi fara match: reutilizeaza surplus (nu create); restul surplus = delete
     unused=list(current)
-    updates,keeps,creates=[],[],[]
+    updates,keeps,missing=[],[],[]
     for layer in desired:
         candidates=[]
         for row in unused:
@@ -934,23 +935,32 @@ def plan_invlifo_alignment(desired,current):
                 continue
             candidates.append(row)
         if not candidates:
-            creates.append(layer)
+            missing.append(layer)
             continue
         exact=[row for row in candidates if not far(row["qty"],layer["qty"],QTY_TOLERANCE)]
         pool=exact or candidates
         pool.sort(key=lambda row:(0 if not far(row["qty"],layer["qty"],QTY_TOLERANCE) else 1,row["id"]))
         chosen=pool[0]
         unused.remove(chosen)
-        if far(chosen["qty"],layer["qty"],QTY_TOLERANCE):
-            updates.append({"row":chosen,"qty":layer["qty"]})
-        else:
+        same_qty=not far(chosen["qty"],layer["qty"],QTY_TOLERANCE)
+        if same_qty:
             keeps.append(chosen)
+        else:
+            updates.append({"row":chosen,"layer":layer,"reuse":False})
+    unused.sort(key=lambda row:row["id"])
+    creates=[]
+    for layer in missing:
+        if unused:
+            chosen=unused.pop(0)
+            updates.append({"row":chosen,"layer":layer,"reuse":True})
+        else:
+            creates.append(layer)
     return keeps,updates,unused,creates
 
 def format_missing_invlifo_creates(creates):
     lines=["INVLIFOFIFOCOST CREARI OMISE",
            "  Nu se creeaza randuri noi in INVLIFOFIFOCOST.",
-           "  Straturi CXSTOCURI fara corespondent existent: %s" % len(creates),
+           "  Straturi CXSTOCURI fara rand reutilizabil: %s" % len(creates),
            "  UNITCOST | SOLD | CXREFMBO | CXREFID"]
     for layer in creates[:MAX_LAYER_LINES]:
         lines.append("  %s | %s | %s | %s" % (
@@ -960,6 +970,47 @@ def format_missing_invlifo_creates(creates):
     if len(creates)>MAX_LAYER_LINES:
         lines.append("  Primele %s straturi lipsa; restul in log." % MAX_LAYER_LINES)
     return "\n".join(lines)
+
+def parse_layer_date(value):
+    if not value:
+        return None
+    from java.text import SimpleDateFormat
+    from java.util import TimeZone
+    f=SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    f.setTimeZone(TimeZone.getTimeZone("UTC"))
+    return f.parse(txt(value)[:19])
+
+def apply_invlifo_layer(mbo,layer,flags,script_service):
+    # Actualizeaza randul existent la stratul CXSTOCURI (fara insert).
+    put_invlifo_number(mbo,"UNITCOST",layer["cost"])
+    put_invlifo_number(mbo,"QUANTITY",layer["qty"])
+    ref_mbo=normalize_ref_mbo(layer.get("ref_mbo"))
+    ref_id=layer.get("ref_id")
+    current_mbo=None if mbo.isNull("REFOBJECT") else mbo.getString("REFOBJECT")
+    current_id=None if mbo.isNull("REFOBJECTID") else mbo.getLong("REFOBJECTID")
+    if not same_ref(current_mbo,current_id,ref_mbo,ref_id):
+        if ref_mbo is None:
+            mbo.setValueNull("REFOBJECT",flags)
+        else:
+            mbo.setValue("REFOBJECT",ref_mbo,flags)
+        if ref_id is None:
+            mbo.setValueNull("REFOBJECTID",flags)
+        else:
+            mbo.setValue("REFOBJECTID",long(ref_id),flags)
+        if ref_mbo and ref_id is not None:
+            try:
+                if mbo.isNull("CONDRATE"):
+                    mbo.setValue("CONDRATE",100,flags)
+            except Exception:
+                pass
+    costdate=parse_layer_date(layer.get("date"))
+    if costdate is not None:
+        try:
+            if mbo.isNull("COSTDATE") or (not mbo.isNull("COSTDATE") and mbo.getDate("COSTDATE").getTime()!=costdate.getTime()):
+                mbo.setValue("COSTDATE",costdate,flags)
+        except Exception as exc:
+            script_service.log_info("CXINVAUDIT COSTDATE neschimbat pe INVLIFOFIFOCOSTID=%s: %s" % (
+                mbo.getUniqueIDValue(),txt(exc)))
 
 def read_invbalances_curbal(inventory):
     from psdi.server import MXServer
@@ -1000,8 +1051,6 @@ def put_invlifo_number(mbo,field,value):
     if current is not None and not far(current,value,QTY_TOLERANCE):
         return False
     mv=mbo.getMboValue(field)
-    if mv.isReadOnly() and not mbo.toBeAdded():
-        raise ValueError("Campul %s este read-only pe INVLIFOFIFOCOST" % field)
     typed=MaxType.createMaxType(Locale.US,TimeZone.getTimeZone("UTC"),mv.getType())
     typed.setScale(mv.getScale())
     typed.setValue(txt(value))
@@ -1054,9 +1103,10 @@ def sync_invlifofifocost(inventory,rows,audit,script_service):
             msg="CORECTIE INVLIFOFIFOCOST: deja aliniat la straturile CXSTOCURI"
             script_service.log_info("CXINVAUDIT "+msg)
             return msg
+        reused=sum(1 for item in updates if item.get("reuse"))
         if updates or deletes:
             for item in updates:
-                put_invlifo_number(item["row"]["mbo"],"QUANTITY",item["qty"])
+                apply_invlifo_layer(item["row"]["mbo"],item["layer"],flags,script_service)
             for row in deletes:
                 row["mbo"].delete(flags)
             ms.save()
@@ -1064,15 +1114,15 @@ def sync_invlifofifocost(inventory,rows,audit,script_service):
                 "CORECTIE INVLIFOFIFOCOST",
                 "  Conditie: CURBAL = CXSTOCURI = %s" % fmt_ro(curbal),
                 "  Pastrate: %s" % len(keeps),
-                "  Actualizate: %s" % len(updates),
+                "  Actualizate: %s (reutilizate: %s)" % (len(updates),reused),
                 "  Sterse: %s" % len(deletes),
-                "  Fara create (doar stergere/editare).",
+                "  Fara create (doar stergere/editare/reutilizare).",
             ]))
         elif creates:
             sections.append("\n".join([
                 "CORECTIE INVLIFOFIFOCOST",
                 "  Conditie: CURBAL = CXSTOCURI = %s" % fmt_ro(curbal),
-                "  Nicio stergere/editare necesara pe randurile existente.",
+                "  Nicio stergere/editare posibila: nu exista randuri de reutilizat.",
             ]))
         if creates:
             sections.append(format_missing_invlifo_creates(creates))
@@ -1181,6 +1231,17 @@ def check_layer_beats_negative_balance():
         [row for row in current if row["id"] in (1,3,5)])
     if len(missing_plan[3])!=1 or missing_plan[3][0]["cost"]!=ExactNumber("99.000"):
         raise ValueError("self-check: lipsa INVLIFOFIFOCOST trebuie semnalata fara create")
+    reuse_desired=[{"cost":ExactNumber("14.590"),"qty":ExactNumber("1"),
+                    "ref_mbo":"MATRECTRANS","ref_id":1337422726}]
+    reuse_current=[
+        {"id":10,"cost":ExactNumber("14.590"),"qty":ExactNumber("4"),"ref_mbo":None,"ref_id":None},
+        {"id":11,"cost":ExactNumber("10.000"),"qty":ExactNumber("1"),"ref_mbo":"MATRECTRANS","ref_id":999},
+    ]
+    r_keeps,r_updates,r_deletes,r_creates=plan_invlifo_alignment(reuse_desired,reuse_current)
+    if r_keeps or r_creates or len(r_updates)!=1 or not r_updates[0].get("reuse"):
+        raise ValueError("self-check: surplusul trebuia reutilizat, nu sters+create")
+    if r_updates[0]["row"]["id"]!=10 or [r["id"] for r in r_deletes]!=[11]:
+        raise ValueError("self-check: reutilizare/stergere surplus gresita")
 
 def run_local(inventory,script_service):
     from psdi.mbo import MboConstants
