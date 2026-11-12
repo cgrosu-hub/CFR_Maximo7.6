@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.23-SPLIT-GAP
+# VERSIUNE: 5.24-SPLIT-ON-ROW
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -18,8 +18,7 @@
 # INITIAL valid: BADFIFO=N; mai multe INITIAL pe aceeasi data cu preturi diferite = OK
 # (straturi de deschidere). Refuza doar INITIAL duplicat pe acelasi pret / dupa miscari.
 # Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
-# Sectiune SPLITURI TINTA: INVUSELINESPLIT fara MATUSETRANS, sau MATUSETRANS
-# de split fara CXSTOCURI.
+# Split lipsa: se scrie pe Info FIFO al randurilor din aceeasi linie, nu in popup.
 # INVBALANCES.CURBAL = TOTAL SOLD straturi, doar daca nu exista BADFIFO=Y/U;
 # apoi aliniaza INVLIFOFIFOCOST (sum QUANTITY) la aceleasi straturi.
 # Scrierea INVLIFOFIFOCOST pe setul copil al INVENTORY; MaxType Locale.US.
@@ -94,7 +93,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.23-SPLIT-GAP"
+VERSION = "5.24-SPLIT-ON-ROW"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -630,7 +629,7 @@ def generated_compact_legacy(value):
                 "FARA MISCARE: ", "NEVERIFICAT: ", "DIFERENTA SURSA: ", "DIFERENTA SOLD: ")
     if len(parts) < 2 or parts[-1] not in ("BADFIFO=Y", "BADFIFO=N", "BADFIFO=U", "BADFIFO=NA"):
         return False
-    body = parts[:-1]
+    body = [p for p in parts[:-1] if not p.startswith("SPLIT LIPSA:")]
     if body and body[-1].startswith("Sursa="):
         if not all(v.isdigit() or v=="INITIAL" for v in body[-1][len("Sursa="):].split(",")):
             return False
@@ -1583,8 +1582,8 @@ def in_chunks(ids, size=300):
         yield ids[start:start+size]
         start+=size
 
-def split_gap_section(inventory, rows, script_service):
-    # Evidențiază splitul care nu a ajuns în MATUSETRANS sau în CXSTOCURI.
+def split_gap_by_matusetrans(inventory, rows, script_service):
+    # Pe fiecare linie cu split incomplet: nota scurta pentru randurile CXSTOCURI ale liniei.
     from psdi.mbo import SqlFormat
     try:
         have=set()
@@ -1595,58 +1594,53 @@ def split_gap_section(inventory, rows, script_service):
         condition.setObject(1,"INVUSELINE","ITEMNUM",inventory.getString("ITEMNUM"))
         condition.setObject(2,"INVUSELINE","SITEID",inventory.getString("SITEID"))
         condition.setObject(3,"INVUSELINE","FROMSTORELOC",inventory.getString("LOCATION"))
-        lines=fetch_rows(inventory,"INVUSELINE",condition.format(),(("INVUSELINEID","L"),))
-        line_ids=[r["INVUSELINEID"] for r in lines if r.get("INVUSELINEID") is not None]
+        line_rows=fetch_rows(inventory,"INVUSELINE",condition.format(),(("INVUSELINEID","L"),))
+        line_ids=[r["INVUSELINEID"] for r in line_rows if r.get("INVUSELINEID") is not None]
         splits=[]
         for chunk in in_chunks(line_ids):
             where="INVUSELINEID IN (%s)" % ",".join(txt(i) for i in chunk)
             splits.extend(fetch_rows(inventory,"INVUSELINESPLIT",where,(
-                ("INVUSELINESPLITID","L"),("INVUSELINEID","L"),("QUANTITY","N"),("UNITCOST","N"))))
-        split_ids=[r["INVUSELINESPLITID"] for r in splits if r.get("INVUSELINESPLITID") is not None]
+                ("INVUSELINESPLITID","L"),("INVUSELINEID","L"))))
+        split_to_line={}
+        for s in splits:
+            if s.get("INVUSELINESPLITID") is not None:
+                split_to_line[s["INVUSELINESPLITID"]]=s.get("INVUSELINEID")
         mts=[]
-        for chunk in in_chunks(split_ids):
+        for chunk in in_chunks(list(split_to_line.keys())):
             where="INVUSELINESPLITID IN (%s)" % ",".join(txt(i) for i in chunk)
             mts.extend(fetch_rows(inventory,"MATUSETRANS",where,(
-                ("MATUSETRANSID","L"),("INVUSELINESPLITID","L"),("QUANTITY","N"),("UNITCOST","N"))))
+                ("MATUSETRANSID","L"),("INVUSELINESPLITID","L"))))
         by_split={}
         for m in mts:
             by_split.setdefault(m.get("INVUSELINESPLITID"),[]).append(m)
-        missing_mt=[]
+        miss_mt={}
         for s in splits:
             if not by_split.get(s.get("INVUSELINESPLITID")):
-                missing_mt.append(s)
-        missing_cx=[]
+                miss_mt.setdefault(s.get("INVUSELINEID"),[]).append(s.get("INVUSELINESPLITID"))
+        miss_cx={}
         for m in mts:
             if m.get("MATUSETRANSID") not in have:
-                missing_cx.append(m)
-        lines_out=["SPLITURI TINTA"]
-        if not splits:
-            lines_out.append("  Niciun INVUSELINESPLIT pe liniile acestui articol/gestiune.")
-        elif not missing_mt and not missing_cx:
-            lines_out.append("  Complet: %s splituri au MATUSETRANS si CXSTOCURI." % len(splits))
-        else:
-            lines_out.append("  INVUSELINESPLIT fara MATUSETRANS: %s" % len(missing_mt))
-            for s in missing_mt[:MAX_LAYER_LINES]:
-                lines_out.append("  split %s | linie %s | qty %s | pret %s | LIPSA MATUSETRANS" % (
-                    txt(s.get("INVUSELINESPLITID")),txt(s.get("INVUSELINEID")),
-                    "-" if s.get("QUANTITY") is None else fmt_ro(s.get("QUANTITY")),
-                    "-" if s.get("UNITCOST") is None else price_label(s.get("UNITCOST"))))
-            if len(missing_mt)>MAX_LAYER_LINES:
-                lines_out.append("  ... inca %s splituri fara MATUSETRANS (vezi log)." % (len(missing_mt)-MAX_LAYER_LINES))
-            lines_out.append("  MATUSETRANS de split fara CXSTOCURI: %s" % len(missing_cx))
-            for m in missing_cx[:MAX_LAYER_LINES]:
-                lines_out.append("  MATUSETRANS %s | split %s | qty %s | pret %s | LIPSA CXSTOCURI" % (
-                    txt(m.get("MATUSETRANSID")),txt(m.get("INVUSELINESPLITID")),
-                    "-" if m.get("QUANTITY") is None else fmt_ro(m.get("QUANTITY")),
-                    "-" if m.get("UNITCOST") is None else price_label(m.get("UNITCOST"))))
-            if len(missing_cx)>MAX_LAYER_LINES:
-                lines_out.append("  ... inca %s MATUSETRANS fara CXSTOCURI (vezi log)." % (len(missing_cx)-MAX_LAYER_LINES))
-        msg="\n".join(lines_out)
-        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
-        return msg
+                line=split_to_line.get(m.get("INVUSELINESPLITID"))
+                miss_cx.setdefault(line,[]).append(m.get("MATUSETRANSID"))
+        notes={}
+        for line in set(list(miss_mt.keys())+list(miss_cx.keys())):
+            parts=[]
+            ids=miss_mt.get(line) or []
+            if ids:
+                parts.append("fara MATUSETRANS "+",".join(txt(i) for i in ids[:12]))
+            ids=miss_cx.get(line) or []
+            if ids:
+                parts.append("fara CXSTOCURI "+",".join(txt(i) for i in ids[:12]))
+            note="SPLIT LIPSA: "+", ".join(parts)
+            for m in mts:
+                if split_to_line.get(m.get("INVUSELINESPLITID"))==line and m.get("MATUSETRANSID") in have:
+                    notes[m["MATUSETRANSID"]]=note
+        script_service.log_info("CXINVAUDIT split lipsa pe %s linii, notate %s randuri" % (
+            len(set(list(miss_mt.keys())+list(miss_cx.keys()))),len(notes)))
+        return notes
     except Exception as exc:
-        script_service.log_info("CXINVAUDIT SPLITURI TINTA indisponibil: "+txt(exc))
-        return "SPLITURI TINTA\n  Indisponibil: %s" % txt(exc)
+        script_service.log_info("CXINVAUDIT split lipsa indisponibil: "+txt(exc))
+        return {}
 
 def run_local(inventory,script_service):
     from psdi.mbo import MboConstants
@@ -1670,7 +1664,22 @@ def run_local(inventory,script_service):
         enrich_returns(inventory,rows,script_service)
         enrich_shipcancels(inventory,rows,script_service)
         audit=audit_rows(rows)
-        planned=dict((r["id"],description(r["old_description"],audit["records"][r["id"]],{})) for r in rows)
+        gap_notes=split_gap_by_matusetrans(inventory,rows,script_service)
+        planned={}
+        for r in rows:
+            text=description(r["old_description"],audit["records"][r["id"]],{})
+            if r.get("ref_mbo")=="MATUSETRANS":
+                extra=gap_notes.get(r.get("ref_id"))
+                if extra and "SPLIT LIPSA:" not in text:
+                    token=" | BADFIFO="
+                    pos=text.rfind(token)
+                    if pos>=0:
+                        merged=text[:pos]+" | "+extra+text[pos:]
+                    else:
+                        merged=text+" | "+extra
+                    if len(merged)<=MAX_DESCRIPTION:
+                        text=merged
+            planned[r["id"]]=text
         verify=open_scope(inventory,"CXSTOCURI")
         fresh,unused=read_journal(verify)
         if snapshot(fresh)!=original:
@@ -1687,7 +1696,6 @@ def run_local(inventory,script_service):
         message=local_summary(audit,unknown)
         layers_text,layers_total=fifo_layers_situation(rows,audit,script_service)
         message+="\n\n"+layers_text
-        message+="\n\n"+split_gap_section(inventory,rows,script_service)
         message+="\n\n"+sync_invbalances_curbal(inventory,layers_total,audit,script_service)
         message+="\n\n"+sync_invlifofifocost(inventory,rows,audit,script_service)
         message+="\n\n"+invlifo_totals(inventory,rows,script_service)
