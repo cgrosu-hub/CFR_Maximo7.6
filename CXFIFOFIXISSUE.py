@@ -1,19 +1,13 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.17-SAVE-ISOLATED
-# Corecteaza randul CXSTOCURI apasat + tranzactia sursa (MATUSETRANS/MATRECTRANS).
-# ISSUE (cale normala, un pret FIFO): scrie DOAR
-#   MATUSETRANS: UNITCOST, ACTUALCOST, CURRENCYUNITCOST, LINECOST, CURRENCYLINECOST,
-#                LINECOST2?, QUANTITY/QTYREQUESTED (daca e nevoie), CURBAL?, MATRECTRANSID?
-#   CXSTOCURI (grupa): UNITCOST/CXQTY pe consumul apasat + CXCURBAL pe tot jurnalul grupei
-# Commit in MXTransaction pe seturi MXServer izolate (NU pe DataBean-ul din ecran).
-# Dupa commit: reset/refresh UI — fara Save pe ecran (Save pe ROWSTAMP vechi = BMXAA8229W).
-# Nu amesteca MboSet-ul din tabelul FIFO cu setul de scriere (paginare = doua instante).
-# Cu INVUSELINE: FIFO pe CANTITATEA consumului apasat, nu pe toata linia.
-# Un singur pret FIFO => fara split; preturi multiple => PAS 1/2/3.
-# Cale normala: NU atinge INVUSELINESPLIT.
-# SHIPTRANSFER/TRANSFER: doar MATRECTRANS+CXSTOCURI.
-# RETURN / VOIDRECEIPT / SHIPRETURN / SHIPCANCEL: ca in CXINVAUDIT la replay.
+# VERSIUNE: 3.18-UI16-NOSPLITDUP
+# Revenire la scrierea pe jurnalul din ecran (bind_screen) ca in 3.16 — resetul agresiv
+# pe INVENTORY/MAINRECORD din 3.17 dezactiva Save dupa Bine.
+# Refresh UI bland (doar tabel FIFO + bean-uri split), fara reset pe owner.
+# ISSUE un pret: MATUSETRANS costuri + CXSTOCURI cost/CXCURBAL pe grupa.
+# ISSUE multi-pret: PAS 1/2/3; la PAS 2 nu creeaza MATUSETRANS daca split-ul e deja legat
+# (evita DB2 -803 duplicate).
+# Cu INVUSELINE: FIFO pe consumul apasat. Cale normala: NU atinge INVUSELINESPLIT.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -89,7 +83,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.17-SAVE-ISOLATED"
+VERSION="3.18-UI16-NOSPLITDUP"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -602,9 +596,8 @@ def screen_rows(context):
         row=ms.getMbo(i)
     return found
 
-def assert_screen_fresh(context, rows):
-    # Doar verificare ROWSTAMP pe randurile vizibile. NU reinnoieste mbo pe DataBean:
-    # scrierea pe setul din ecran + set MXServer = BMXAA8229W (paginare / doua instante).
+def bind_screen_journal(context, rows):
+    # Ca in 3.16: randul din tabel se scrie o singura data (aceeasi instanta ca DataBean).
     ui=screen_rows(context)
     for row in rows:
         other=ui.get(row["id"])
@@ -612,6 +605,7 @@ def assert_screen_fresh(context, rows):
             continue
         if text(other.getRowStamp())!=text(row["mbo"].getRowStamp()):
             fail("Jurnalul de pe ecran e invechit pentru CXSTOCURIID=%s; redeschide articolul" % row["id"])
+        row["mbo"]=other
 
 def owns(plans):
     from java.lang import System
@@ -629,24 +623,14 @@ def owns(plans):
     return ordered
 
 def refresh_table(context=None):
-    # Commit deja in DB pe seturi izolate. Reincarca UI ca Save pe ecran sa nu mai fie necesar.
+    # Refresh bland (3.16): doar tabelul FIFO + bean-uri split. NU reseta INVENTORY/owner
+    # — asta dezactiva Save dupa Bine in 3.17.
     from psdi.common.context import UIContext
     ui=UIContext.getCurrentContext()
     session=ui.getWebClientSession() if ui else None
     if session is None:
         return False
     ok=False
-    try:
-        if context is not None:
-            ms=context.getThisMboSet()
-            if ms is not None:
-                ms.reset()
-                ok=True
-            owner=context.getOwner()
-            if owner is not None and owner.getThisMboSet() is not None:
-                owner.getThisMboSet().reset()
-    except Exception:
-        pass
     bean=session.getDataBean(TABLE_ID)
     if bean is not None:
         bean.reset()
@@ -655,7 +639,7 @@ def refresh_table(context=None):
     try:
         app=session.getCurrentApp()
         if app is not None:
-            for name in ("INVUSELINESPLIT","INVUSELINE","INVUSE","MATUSETRANS","MATRECTRANS","MAINRECORD"):
+            for name in ("INVUSELINESPLIT","INVUSELINE","INVUSE","MATUSETRANS","MATRECTRANS"):
                 try:
                     b=app.getDataBean(name)
                     if b is not None:
@@ -817,7 +801,7 @@ def execute(context):
             cxwhere=scope_where(context,"CXSTOCURI")
             cxset,raw=query("CXSTOCURI",cxwhere)
             all_journal=[journal_row(m) for m in raw]
-            assert_screen_fresh(context,all_journal)
+            bind_screen_journal(context,all_journal)
             if any(m.getString("CURRENCYCODE")!=rm.getString("CURRENCYCODE") for m in raw if not m.isNull("CURRENCYCODE")):
                 fail("Monede diferite intre jurnal si MATRECTRANS")
             journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
@@ -917,7 +901,7 @@ def execute(context):
             cxwhere=scope_where(context,"CXSTOCURI")
             cxset,raw=query("CXSTOCURI",cxwhere)
             all_journal=[journal_row(m) for m in raw]
-            assert_screen_fresh(context,all_journal)
+            bind_screen_journal(context,all_journal)
             journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
             rows=[r for r in journal if r["id"]==context.getLong("CXSTOCURIID")]
             if len(rows)!=1 or rows[0]["ref"]!=rm.getLong("MATUSETRANSID") or rows[0]["kind"]!="RETURN":
@@ -1037,7 +1021,7 @@ def execute(context):
             cxwhere=scope_where(context,"CXSTOCURI")
             cxset,raw=query("CXSTOCURI",cxwhere)
             all_journal=[journal_row(m) for m in raw]
-            assert_screen_fresh(context,all_journal)
+            bind_screen_journal(context,all_journal)
             if any(m.getString("CURRENCYCODE")!=first.getString("CURRENCYCODE") for m in raw):
                 fail("Monede diferite intre jurnal si consum")
             journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
@@ -1183,7 +1167,7 @@ def execute(context):
         cxwhere=scope_where(context,"CXSTOCURI")
         cxset,raw=query("CXSTOCURI",cxwhere)
         all_journal=[journal_row(m) for m in raw]
-        assert_screen_fresh(context,all_journal)
+        bind_screen_journal(context,all_journal)
         if any(m.getString("CURRENCYCODE")!=currency for m in raw):
             fail("Monede diferite intre jurnal si consum")
         journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
@@ -1429,8 +1413,19 @@ def execute(context):
             from java.util import Date
             created_rows=[]
             base_actual=template.getDate("ACTUALDATE")
+            existing_by_split={}
+            for mem in mts:
+                if not mem.isNull("INVUSELINESPLITID"):
+                    sid=mem.getLong("INVUSELINESPLITID")
+                    existing_by_split.setdefault(sid,[]).append(mem)
             for idx,c in enumerate(creates):
                 sm=c["split_mbo"]
+                sid=long(c["split_id"])
+                # Evita DB2 -803: un split nu poate primi un al doilea MATUSETRANS.
+                prior_mt=existing_by_split.get(sid) or []
+                if prior_mt:
+                    fail("PAS 2: INVUSELINESPLIT %s are deja MATUSETRANS %s; redeschide articolul si reia din PAS 3 sau sterge duplicatul" % (
+                        sid,prior_mt[0].getLong("MATUSETRANSID")))
                 mm=mset.addAtEnd(FLAGS)
                 for f in MATUSE_COPY:
                     if f=="ACTUALDATE":
@@ -1453,7 +1448,7 @@ def execute(context):
                     mm.setValueNull("MATRECTRANSID",FLAGS)
                 else:
                     mm.setValue("MATRECTRANSID",long(c["receipt"]),FLAGS)
-                mm.setValue("INVUSELINESPLITID",long(c["split_id"]),FLAGS)
+                mm.setValue("INVUSELINESPLITID",sid,FLAGS)
                 if not mm.isNull("ISSUEID"):
                     mm.setValueNull("ISSUEID",FLAGS)
                 if not mm.isNull("QTYRETURNED"):
@@ -1465,6 +1460,7 @@ def execute(context):
                 c["new_id"]=mm.getLong("MATUSETRANSID")
                 c["actual_key"]=datekey(mm.getDate("ACTUALDATE"))
                 created_rows.append(c)
+                existing_by_split.setdefault(sid,[]).append(mm)
                 service.log_info("CXFIFOFIXISSUE PAS2 create MATUSETRANS=%s split=%s qty=%s cost=%s actualdate=+%smin" % (
                     c["new_id"],c["split_id"],fmt(-c["qty"]),fmt(c["cost"]),idx+1))
             ids=",".join(text(c["new_id"]) for c in created_rows)
