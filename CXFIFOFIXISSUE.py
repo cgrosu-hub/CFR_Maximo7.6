@@ -1,13 +1,13 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.22-RETURN-PRIORITY
-# Restaurat 3.22 peste 3.23/3.36. CONTENTUID revine la forma din 3.22.
+# VERSIUNE: 3.20-RETURN-ASTEPTAT
+# Restaurat 3.20 peste 3.22/3.37.
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
-# RETURN: pune stocul inapoi pe prioritatea stratului consumat (ca Check FIFO), nu
-# merge pe primul strat cu acelasi pret din coada (altfel 2,630 ramane in spatele
-# lui 2,960 si ISSUE -40 pare „deja conform” la 2,960 in loc de split).
-# Multi-pret pe consum => PAS 1/2/3 (ex. 30@2,630 + 10@2,960).
-# Splituri libere pe toata linia; split ocupat => nou in PAS 2.
+# RETURN anterior: restabileste stratul pe UNITCOST-ul din jurnalul de retur (nu doar
+# pe pretul ISSUEID), ca FIFO sa vada stocul ieftin reintors (ex. 2,630).
+# Daca planul e „gol” dar Info FIFO are BADFIFO=Y / asteptat ≠ pret curent, forțeaza
+# corectia la pretul asteptat din Check FIFO (evita „nimic modificat” fals).
+# ISSUE multi-pret: PAS 1/2/3; splituri libere pe toata linia; split ocupat => nou in PAS 2.
 # Cu INVUSELINE: FIFO pe consumul apasat. Cale normala: NU atinge INVUSELINESPLIT.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
@@ -84,7 +84,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.37-RESTORE-322"
+VERSION="3.38-RESTORE-320"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -270,49 +270,32 @@ def issue_of_returns(rows,query):
             links[m.getLong("MATUSETRANSID")]=None if m.isNull("ISSUEID") else m.getLong("ISSUEID")
     return links
 
-def put_back(layers,qty,cost,priority,ref=None,refmbo=None,cxid=None,initial=False):
-    # Ca Check FIFO: restabileste pe aceeasi prioritate de strat, nu pe primul pret egal din coada.
+def restore(layers,qty,cost,prior=None):
     for layer in layers:
-        if not different(layer["cost"],cost,PRICE_EPS) and layer.get("priority")==priority:
+        if not different(layer["cost"],cost,PRICE_EPS):
             layer["qty"]+=qty
             return
-    layers.append({"qty":qty,"cost":cost,"ref":ref,"refmbo":refmbo,"cxid":cxid,
-                   "initial":initial,"priority":priority})
-    layers.sort(key=lambda layer: layer.get("priority") or ())
-
-def restore_return(layers,qty,issue_row,allocations,return_cost=None,prior=None):
-    # Intoarce stocul LIFO pe alocarile ISSUE-ului legat (prioritate strat sursa).
-    remaining=qty
-    if allocations:
-        for a in reversed(allocations):
-            if remaining<=EPS:
+    ref=refmbo=cxid=None
+    is_initial=True
+    if prior:
+        ordered=list(reversed(sorted(prior,key=order)))
+        for p in ordered:
+            if different(p.get("cost"),cost,PRICE_EPS):
+                continue
+            if p.get("qty") is not None and p["qty"]>ZERO and p.get("refmbo")=="MATRECTRANS" and p.get("ref") is not None:
+                ref,refmbo,cxid=p["ref"],p["refmbo"],p["id"]
+                is_initial=False
                 break
-            take=min(remaining,a["qty"])
-            if take>EPS:
-                put_back(layers,take,a["cost"],a.get("priority") or order(issue_row),
-                         a.get("ref"),a.get("refmbo"),a.get("cxid"),a.get("initial",False))
-                remaining-=take
-    if remaining>EPS:
-        cost=return_cost if return_cost is not None else issue_row.get("cost")
-        if cost is None:
-            fail("Retur fara pret de restabilire pentru ISSUEID=%s" % issue_row.get("ref"))
-        priority=order(issue_row)
-        # Fara alocare salvata: pune pe cea mai veche sursa cu acelasi pret (ca INITIAL).
-        if prior:
-            for p in sorted(prior,key=order):
-                if order(p)>=order(issue_row):
+        else:
+            for p in ordered:
+                if p.get("kind")=="INITIAL" and not different(p.get("cost"),cost,PRICE_EPS):
+                    ref,refmbo,cxid=p.get("ref"),p.get("refmbo"),p["id"]
                     break
-                if p.get("cost") is None or different(p["cost"],cost,PRICE_EPS):
-                    continue
-                if p.get("kind")=="INITIAL" or (p.get("qty") is not None and p["qty"]>ZERO and p.get("kind") in ENTRIES):
-                    priority=order(p)
-                    break
-        put_back(layers,remaining,cost,priority,
-                 issue_row.get("ref"),issue_row.get("refmbo"),issue_row.get("id"),False)
+    # ponytail: stratul epuizat revine in fata. Pozitia FIFO originala cere pastrarea stratului gol.
+    layers.insert(0,{"qty":qty,"cost":cost,"ref":ref,"refmbo":refmbo,"cxid":cxid,"initial":is_initial})
 
 def replay(prior,links=None):
     layers=[]
-    issue_allocs={}
     initial=any(r["kind"]=="INITIAL" for r in prior)
     prices,opening=set(),set()
     opening_dates={}
@@ -328,8 +311,7 @@ def replay(prior,links=None):
             opening.add(cost)
             opening_dates[r["date"]]=cost
             if r["balance"]>EPS:
-                layers.append({"qty":r["balance"],"cost":cost,"ref":r["ref"],"refmbo":r["refmbo"],
-                               "cxid":r["id"],"initial":True,"priority":order(r)})
+                layers.append({"qty":r["balance"],"cost":cost,"ref":r["ref"],"refmbo":r["refmbo"],"cxid":r["id"],"initial":True})
             continue
         movement=True
         if qty is None:
@@ -345,9 +327,10 @@ def replay(prior,links=None):
             matches=[p for p in prior if p.get("kind")=="ISSUE" and p.get("ref")==issue_id and order(p)<order(r)]
             if len(matches)!=1:
                 fail("Retur anterior %s fara consum unic anterior" % r["ref"])
-            # Pret jurnal retur (ex. 2,630) + pozitia FIFO a alocarii ISSUEID.
+            # Stocul reintors e pe pretul din jurnalul de retur (ex. 2,630), nu neaparat
+            # pe UNITCOST-ul brut al ISSUEID daca acela e inca gresit in jurnal.
             restore_cost=cost if cost is not None else matches[0]["cost"]
-            restore_return(layers,qty,matches[0],issue_allocs.get(issue_id) or [],restore_cost,prior)
+            restore(layers,qty,restore_cost,prior)
             started=True
             continue
         if kind=="SHIPCANCEL":
@@ -357,10 +340,9 @@ def replay(prior,links=None):
                      and p.get("qty") is not None and not different(-p["qty"],qty)
                      and p.get("cost") is not None and not different(p["cost"],cost,PRICE_EPS)]
             if len(matches)==1:
-                ship=matches[0]
-                restore_return(layers,qty,ship,issue_allocs.get(ship.get("ref")) or [],ship["cost"],prior)
+                restore(layers,qty,matches[0]["cost"],prior)
             else:
-                put_back(layers,qty,cost,order(r),r.get("ref"),r.get("refmbo"),r.get("id"),False)
+                restore(layers,qty,cost,prior)
             started=True
             continue
         if kind in VOID_TYPES:
@@ -387,8 +369,7 @@ def replay(prior,links=None):
             prices.add(cost)
             started=True
             if available>EPS:
-                layers.append({"qty":available,"cost":cost,"ref":r["ref"],"refmbo":r["refmbo"],
-                               "cxid":r["id"],"initial":False,"priority":order(r)})
+                layers.append({"qty":available,"cost":cost,"ref":r["ref"],"refmbo":r["refmbo"],"cxid":r["id"],"initial":False})
                 # CXCURBAL>=0 pe intrare reface baza locala; gap-ul anterior nu blocheaza iesirea curenta.
                 if r["balance"] is not None and r["balance"]>=ZERO:
                     recovering=False
@@ -411,8 +392,6 @@ def replay(prior,links=None):
             expected=sum((a["qty"]*a["cost"] for a in allocation),ZERO)/(-qty)
             if different(cost,expected,PRICE_EPS):
                 fail("Corecteaza intai iesirea anterioara RefID=%s" % r["ref"])
-            if r.get("ref") is not None:
-                issue_allocs[r["ref"]]=[dict(a) for a in allocation]
             recovering=False
     if recovering:
         fail("Baza cronologica anterioara nerecuperata; ORDINE_DATE nu autorizeaza update")
@@ -462,6 +441,26 @@ def set_info(mbo,message):
     msg=audit_info(message)
     mbo.setValue("DESCRIPTION_LONGDESCRIPTION",msg,FLAGS)
     return msg
+
+def info_expected_cost(desc):
+    # Ex: "DIFERENTA: ... asteptat 2,712; diferenta ..."
+    raw=text(desc)
+    key="asteptat "
+    pos=raw.find(key)
+    if pos<0:
+        return None
+    token=""
+    for ch in raw[pos+len(key):]:
+        if ch in "0123456789,.":
+            token+=ch
+        elif token:
+            break
+    if not token:
+        return None
+    try:
+        return ExactNumber(token.replace(",", "."))
+    except Exception:
+        return None
 
 def layer_segments(allocations):
     segments=[]
@@ -751,28 +750,6 @@ def check_matrectrans_exit_cost():
         raise ValueError("self-check: ISSUE dupa VOIDRECEIPT trebuie sa preia 9.501")
     if not allocation or allocation[0].get("ref")!=10:
         raise ValueError("self-check: VOIDRECEIPT trebuie sa lase stratul vechi FIFO")
-    # Speta 175368: RETURN pe 2,630 nu se lipea in spatele lui 2,960; ISSUE -40 => split.
-    def jrow(ident,date,ref,kind,qty,cost,balance,mbo="MATUSETRANS"):
-        return {"id":ident,"group":"G","date":date,"ref":ref,"refmbo":mbo,
-                "kind":kind,"qty":ExactNumber(qty),"cost":ExactNumber(cost),
-                "balance":None if balance is None else ExactNumber(balance)}
-    return_prior=[
-        jrow(1,"2026-01-01 00:00:00.000000000",1,"INITIAL","100","2.630","100","CXSTOCURI"),
-        jrow(2,"2026-01-01 00:00:00.000000000",2,"INITIAL","1000","2.960","1000","CXSTOCURI"),
-        jrow(3,"2026-02-01 00:00:00.000000000",154452,"ISSUE","-100","2.630","0"),
-        jrow(4,"2026-03-01 00:00:00.000000000",20,"ISSUE","-50","2.960","950"),
-        jrow(5,"2026-04-22 10:41:00.000000000",30,"RETURN","30","2.630","980"),
-    ]
-    layers=replay(return_prior,{30:154452})
-    allocation,short=consume(layers,ExactNumber("40"))
-    if short>EPS:
-        raise ValueError("self-check: dupa RETURN trebuie stoc pentru -40")
-    if len(allocation)<2:
-        raise ValueError("self-check: ISSUE dupa RETURN trebuie multi-pret (split), nu un singur strat")
-    if different(allocation[0]["cost"],ExactNumber("2.630"),PRICE_EPS) or different(allocation[0]["qty"],ExactNumber("30")):
-        raise ValueError("self-check: primul segment trebuie 30@2.630")
-    if different(allocation[1]["cost"],ExactNumber("2.960"),PRICE_EPS) or different(allocation[1]["qty"],ExactNumber("10")):
-        raise ValueError("self-check: al doilea segment trebuie 10@2.960")
 
 def execute(context):
     check_matrectrans_exit_cost()
@@ -1340,14 +1317,7 @@ def execute(context):
         allocation,short=consume(layers,total)
         if short>EPS:
             fail("Stoc anterior insuficient; receptiile viitoare nu autorizeaza update")
-        # Preturi FIFO diferite pe acelasi consum => split obligatoriu (fara medie ponderata).
-        alloc_costs=[]
-        for a in allocation:
-            if not any(not different(a["cost"],c,PRICE_EPS) for c in alloc_costs):
-                alloc_costs.append(a["cost"])
         segments=layer_segments(allocation)
-        if len(alloc_costs)>1 and len(segments)<2:
-            fail("Alocare multi-pret colapsata gresit; nu se scrie medie ponderata pe un singur MATUSETRANS")
         recovery=False
         for mem in members:
             r=jbyref[mem["id"]]
@@ -1355,9 +1325,6 @@ def execute(context):
                 fail("Tip/directie/data neconforme RefID=%s; recuperarea nu schimba date" % mem["id"])
             recovery=recovery or different(r["qty"],-mem["old_qty"]) or different(r["cost"],mem["old_cost"],PRICE_EPS)
         mapped,creates=map_members(segments,members)
-        if len(alloc_costs)>1 and not creates and len(mapped)<2:
-            fail("Consumul %s cere line split pe %s preturi FIFO; nu se actualizeaza ca un singur pret" % (
-                clicked_ref,len(alloc_costs)))
         new_total=sum((a["value"] for a in mapped),ZERO)+sum((c["value"] for c in creates),ZERO)
         if different(sum((a["qty"] for a in mapped),ZERO)+sum((c["qty"] for c in creates),ZERO),total):
             fail("Suma cantitatilor pe straturi difera de consumul original")
@@ -1598,8 +1565,44 @@ def execute(context):
                 plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
             plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
         if not plans:
-            if len(alloc_costs)>1:
-                fail("Consumul %s necesita line split pe preturi FIFO diferite; reapeasa butonul dupa refresh" % clicked_ref)
+            desc=text(clicked["mbo"].getString("DESCRIPTION_LONGDESCRIPTION"))
+            info_exp=info_expected_cost(desc)
+            cur_cost=number(template,"UNITCOST")
+            # Fals „conforme”: replay local = pret curent, dar Check FIFO zice alt asteptat.
+            if (info_exp is not None and different(cur_cost,info_exp,PRICE_EPS) and
+                ("BADFIFO=Y" in desc or "DIFERENTA:" in desc)):
+                if info_exp<ZERO or ExactNumber(info_exp.fixed(3))!=info_exp:
+                    fail("Pretul asteptat din Info FIFO nu poate fi scris: %s" % fmt(info_exp))
+                cost=info_exp
+                value=money(total*cost)
+                receipt=None
+                if allocation:
+                    first=allocation[0]
+                    if first.get("refmbo")=="MATRECTRANS" and first.get("ref") is not None:
+                        receipt=first["ref"]
+                    elif first.get("initial"):
+                        receipt=None
+                    else:
+                        receipt=first.get("ref")
+                changes={clicked["id"]:{"qty":-total,"cost":cost}}
+                after=ledger(journal,changes)
+                for f in ("UNITCOST","ACTUALCOST","CURRENCYUNITCOST"):
+                    plan_number(template,f,cost)
+                for f in ("LINECOST","CURRENCYLINECOST"):
+                    plan_number(template,f,value)
+                if not template.isNull("LINECOST2"):
+                    plan_number(template,"LINECOST2",value)
+                plan_receipt(template,receipt)
+                for r in journal:
+                    if r["id"] in changes:
+                        plan_number(r["mbo"],"CXQTY",changes[r["id"]]["qty"])
+                        plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
+                    plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
+                service.log_info("CXFIFOFIXISSUE force asteptat Info FIFO %s -> %s on MATUSETRANS %s" % (
+                    fmt(cur_cost),fmt(cost),clicked_ref))
+            else:
+                return "MATUSETRANS %s si CXSTOCURI sunt deja conforme planului local; nimic modificat." % clicked_ref
+        if not plans:
             return "MATUSETRANS %s si CXSTOCURI sunt deja conforme planului local; nimic modificat." % clicked_ref
         planned_tables=set(m.getName().upper() for m,f,k,v,old in plans)
         sets_by_name={"MATUSETRANS":mset,"CXSTOCURI":cxset}
