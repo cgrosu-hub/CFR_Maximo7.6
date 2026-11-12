@@ -1,14 +1,14 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.29-SPLIT-RESUME
+# VERSIUNE: 3.30-THREE-STEPS
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
-# Line split in 3 pasi separati (nu in acelasi click):
-#   PAS 1 = INVUSELINESPLIT nou, apoi STOP (reapeasa).
-#   Daca exista INVUSELINESPLIT fara MATUSETRANS: creeaza direct MT + CXSTOCURI
-#   din qty/cost-ul splitului, pe seturi NOI (nu salveaza fratii => fara BMXAA8229W).
-#   Nu reface FIFO pe cantitatea deja redusa (34) si nu „umfla” totalul.
-# UUID pe CONTENTUID. Cascada doar pe calea cu un singur pret.
-# Fara stop CXSENTEBS/FINCNTRLID. Mismatch linie = avertisment, nu blocaj.
+# Line split in 3 commit-uri separate:
+#   1) INVUSELINESPLIT, stop.
+#   2) doar MATUSETRANS pentru splitul liber, stop (ID-ul se comite).
+#   3) doar CXSTOCURI, cu CXREFID = MATUSETRANSID deja salvat.
+#   Nu scrie MT si CX in aceeasi tranzactie.
+# UUID pe CONTENTUID. Cascada doar pe un singur pret.
+# Fara stop CXSENTEBS/FINCNTRLID. Mismatch linie = avertisment.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -84,7 +84,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.29-SPLIT-RESUME"
+VERSION="3.30-THREE-STEPS"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -1459,20 +1459,15 @@ def execute(context):
         free_splits=sorted([m for m in splitrows if m.getLong("INVUSELINESPLITID") not in used_splits
                             and number(m,"QUANTITY")>EPS],
                            key=lambda m: m.getLong("INVUSELINESPLITID"))
-        # Split fara MATUSETRANS = PAS 2+3 direct. Nu realocam FIFO pe qty-ul deja redus.
+        # PAS 2: doar MATUSETRANS. CXSTOCURI se scrie la a treia apasare, dupa ce ID-ul e comis.
         if free_splits:
             from java.util import Date
             new_mt=MXServer.getMXServer().getMboSet("MATUSETRANS",user)
-            new_cx=MXServer.getMXServer().getMboSet("CXSTOCURI",user)
             opened.append(new_mt)
-            opened.append(new_cx)
             new_mt.setWhere("1=2")
             new_mt.reset()
-            new_cx.setWhere("1=2")
-            new_cx.reset()
             base_actual=template.getDate("ACTUALDATE")
             created_rows=[]
-            template_j=clicked
             for idx,sm in enumerate(free_splits):
                 qty=number(sm,"QUANTITY")
                 cost=number(sm,"UNITCOST")
@@ -1506,36 +1501,70 @@ def execute(context):
                     put_number(mm,"QTYRETURNED",ZERO)
                 mm.setValue("CXSENTEBS",0,FLAGS)
                 mm.setValue("HASLD",0,FLAGS)
-                jm=new_cx.addAtEnd(FLAGS)
-                for f in ("ITEMNUM","LOCATION","ORGID","SITEID","COMMODITYGROUP","CURRENCYCODE",
-                          "DESCRIPTION","GLCREDITACCT","GLDEBITACCT","ISSUETO","ROTASSETNUM"):
-                    copy_value(template_j["mbo"],jm,f)
-                put_number(jm,"CXQTY",-qty)
-                put_number(jm,"UNITCOST",cost)
-                jm.setValue("CXDOCUMENTDATE",mm.getDate("ACTUALDATE"),FLAGS)
-                jm.setValue("CXREF","ISSUE",FLAGS)
-                jm.setValue("CXREFMBO","MATUSETRANS",FLAGS)
-                jm.setValue("CXREFID",mm.getLong("MATUSETRANSID"),FLAGS)
-                jm.setValue("HASLD",1,FLAGS)
-                if not mm.isNull("CURBAL"):
-                    put_number(jm,"CXCURBAL",number(mm,"CURBAL"))
-                set_info(jm,"CXFIFOFIX PAS 2/3: MATUSETRANS+CXSTOCURI pentru split %s. Ruleaza Check FIFO." % sm.getLong("INVUSELINESPLITID"))
                 created_rows.append((mm.getLong("MATUSETRANSID"),qty,cost,sm.getLong("INVUSELINESPLITID")))
-                service.log_info("CXFIFOFIXISSUE resume split=%s MATUSETRANS=%s qty=%s cost=%s" % (
-                    sm.getLong("INVUSELINESPLITID"),mm.getLong("MATUSETRANSID"),fmt(-qty),fmt(cost)))
+                service.log_info("CXFIFOFIXISSUE PAS2 MATUSETRANS=%s split=%s qty=%s cost=%s" % (
+                    mm.getLong("MATUSETRANSID"),sm.getLong("INVUSELINESPLITID"),fmt(-qty),fmt(cost)))
             ids=",".join(text(i[0]) for i in created_rows)
             tx=MXServer.getMXServer().createMXTransaction()
-            for ms in (new_mt,new_cx):
-                ms.setFlag(MboConstants.NOSAVE,False)
-                ms.setMXTransaction(tx)
-                tx.add(ms)
+            new_mt.setFlag(MboConstants.NOSAVE,False)
+            new_mt.setMXTransaction(tx)
+            tx.add(new_mt)
             tx.save()
             commit_started=True
             tx.commit()
             committed=True
-            message="PAS 2/3 SALVAT din splituri fara MATUSETRANS: %s.\nNu apasa Save (deja comis). Ruleaza Check FIFO." % ids
+            message="PAS 2/3 SALVAT: doar MATUSETRANS %s.\nCXSTOCURI nu e scris inca (depinde de acest ID).\nNu apasa Save. Reapeasa butonul (PAS 3)." % ids
             for mid,qty,cost,sid in created_rows:
                 message+="\nMATUSETRANS %s: %s la %s; split %s." % (mid,fmt(-qty),fmt(cost),sid)
+            service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
+            try:
+                if not refresh_table(context):
+                    message+="\nRedeschide articolul pentru refresh."
+            except Exception:
+                message+="\nRefresh nereusit; redeschide articolul."
+            return message
+        # PAS 3: MATUSETRANS de pe linie deja comis, fara rand CXSTOCURI.
+        pending_cx=[m for m in line_members if m["id"] not in line_jbyref]
+        if pending_cx:
+            new_cx=MXServer.getMXServer().getMboSet("CXSTOCURI",user)
+            opened.append(new_cx)
+            new_cx.setWhere("1=2")
+            new_cx.reset()
+            made=[]
+            for mem in pending_cx:
+                src=mem["mbo"]
+                # Reincarca din DB ca CXREFID sa fie ID-ul comis la PAS 2.
+                fresh_ms,fresh_rows=query("MATUSETRANS","MATUSETRANSID=%s" % mem["id"],2)
+                if len(fresh_rows)!=1:
+                    fail("MATUSETRANS %s lipsa la PAS 3" % mem["id"])
+                src=fresh_rows[0]
+                qty=-number(src,"QUANTITY")
+                cost=number(src,"UNITCOST")
+                jm=new_cx.addAtEnd(FLAGS)
+                for f in ("ITEMNUM","LOCATION","ORGID","SITEID","COMMODITYGROUP","CURRENCYCODE",
+                          "DESCRIPTION","GLCREDITACCT","GLDEBITACCT","ISSUETO","ROTASSETNUM"):
+                    copy_value(clicked["mbo"],jm,f)
+                put_number(jm,"CXQTY",-qty)
+                put_number(jm,"UNITCOST",cost)
+                jm.setValue("CXDOCUMENTDATE",src.getDate("ACTUALDATE"),FLAGS)
+                jm.setValue("CXREF","ISSUE",FLAGS)
+                jm.setValue("CXREFMBO","MATUSETRANS",FLAGS)
+                jm.setValue("CXREFID",src.getLong("MATUSETRANSID"),FLAGS)
+                jm.setValue("HASLD",1,FLAGS)
+                if not src.isNull("CURBAL"):
+                    put_number(jm,"CXCURBAL",number(src,"CURBAL"))
+                set_info(jm,"CXFIFOFIX PAS 3/3: CXSTOCURI pentru MATUSETRANS %s. Ruleaza Check FIFO." % src.getLong("MATUSETRANSID"))
+                made.append(src.getLong("MATUSETRANSID"))
+                service.log_info("CXFIFOFIXISSUE PAS3 CXSTOCURI for MATUSETRANS %s" % src.getLong("MATUSETRANSID"))
+            tx=MXServer.getMXServer().createMXTransaction()
+            new_cx.setFlag(MboConstants.NOSAVE,False)
+            new_cx.setMXTransaction(tx)
+            tx.add(new_cx)
+            tx.save()
+            commit_started=True
+            tx.commit()
+            committed=True
+            message="PAS 3/3 SALVAT: CXSTOCURI pentru MATUSETRANS %s.\nNu apasa Save. Ruleaza Check FIFO." % ",".join(text(i) for i in made)
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
             try:
                 if not refresh_table(context):
@@ -1655,7 +1684,7 @@ def execute(context):
             commit_started=True
             tx.commit()
             committed=True
-            message="PAS 1/3 SALVAT: INVUSELINESPLIT noi %s.\nNu apasa Save. Reapeasa butonul: va crea MATUSETRANS+CXSTOCURI pentru splitul liber." % (
+            message="PAS 1/3 SALVAT: INVUSELINESPLIT noi %s.\nNu apasa Save. Reapeasa butonul (PAS 2 = doar MATUSETRANS)." % (
                 ",".join(text(i) for i in created_split_ids) if created_split_ids else "-")
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
             try:
