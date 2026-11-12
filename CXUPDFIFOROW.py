@@ -1,11 +1,12 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.6-COVERING-RECEIPT
+# VERSIUNE: 3.7-SAMESTAMP-RECEIPT
 # Implicit: muta la maximul orelor din aceeasi zi (acelasi site/gestiune) + 1 minut.
 # RETURN inainte de ISSUE (ISSUEID): data = ISSUE + 1 minut (MATUSETRANS+CXSTOCURI).
 # ISSUE/SHIPTRANSFER cu stoc anterior insuficient: muta dupa prima receptie ulterioara
-# (RECEIPT/SHIPRECEIPT/TRANSFER) cu CXQTY >= |qty| iesire (+1 minut). Nu ancora pe
-# RETURN mic sau pe prima intrare care nu acopera cantitatea (ex. RECEIPT 21.07).
+# in jurnal (RECEIPT/SHIPRECEIPT/TRANSFER) cu CXQTY >= |qty| (+1 minut). Include si
+# receptia de pe aceeasi data/ora, dar dupa ieșire (CXREFID/CXSTOCURIID) — ex. SHIPTRANSFER
+# si RECEIPT ambele 23.06 00:00.
 # SHIPTRANSFER: daca receptia legata (RECEIPTREF) ar ramane inaintea noii date,
 # o muta si pe ea (MATRECTRANS+CXSTOCURI) la aceeasi data — nu blocheaza.
 # ACTUALDATE/CXDOCUMENTDATE: NOACCESSCHECK+NOVALIDATION (evita BMXAA1198E pe perioada
@@ -26,7 +27,7 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
-VERSION = "3.6-COVERING-RECEIPT"
+VERSION = "3.7-SAMESTAMP-RECEIPT"
 COVERING_RECEIPT = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 DATE_FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 SUPPORTED = {
@@ -134,13 +135,21 @@ def stock_before(all_rows, target):
             bal = bal.add(number(r, "CXQTY"))
     return bal
 
+def journal_key(r):
+    # Ordine jurnal: data, CXREFID, CXSTOCURIID (aceeasi ora => receptia de dupa e eligibila).
+    return (stamp(r),
+            0 if r.isNull("CXREFID") else r.getLong("CXREFID"),
+            r.getUniqueIDValue())
+
 def first_covering_inbound(all_rows, target, after_ms, needed):
-    # Prima receptie (nu RETURN) dupa iesire, cu cantitate care acopera consumul.
+    # Prima receptie (nu RETURN) dupa iesire in jurnal, cu cantitate care acopera consumul.
+    # Include aceeasi data/ora daca e dupa target pe CXREFID/CXSTOCURIID.
+    t_key = journal_key(target)
     later = []
     for r in all_rows:
         if not same_fifo_book(r, target):
             continue
-        if stamp(r) <= after_ms:
+        if journal_key(r) <= t_key:
             continue
         if r.getString("CXREF") == "INITIAL":
             continue
@@ -153,7 +162,7 @@ def first_covering_inbound(all_rows, target, after_ms, needed):
         later.append(r)
     if not later:
         return None
-    later.sort(key=lambda x: (stamp(x), x.getUniqueIDValue()))
+    later.sort(key=journal_key)
     return later[0]
 
 def stamp(r):
