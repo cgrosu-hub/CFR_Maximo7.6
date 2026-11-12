@@ -1,11 +1,10 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.22-RETURN-PRIORITY
+# VERSIUNE: 3.23-CONTENTUID
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
-# RETURN: pune stocul inapoi pe prioritatea stratului consumat (ca Check FIFO), nu
-# merge pe primul strat cu acelasi pret din coada (altfel 2,630 ramane in spatele
-# lui 2,960 si ISSUE -40 pare „deja conform” la 2,960 in loc de split).
-# Multi-pret pe consum => PAS 1/2/3 (ex. 30@2,630 + 10@2,960).
+# RETURN pe prioritatea stratului; multi-pret => PAS 1/2/3.
+# CONTENTUID pe INVUSELINESPLIT noi: UUID unic (evita DB2 -803 / BMXAA4211E cand
+# sablonul avea deja cgFIA2026... si index 0 regenera acelasi ID).
 # Splituri libere pe toata linia; split ocupat => nou in PAS 2.
 # Cu INVUSELINE: FIFO pe consumul apasat. Cale normala: NU atinge INVUSELINESPLIT.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
@@ -83,7 +82,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.22-RETURN-PRIORITY"
+VERSION="3.23-CONTENTUID"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -428,16 +427,17 @@ def copy_value(src,dst,field):
         return
     dst.setValue(field,src.getMboValue(field).getCurrentValue(),FLAGS)
 
-def split_contentuid(source,index):
-    tag="cgFIA2026"
-    src=text(source)
-    base=tag+src[len(tag):] if len(src)>=len(tag) else tag+src
-    if index<=0:
-        return base
-    mark=text(index)
-    if len(base)<=len(tag)+len(mark):
-        return base+mark
-    return base[:len(tag)]+mark+base[len(tag)+len(mark):]
+def split_contentuid(source,index,used=None):
+    # Mereu UUID nou: vechiul cgFIA2026+suffix colisiona cu splitul PAS 1 deja comis (DB2 -803).
+    from java.util import UUID
+    uid=text(UUID.randomUUID().toString())
+    if used is not None:
+        guard=0
+        while uid in used and guard<20:
+            uid=text(UUID.randomUUID().toString())
+            guard+=1
+        used.add(uid)
+    return uid
 
 def add_minutes(value,minutes):
     from java.util import Calendar
@@ -1408,6 +1408,10 @@ def execute(context):
                     plan_number(c["split_mbo"],"UNITCOST",c["cost"])
             new_split_idx=0
             created_split_ids=[]
+            used_uids=set()
+            for sm0 in splitrows:
+                if not sm0.isNull("CONTENTUID"):
+                    used_uids.add(text(sm0.getString("CONTENTUID")))
             for c in creates:
                 if not c.get("new_split"):
                     continue
@@ -1418,11 +1422,11 @@ def execute(context):
                 put_number(sm,"UNITCOST",c["cost"])
                 sm.setValue("AUTOCREATED",1,FLAGS)
                 src_uid="" if template_split.isNull("CONTENTUID") else template_split.getString("CONTENTUID")
-                sm.setValue("CONTENTUID",split_contentuid(src_uid,new_split_idx),FLAGS)
+                sm.setValue("CONTENTUID",split_contentuid(src_uid,new_split_idx,used_uids),FLAGS)
                 new_split_idx+=1
                 created_split_ids.append(sm.getLong("INVUSELINESPLITID"))
-                service.log_info("CXFIFOFIXISSUE PAS1 create split=%s qty=%s cost=%s" % (
-                    sm.getLong("INVUSELINESPLITID"),fmt(c["qty"]),fmt(c["cost"])))
+                service.log_info("CXFIFOFIXISSUE PAS1 create split=%s qty=%s cost=%s uid=%s" % (
+                    sm.getLong("INVUSELINESPLITID"),fmt(c["qty"]),fmt(c["cost"]),sm.getString("CONTENTUID")))
             info=set_info(clicked["mbo"],"CXFIFOFIX PAS 1/3: INVUSELINESPLIT actualizat (%s noi). Fara Save; reapeasa butonul 2." % len(created_split_ids))
             plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
@@ -1479,6 +1483,10 @@ def execute(context):
             created_rows=[]
             base_actual=template.getDate("ACTUALDATE")
             new_split_idx=0
+            used_uids=set()
+            for sm0 in splitrows:
+                if not sm0.isNull("CONTENTUID"):
+                    used_uids.add(text(sm0.getString("CONTENTUID")))
             for idx,c in enumerate(creates):
                 sid=long(c["split_id"]) if c.get("split_id") is not None else None
                 prior_mt=mt_by_split.get(sid) if sid is not None else None
@@ -1493,13 +1501,14 @@ def execute(context):
                     put_number(sm,"UNITCOST",c["cost"])
                     sm.setValue("AUTOCREATED",1,FLAGS)
                     src_uid="" if template_split.isNull("CONTENTUID") else template_split.getString("CONTENTUID")
-                    sm.setValue("CONTENTUID",split_contentuid(src_uid,100+new_split_idx),FLAGS)
+                    sm.setValue("CONTENTUID",split_contentuid(src_uid,100+new_split_idx,used_uids),FLAGS)
                     new_split_idx+=1
                     c["split_mbo"]=sm
                     c["split_id"]=sm.getLong("INVUSELINESPLITID")
                     c["new_split"]=True
                     sid=long(c["split_id"])
-                    service.log_info("CXFIFOFIXISSUE PAS2 create split=%s (inlocuire split ocupat)" % sid)
+                    service.log_info("CXFIFOFIXISSUE PAS2 create split=%s uid=%s (inlocuire split ocupat)" % (
+                        sid,sm.getString("CONTENTUID")))
                 else:
                     sm=c["split_mbo"]
                     plan_number(sm,"QUANTITY",c["qty"])
