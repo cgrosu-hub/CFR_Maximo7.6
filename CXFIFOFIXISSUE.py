@@ -1,12 +1,12 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.27-PAS12-CHAIN
+# VERSIUNE: 3.28-PAS2-OWNSETS
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
-# RETURN pe prioritatea stratului; multi-pret => PAS 1/2/3.
-# Dupa PAS 1: continua automat PAS 2 in acelasi click (creeaza MATUSETRANS lipsa).
-# Splituri libere: mereu adaugate la cantitatea consumului (chiar dupa Check FIFO).
-# Daca e un singur MT pe linie si INVUSELINE.QUANTITY > MT: foloseste cantitatea liniei.
-# Cascada conservatoare; fara stop CXSENTEBS/FINCNTRLID; mismatch linie = warn.
+# PAS 1→2 in acelasi click; splituri libere mereu in total; line-qty recover.
+# PAS 2: NU salveaza tot MboSet-ul MATUSETRANS al liniei (BMXAA8229W pe frati
+# cu ROWSTAMP vechi, ex. 241273); doar seturile din plan + MT-urile create/modificate.
+# Dupa PAS 1 reincarca MT apasat din DB inainte de PAS 2.
+# Cascada conservatoare; fara stop CXSENTEBS/FINCNTRLID.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -82,7 +82,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.27-PAS12-CHAIN"
+VERSION="3.28-PAS2-OWNSETS"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -632,11 +632,20 @@ def bind_screen_journal(context, rows):
             fail("Jurnalul de pe ecran e invechit pentru CXSTOCURIID=%s; redeschide articolul" % row["id"])
         row["mbo"]=other
 
-def owns(plans):
+def owns(plans,extra_mbos=None):
     from java.lang import System
     ordered=[]
     seen=set()
     for m,f,k,v,old in plans:
+        ms=m.getThisMboSet()
+        marker=System.identityHashCode(ms)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        ordered.append((m.getName().upper(),ms))
+    for m in (extra_mbos or []):
+        if m is None:
+            continue
         ms=m.getThisMboSet()
         marker=System.identityHashCode(ms)
         if marker in seen:
@@ -1581,6 +1590,14 @@ def execute(context):
             commit_started=False
             committed=False
             tx=None
+            # ROWSTAMP proaspat pe MT apasat (Maximo poate fi actualizat la PAS 1).
+            fresh_ms,fresh_rows=query("MATUSETRANS","MATUSETRANSID=%s" % clicked_ref,2)
+            if len(fresh_rows)==1:
+                template=fresh_rows[0]
+                clicked_mem["mbo"]=template
+                for a in mapped:
+                    if a["member"]["id"]==clicked_ref:
+                        a["member"]["mbo"]=template
             used_splits=set(mt_by_split.keys())
             for mem in members:
                 if not mem["mbo"].isNull("INVUSELINESPLITID"):
@@ -1697,6 +1714,7 @@ def execute(context):
                 mm.setValue("CXSENTEBS",0,FLAGS)
                 mm.setValue("HASLD",0,FLAGS)
                 c["new_id"]=mm.getLong("MATUSETRANSID")
+                c["mbo"]=mm
                 c["actual_key"]=datekey(mm.getDate("ACTUALDATE"))
                 created_rows.append(c)
                 mt_by_split.setdefault(sid,[]).append(mm)
@@ -1708,8 +1726,13 @@ def execute(context):
             documents_before=document_values(doc,line)
             operation="PAS2 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
             service.log_info("CXFIFOFIXISSUE PLAN "+VERSION+" "+operation)
+            extra_mbos=[a["member"]["mbo"] for a in mapped]+[c["mbo"] for c in created_rows]
+            for c in creates:
+                if c.get("split_mbo") is not None:
+                    extra_mbos.append(c["split_mbo"])
+            write_sets=owns(plans,extra_mbos)
             tx=MXServer.getMXServer().createMXTransaction()
-            for name,ms in (("INVUSELINESPLIT",sset),("MATUSETRANS",mset),("CXSTOCURI",cxset)):
+            for name,ms in write_sets:
                 ms.setFlag(MboConstants.NOSAVE,False)
                 ms.setMXTransaction(tx)
                 tx.add(ms)
@@ -1724,7 +1747,7 @@ def execute(context):
             message=""
             if pas1_message:
                 message=pas1_message+"\n"
-            message+="PAS 2/3 SALVAT: MATUSETRANS noi %s.\nACTUALDATE = original + N minute.\nNu apasa Save (deja comis). Reapeasa butonul 2 (PAS 3 = CXSTOCURI)." % ids
+            message+="PAS 2/3 SALVAT: MATUSETRANS noi %s.\nACTUALDATE = original + N minute.\nNu apasa Save (deja comis; Save pe ROWSTAMP vechi = BMXAA8229W). Reapeasa butonul 2 (PAS 3 = CXSTOCURI)." % ids
             for c in created_rows:
                 message+="\nMATUSETRANS %s: %s la %s; receptie %s; split %s." % (
                     c["new_id"],fmt(-c["qty"]),fmt(c["cost"]),receipt_label(c["receipt"]),c["split_id"])
