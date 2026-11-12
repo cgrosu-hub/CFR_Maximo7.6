@@ -1,11 +1,11 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.5-NOVALID-DATE
+# VERSIUNE: 3.6-COVERING-RECEIPT
 # Implicit: muta la maximul orelor din aceeasi zi (acelasi site/gestiune) + 1 minut.
 # RETURN inainte de ISSUE (ISSUEID): data = ISSUE + 1 minut (MATUSETRANS+CXSTOCURI).
-# ISSUE/SHIPTRANSFER datat gresit inaintea unei intrari, DOAR daca |qty| < suma stoc
-# pe toate intrarile FIFO (acelasi site/gestiune/grupa) si stocul anterior e insuficient:
-# data = prima intrare ulterioara + 1 minut.
+# ISSUE/SHIPTRANSFER cu stoc anterior insuficient: muta dupa prima receptie ulterioara
+# (RECEIPT/SHIPRECEIPT/TRANSFER) cu CXQTY >= |qty| iesire (+1 minut). Nu ancora pe
+# RETURN mic sau pe prima intrare care nu acopera cantitatea (ex. RECEIPT 21.07).
 # SHIPTRANSFER: daca receptia legata (RECEIPTREF) ar ramane inaintea noii date,
 # o muta si pe ea (MATRECTRANS+CXSTOCURI) la aceeasi data — nu blocheaza.
 # ACTUALDATE/CXDOCUMENTDATE: NOACCESSCHECK+NOVALIDATION (evita BMXAA1198E pe perioada
@@ -26,7 +26,8 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
-VERSION = "3.5-NOVALID-DATE"
+VERSION = "3.6-COVERING-RECEIPT"
+COVERING_RECEIPT = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 DATE_FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 SUPPORTED = {
     "MATRECTRANS": ("MATRECTRANSID", "ACTUALDATE", ("RECEIPT", "TRANSFER", "SHIPTRANSFER", "SHIPRECEIPT", "RETURN", "VOIDRECEIPT", "SHIPRETURN", "SHIPCANCEL")),
@@ -133,16 +134,21 @@ def stock_before(all_rows, target):
             bal = bal.add(number(r, "CXQTY"))
     return bal
 
-def first_later_inbound(all_rows, target, after_ms):
+def first_covering_inbound(all_rows, target, after_ms, needed):
+    # Prima receptie (nu RETURN) dupa iesire, cu cantitate care acopera consumul.
     later = []
     for r in all_rows:
         if not same_fifo_book(r, target):
             continue
         if stamp(r) <= after_ms:
             continue
+        if r.getString("CXREF") == "INITIAL":
+            continue
+        if r.getString("CXREF") not in COVERING_RECEIPT:
+            continue
         if not is_inbound(r):
             continue
-        if r.getString("CXREF") == "INITIAL":
+        if number(r, "CXQTY").compareTo(needed) < 0:
             continue
         later.append(r)
     if not later:
@@ -430,19 +436,27 @@ def execute(context):
                     new_ms = issue_ms + SHIFT_MS
                     date_mode = "AFTER_ISSUE"
                     daymax_blocked = False
-            # ISSUE/SHIPTRANSFER inaintea unei intrari, doar daca |qty| < stoc total pe
-            # intrari si stocul cronologic anterior e insuficient (data gresita).
+            # ISSUE/SHIPTRANSFER: stoc anterior insuficient -> dupa prima receptie care acopera |qty|.
             if date_mode == "DAYMAX" and after_receipt_exit(kind, table):
                 consumed = number(target, "CXQTY").abs()
                 inbound = total_inbound_stock(all_rows, target)
                 prior = stock_before(all_rows, target)
-                if consumed.compareTo(inbound) < 0 and prior.compareTo(consumed) < 0:
-                    nxt = first_later_inbound(all_rows, target, old_ms)
-                    if nxt is not None:
-                        new_ms = stamp(nxt) + SHIFT_MS
-                        date_mode = "AFTER_RECEIPT"
-                        daymax_blocked = False
-                        require_before = False
+                if prior.compareTo(consumed) < 0:
+                    if consumed.compareTo(inbound) > 0:
+                        fail("Stoc total pe intrari (%s) < |iesire| %s; nu pot muta dupa o receptie" % (
+                            canonical(inbound), canonical(consumed)))
+                    nxt = first_covering_inbound(all_rows, target, old_ms, consumed)
+                    if nxt is None:
+                        fail("Nu exista receptie ulterioara (RECEIPT/SHIPRECEIPT/TRANSFER) cu cantitate >= %s" %
+                             canonical(consumed))
+                    new_ms = stamp(nxt) + SHIFT_MS
+                    date_mode = "AFTER_RECEIPT"
+                    daymax_blocked = False
+                    require_before = False
+                    service.log_info("CXUPDFIFOROW AFTER_RECEIPT cover CXREF=%s RefID=%s qty=%s -> +1min" % (
+                        nxt.getString("CXREF"),
+                        "" if nxt.isNull("CXREFID") else str(nxt.getLong("CXREFID")),
+                        canonical(number(nxt, "CXQTY"))))
             if date_mode == "DAYMAX" and daymax_blocked:
                 fail("Maximul zilei + un minut depaseste ziua curenta; nimic modificat")
             check_shipment_parent(source, new_ms)
