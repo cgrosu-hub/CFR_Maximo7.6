@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.21-NEG-RECEIPT
+# VERSIUNE: 5.22-NEG-RECEIPT-CHECK
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -92,7 +92,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.21-NEG-RECEIPT"
+VERSION = "5.22-NEG-RECEIPT-CHECK"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -1494,18 +1494,25 @@ def check_layer_beats_negative_balance():
     if flag(sold_rec)!="Y":
         raise ValueError("self-check: sold negativ trebuie BADFIFO=Y chiar daca pretul e OK")
     # Receptii/comenzi cu cantitate negativa = iesiri FIFO; nu blocheaza grupa.
+    # Soldurile urmeaza cartea pe pret (12-6-2+4+10-2-6-2 => 8).
     neg_receipt=audit_rows([
         row(1,"2026-04-23 00:00:00.000000000",10,"RECEIPT","12","12.000","12"),
         row(2,"2026-04-24 00:51:00.000000000",20,"RECEIPT","-6","12.000","6"),
         row(3,"2026-04-24 00:54:00.000000000",30,"RECEIPT","-2","12.000","4"),
         row(4,"2026-04-24 01:03:00.000000000",40,"RECEIPT","4","12.000","8"),
-        row(5,"2026-04-25 00:04:00.000000000",50,"SHIPTRANSFER","-2","12.000","8"),
+        row(5,"2026-04-24 01:04:00.000000000",45,"RECEIPT","10","12.000","18"),
+        row(6,"2026-04-24 01:05:00.000000000",46,"RECEIPT","-2","12.000","16"),
+        row(7,"2026-04-24 01:06:00.000000000",47,"RECEIPT","-6","12.000","10"),
+        row(8,"2026-04-25 00:04:00.000000000",50,"SHIPTRANSFER","-2","12.000","8"),
     ])
-    for rid in (2,3,5):
-        if neg_receipt["records"][rid]["status"]!="OK":
-            raise ValueError("self-check: RECEIPT/SHIPTRANSFER negativ trebuie OK, nu NEVERIFICAT")
-        if flag(neg_receipt["records"][rid])!="N":
-            raise ValueError("self-check: RECEIPT negativ OK trebuie BADFIFO=N")
+    for rid in (2,3,6,7,8):
+        rec=neg_receipt["records"][rid]
+        if rec["status"]!="OK":
+            raise ValueError("self-check: RECEIPT/SHIPTRANSFER negativ trebuie OK, got %s (%s)" % (
+                rec["status"],rec.get("reason")))
+        if flag(rec)!="N":
+            raise ValueError("self-check: iesire negativa OK trebuie BADFIFO=N, got %s (sold_bad=%s/%s)" % (
+                flag(rec),rec.get("balance_bad"),rec.get("balance_expected")))
     if "neimplementat" in (neg_receipt["records"][2].get("reason") or ""):
         raise ValueError("self-check: RECEIPT negativ nu trebuie tip neimplementat")
 
