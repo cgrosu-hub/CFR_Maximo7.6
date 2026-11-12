@@ -1,14 +1,12 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.26-PAS2-ORPHAN-SPLIT
+# VERSIUNE: 3.27-PAS12-CHAIN
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
 # RETURN pe prioritatea stratului; multi-pret => PAS 1/2/3.
-# CONTENTUID pe INVUSELINESPLIT noi: UUID unic.
-# PAS 1 incomplet: dupa ce Maximo sincronizeaza MATUSETRANS la primul segment (ex. 38),
-# PAS 2 trebuie sa foloseasca MT + splituri libere (ex. 38+10=48), altfel nu mai creeaza
-# al doilea MATUSETRANS/CXSTOCURI.
+# Dupa PAS 1: continua automat PAS 2 in acelasi click (creeaza MATUSETRANS lipsa).
+# Splituri libere: mereu adaugate la cantitatea consumului (chiar dupa Check FIFO).
+# Daca e un singur MT pe linie si INVUSELINE.QUANTITY > MT: foloseste cantitatea liniei.
 # Cascada conservatoare; fara stop CXSENTEBS/FINCNTRLID; mismatch linie = warn.
-# Cu INVUSELINE: FIFO pe consumul apasat (+ cascada jurnal). Cale normala: NU atinge split.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -84,7 +82,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.26-PAS2-ORPHAN-SPLIT"
+VERSION="3.27-PAS12-CHAIN"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -1452,21 +1450,17 @@ def execute(context):
         free_splits=sorted([m for m in splitrows if m.getLong("INVUSELINESPLITID") not in used_splits],
                            key=lambda m: m.getLong("INVUSELINESPLITID"),reverse=True)
         free_qty=sum((number(s,"QUANTITY") for s in free_splits if number(s,"QUANTITY")>EPS),ZERO)
+        # Mereu: MT redus de Maximo + splituri libere = consumul original (nu depinde de Info PAS 1).
         if free_qty>EPS:
             combined=total+free_qty
-            pas1_info=""
-            try:
-                if clicked is not None:
-                    pas1_info=text(clicked["mbo"].getString("DESCRIPTION_LONGDESCRIPTION"))
-            except Exception:
-                pas1_info=""
-            line_match=not different(combined,line_qty)
-            info_pas1=("PAS 1/3" in pas1_info) or ("CXFIFOFIX PAS 1" in pas1_info)
-            # Completeaza consumul original: MT redus de Maximo + split liber din PAS 1.
-            if line_match or info_pas1 or line_qty_mismatch:
-                service.log_info("CXFIFOFIXISSUE PAS2-orphan: total %s + free_splits %s => %s (line=%s pas1=%s)" % (
-                    fmt(total),fmt(free_qty),fmt(combined),fmt(line_qty),info_pas1))
-                total=combined
+            service.log_info("CXFIFOFIXISSUE orphan-splits: total %s + free %s => %s" % (
+                fmt(total),fmt(free_qty),fmt(combined)))
+            total=combined
+        elif len(line_members)==1 and line_qty>total+EPS:
+            # Un singur MT pe linie, cantitatea liniei inca e cea mare (ex. 48 vs 34).
+            service.log_info("CXFIFOFIXISSUE line-qty recover: MT %s < line %s; folosesc linia" % (
+                fmt(total),fmt(line_qty)))
+            total=line_qty
         prior=journal[:pos]
         layers=replay(prior,issue_of_returns(prior,query))
         allocation,short=consume(layers,total)
@@ -1522,7 +1516,8 @@ def execute(context):
             c["source_balance"]=running
             if running is not None:
                 running-=c["qty"]
-        # PAS 1: doar INVUSELINESPLIT noi/ajustate (pentru consumul apasat)
+        # PAS 1: INVUSELINESPLIT noi; apoi continua PAS 2 in acelasi click.
+        pas1_message=""
         if creates and any(c.get("new_split") for c in creates):
             for a in mapped:
                 m=a["member"]["mbo"]
@@ -1553,9 +1548,12 @@ def execute(context):
                 sm.setValue("CONTENTUID",split_contentuid(src_uid,new_split_idx,used_uids),FLAGS)
                 new_split_idx+=1
                 created_split_ids.append(sm.getLong("INVUSELINESPLITID"))
+                c["split_mbo"]=sm
+                c["split_id"]=sm.getLong("INVUSELINESPLITID")
+                c["new_split"]=False
                 service.log_info("CXFIFOFIXISSUE PAS1 create split=%s qty=%s cost=%s uid=%s" % (
                     sm.getLong("INVUSELINESPLITID"),fmt(c["qty"]),fmt(c["cost"]),sm.getString("CONTENTUID")))
-            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 1/3: INVUSELINESPLIT actualizat (%s noi). Fara Save; reapeasa butonul 2." % len(created_split_ids))
+            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 1/3: INVUSELINESPLIT (%s noi); continui PAS 2." % len(created_split_ids))
             plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
             operation="PAS1 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
@@ -1575,15 +1573,41 @@ def execute(context):
             commit_started=True
             tx.commit()
             committed=True
-            message="PAS 1/3 SALVAT: INVUSELINESPLIT. Splituri noi: %s.\nNu apasa Save (deja comis; Save da BMXAA8229W). Reapeasa butonul 2 (PAS 2)." % (
+            pas1_message="PAS 1/3 SALVAT: INVUSELINESPLIT noi %s." % (
                 ",".join(text(i) for i in created_split_ids) if created_split_ids else "-")
-            service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
-            try:
-                if not refresh_table(context):
-                    message+="\nRedeschide articolul pentru refresh."
-            except Exception:
-                message+="\nRefresh nereusit; redeschide articolul."
-            return message
+            service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+pas1_message)
+            # Pregateste PAS 2 in acelasi click: planuri curate, splituri legate.
+            plans=[]
+            commit_started=False
+            committed=False
+            tx=None
+            used_splits=set(mt_by_split.keys())
+            for mem in members:
+                if not mem["mbo"].isNull("INVUSELINESPLITID"):
+                    used_splits.add(mem["mbo"].getLong("INVUSELINESPLITID"))
+            for c in creates:
+                if c.get("split_id") is not None:
+                    used_splits.add(long(c["split_id"]))
+            free_splits=sorted([m for m in splitrows if m.getLong("INVUSELINESPLITID") not in used_splits],
+                               key=lambda m: m.getLong("INVUSELINESPLITID"),reverse=True)
+            for c in creates:
+                if c.get("split_mbo") is not None and c.get("split_id") is not None:
+                    c["new_split"]=False
+                    continue
+                matched=None
+                for i,sm in enumerate(list(free_splits)):
+                    if (not different(number(sm,"QUANTITY"),c["qty"]) and
+                        not different(number(sm,"UNITCOST"),c["cost"],PRICE_EPS)):
+                        matched=free_splits.pop(i)
+                        break
+                if matched is None and free_splits:
+                    matched=free_splits.pop(0)
+                if matched is None:
+                    fail("PAS 1 comis dar split liber lipsa pentru PAS 2 (qty=%s cost=%s); reapeasa butonul" % (
+                        fmt(c["qty"]),fmt(c["cost"])))
+                c["new_split"]=False
+                c["split_mbo"]=matched
+                c["split_id"]=matched.getLong("INVUSELINESPLITID")
         # PAS 2: creeaza MATUSETRANS suplimentare doar pentru straturile consumului apasat
         if creates:
             for a in mapped:
@@ -1697,7 +1721,10 @@ def execute(context):
             commit_started=True
             tx.commit()
             committed=True
-            message="PAS 2/3 SALVAT: MATUSETRANS noi %s.\nACTUALDATE = original + N minute.\nNu apasa Save (deja comis). Reapeasa butonul 2 (PAS 3 = CXSTOCURI)." % ids
+            message=""
+            if pas1_message:
+                message=pas1_message+"\n"
+            message+="PAS 2/3 SALVAT: MATUSETRANS noi %s.\nACTUALDATE = original + N minute.\nNu apasa Save (deja comis). Reapeasa butonul 2 (PAS 3 = CXSTOCURI)." % ids
             for c in created_rows:
                 message+="\nMATUSETRANS %s: %s la %s; receptie %s; split %s." % (
                     c["new_id"],fmt(-c["qty"]),fmt(c["cost"]),receipt_label(c["receipt"]),c["split_id"])
