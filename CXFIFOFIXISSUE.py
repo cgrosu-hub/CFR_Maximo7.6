@@ -1,11 +1,12 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.19-FREESPLIT-LINE
+# VERSIUNE: 3.20-RETURN-ASTEPTAT
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
-# ISSUE un pret: MATUSETRANS costuri + CXSTOCURI cost/CXCURBAL pe grupa.
-# ISSUE multi-pret: PAS 1/2/3. Spliturile „libere” se calculeaza pe TOATA INVUSELINE
-# (nu doar pe consumul apasat) si se prefera cele mai noi; daca un split e deja legat
-# de alt MATUSETRANS, PAS 2 creeaza split nou — nu blocheaza cu mesaj mort.
+# RETURN anterior: restabileste stratul pe UNITCOST-ul din jurnalul de retur (nu doar
+# pe pretul ISSUEID), ca FIFO sa vada stocul ieftin reintors (ex. 2,630).
+# Daca planul e „gol” dar Info FIFO are BADFIFO=Y / asteptat ≠ pret curent, forțeaza
+# corectia la pretul asteptat din Check FIFO (evita „nimic modificat” fals).
+# ISSUE multi-pret: PAS 1/2/3; splituri libere pe toata linia; split ocupat => nou in PAS 2.
 # Cu INVUSELINE: FIFO pe consumul apasat. Cale normala: NU atinge INVUSELINESPLIT.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
@@ -82,7 +83,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.19-FREESPLIT-LINE"
+VERSION="3.20-RETURN-ASTEPTAT"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -325,7 +326,10 @@ def replay(prior,links=None):
             matches=[p for p in prior if p.get("kind")=="ISSUE" and p.get("ref")==issue_id and order(p)<order(r)]
             if len(matches)!=1:
                 fail("Retur anterior %s fara consum unic anterior" % r["ref"])
-            restore(layers,qty,matches[0]["cost"],prior)
+            # Stocul reintors e pe pretul din jurnalul de retur (ex. 2,630), nu neaparat
+            # pe UNITCOST-ul brut al ISSUEID daca acela e inca gresit in jurnal.
+            restore_cost=cost if cost is not None else matches[0]["cost"]
+            restore(layers,qty,restore_cost,prior)
             started=True
             continue
         if kind=="SHIPCANCEL":
@@ -436,6 +440,26 @@ def set_info(mbo,message):
     msg=audit_info(message)
     mbo.setValue("DESCRIPTION_LONGDESCRIPTION",msg,FLAGS)
     return msg
+
+def info_expected_cost(desc):
+    # Ex: "DIFERENTA: ... asteptat 2,712; diferenta ..."
+    raw=text(desc)
+    key="asteptat "
+    pos=raw.find(key)
+    if pos<0:
+        return None
+    token=""
+    for ch in raw[pos+len(key):]:
+        if ch in "0123456789,.":
+            token+=ch
+        elif token:
+            break
+    if not token:
+        return None
+    try:
+        return ExactNumber(token.replace(",", "."))
+    except Exception:
+        return None
 
 def layer_segments(allocations):
     segments=[]
@@ -1539,6 +1563,44 @@ def execute(context):
                 plan_number(r["mbo"],"CXQTY",changes[r["id"]]["qty"])
                 plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
             plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
+        if not plans:
+            desc=text(clicked["mbo"].getString("DESCRIPTION_LONGDESCRIPTION"))
+            info_exp=info_expected_cost(desc)
+            cur_cost=number(template,"UNITCOST")
+            # Fals „conforme”: replay local = pret curent, dar Check FIFO zice alt asteptat.
+            if (info_exp is not None and different(cur_cost,info_exp,PRICE_EPS) and
+                ("BADFIFO=Y" in desc or "DIFERENTA:" in desc)):
+                if info_exp<ZERO or ExactNumber(info_exp.fixed(3))!=info_exp:
+                    fail("Pretul asteptat din Info FIFO nu poate fi scris: %s" % fmt(info_exp))
+                cost=info_exp
+                value=money(total*cost)
+                receipt=None
+                if allocation:
+                    first=allocation[0]
+                    if first.get("refmbo")=="MATRECTRANS" and first.get("ref") is not None:
+                        receipt=first["ref"]
+                    elif first.get("initial"):
+                        receipt=None
+                    else:
+                        receipt=first.get("ref")
+                changes={clicked["id"]:{"qty":-total,"cost":cost}}
+                after=ledger(journal,changes)
+                for f in ("UNITCOST","ACTUALCOST","CURRENCYUNITCOST"):
+                    plan_number(template,f,cost)
+                for f in ("LINECOST","CURRENCYLINECOST"):
+                    plan_number(template,f,value)
+                if not template.isNull("LINECOST2"):
+                    plan_number(template,"LINECOST2",value)
+                plan_receipt(template,receipt)
+                for r in journal:
+                    if r["id"] in changes:
+                        plan_number(r["mbo"],"CXQTY",changes[r["id"]]["qty"])
+                        plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
+                    plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
+                service.log_info("CXFIFOFIXISSUE force asteptat Info FIFO %s -> %s on MATUSETRANS %s" % (
+                    fmt(cur_cost),fmt(cost),clicked_ref))
+            else:
+                return "MATUSETRANS %s si CXSTOCURI sunt deja conforme planului local; nimic modificat." % clicked_ref
         if not plans:
             return "MATUSETRANS %s si CXSTOCURI sunt deja conforme planului local; nimic modificat." % clicked_ref
         planned_tables=set(m.getName().upper() for m,f,k,v,old in plans)
