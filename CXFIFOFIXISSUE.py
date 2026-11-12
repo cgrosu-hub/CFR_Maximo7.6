@@ -1,12 +1,14 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.24-CASCADE-ISSUE
+# VERSIUNE: 3.25-LINE-QTY-WARN
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
 # RETURN pe prioritatea stratului; multi-pret => PAS 1/2/3.
 # CONTENTUID pe INVUSELINESPLIT noi: UUID unic.
 # Cascada conservatoare (cale normala, fara split): dupa ISSUE-ul apasat, corecteaza
 # ISSUE-urile contigue urmatoare din aceeasi grupa (max N); stop la split/stoc/eroare.
-# Fara stop pe CXSENTEBS / FINCNTRLID (corectia e permisa oricum).
+# Fara stop pe CXSENTEBS / FINCNTRLID.
+# Daca sum(MATUSETRANS) != INVUSELINE.QUANTITY: doar avertizeaza in log; nu blocheaza
+# splitul pe consumul apasat (nu se forteaza totusi cantitatea documentului).
 # Cu INVUSELINE: FIFO pe consumul apasat (+ cascada jurnal). Cale normala: NU atinge split.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
@@ -83,7 +85,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.24-CASCADE-ISSUE"
+VERSION="3.25-LINE-QTY-WARN"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -1309,8 +1311,12 @@ def execute(context):
             members.append({"mbo":m,"id":mid,"old_qty":qty,
                             "old_cost":cost,"date":datekey(m.getDate("ACTUALDATE"))})
             total+=qty
-        if different(total,number(line,"QUANTITY")):
-            fail("Total MATUSETRANS diferit de cantitatea liniei; nu se forteaza documentul")
+        line_qty=number(line,"QUANTITY")
+        line_qty_mismatch=different(total,line_qty)
+        if line_qty_mismatch:
+            # Nu bloca splitul pe consumul apasat; documentul tot nu e forțat (QUANTITY linie neschimbata).
+            service.log_info("CXFIFOFIXISSUE WARN sum MATUSETRANS=%s != INVUSELINE.QUANTITY=%s INVUSELINEID=%s; continui pe consumul apasat" % (
+                fmt(total),fmt(line_qty),lineid))
         if currency!=doc.getString("CURRENCYCODE") or number(doc,"EXCHANGERATE")!=ONE:
             fail("Moneda/conversie document neconforma")
         members.sort(key=lambda m:(m["date"],m["id"]))
