@@ -1,28 +1,20 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.16-SHIPCANCEL
+# VERSIUNE: 3.17-SAVE-ISOLATED
 # Corecteaza randul CXSTOCURI apasat + tranzactia sursa (MATUSETRANS/MATRECTRANS).
-# Cu INVUSELINE: FIFO pe CANTITATEA consumului apasat, nu pe toata linia; alte MATUSETRANS
-# de pe linie (chiar intercalate temporal) nu blocheaza si nu sunt rescrise.
-# Daca alocarea FIFO are UN SINGUR pret (chiar din mai multe receptii), NU face split:
-# actualizeaza doar pretul/cantitatea pe consumul apasat (MATRECTRANSID = prima receptie).
-# Split 3 pasi doar cand consumul apasat cere PRETRURI FIFO diferite.
-# PAS 1 = INVUSELINESPLIT lipsa; PAS 2 = MATUSETRANS nou (ACTUALDATE +1 min);
-# PAS 3 = CXSTOCURI nou + corectie CXQTY/CXCURBAL. Info FIFO dupa fiecare pas.
-# Save pe ecran dupa commit pe INVUSELINESPLIT = BMXAA8229W (ROWSTAMP stale).
-# Cale normala (fara creates): NU atinge INVUSELINESPLIT — doar MATUSETRANS+CXSTOCURI.
-# SHIPTRANSFER/TRANSFER de iesire din MATRECTRANS: doar MATRECTRANS+CXSTOCURI (fara split).
-# Strat INITIAL e provenienta legitima (MATRECTRANSID null pe linia corespunzatoare).
-# Mai multe INITIAL pe aceeasi data cu preturi diferite = OK (straturi de deschidere).
-# Daca INVUSELINE lipseste, corecteaza totusi pretul tranzactiei si jurnalul.
-# RETURN preia acelasi pret FIFO al consumului.
-# VOIDRECEIPT/SHIPRETURN anterior: anulare pe pret (newest-first), ca in CXINVAUDIT.
-# SHIPCANCEL anterior (qty>0): restabileste stoc pe pret, ca in CXINVAUDIT.
-# Dupa corectie: recalculeaza CXCURBAL pe TOT jurnalul grupei (nu doar pretul afectat).
-# NU modifica INVUSE (decat daca e nevoie de ACTUALDATE pe linie in pasi de create),
-# receptii, stoc fizic, INVLIFOFIFOCOST ori ROWSTAMP.
-# Necesita protectia CXADDTOCXSTOCURI si teste fara concurenta in TEST.
-# Calcule Java BigDecimal; fara decimal/json/re si fara filtre de pilot.
+# ISSUE (cale normala, un pret FIFO): scrie DOAR
+#   MATUSETRANS: UNITCOST, ACTUALCOST, CURRENCYUNITCOST, LINECOST, CURRENCYLINECOST,
+#                LINECOST2?, QUANTITY/QTYREQUESTED (daca e nevoie), CURBAL?, MATRECTRANSID?
+#   CXSTOCURI (grupa): UNITCOST/CXQTY pe consumul apasat + CXCURBAL pe tot jurnalul grupei
+# Commit in MXTransaction pe seturi MXServer izolate (NU pe DataBean-ul din ecran).
+# Dupa commit: reset/refresh UI — fara Save pe ecran (Save pe ROWSTAMP vechi = BMXAA8229W).
+# Nu amesteca MboSet-ul din tabelul FIFO cu setul de scriere (paginare = doua instante).
+# Cu INVUSELINE: FIFO pe CANTITATEA consumului apasat, nu pe toata linia.
+# Un singur pret FIFO => fara split; preturi multiple => PAS 1/2/3.
+# Cale normala: NU atinge INVUSELINESPLIT.
+# SHIPTRANSFER/TRANSFER: doar MATRECTRANS+CXSTOCURI.
+# RETURN / VOIDRECEIPT / SHIPRETURN / SHIPCANCEL: ca in CXINVAUDIT la replay.
+# Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
 from java.math import BigDecimal, MathContext, RoundingMode
 from java.text import NumberFormat, ParsePosition
@@ -97,7 +89,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.16-SHIPCANCEL"
+VERSION="3.17-SAVE-ISOLATED"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -610,9 +602,9 @@ def screen_rows(context):
         row=ms.getMbo(i)
     return found
 
-def bind_screen_journal(context, rows):
-    # ponytail: randul deja incarcat in tabel trebuie scris o singura data.
-    # A doua instanta CXSTOCURI produce BMXAA8229W pe ROWSTAMP.
+def assert_screen_fresh(context, rows):
+    # Doar verificare ROWSTAMP pe randurile vizibile. NU reinnoieste mbo pe DataBean:
+    # scrierea pe setul din ecran + set MXServer = BMXAA8229W (paginare / doua instante).
     ui=screen_rows(context)
     for row in rows:
         other=ui.get(row["id"])
@@ -620,7 +612,6 @@ def bind_screen_journal(context, rows):
             continue
         if text(other.getRowStamp())!=text(row["mbo"].getRowStamp()):
             fail("Jurnalul de pe ecran e invechit pentru CXSTOCURIID=%s; redeschide articolul" % row["id"])
-        row["mbo"]=other
 
 def owns(plans):
     from java.lang import System
@@ -637,25 +628,34 @@ def owns(plans):
     ordered.sort(key=lambda pair: rank.get(pair[0],9))
     return ordered
 
-def refresh_table():
-    # Commit-ul e deja in DB. Refresh UI ca sa nu mai fie nevoie de Save
-    # (Save pe INVUSELINESPLIT stale = BMXAA8229W).
+def refresh_table(context=None):
+    # Commit deja in DB pe seturi izolate. Reincarca UI ca Save pe ecran sa nu mai fie necesar.
     from psdi.common.context import UIContext
     ui=UIContext.getCurrentContext()
     session=ui.getWebClientSession() if ui else None
     if session is None:
         return False
     ok=False
+    try:
+        if context is not None:
+            ms=context.getThisMboSet()
+            if ms is not None:
+                ms.reset()
+                ok=True
+            owner=context.getOwner()
+            if owner is not None and owner.getThisMboSet() is not None:
+                owner.getThisMboSet().reset()
+    except Exception:
+        pass
     bean=session.getDataBean(TABLE_ID)
     if bean is not None:
         bean.reset()
         bean.refreshTable()
         ok=True
-    # ponytail: incearca si alte bean-uri care tin INVUSELINESPLIT in sesiune
     try:
         app=session.getCurrentApp()
         if app is not None:
-            for name in ("INVUSELINESPLIT","INVUSELINE","INVUSE","MATUSETRANS","MATRECTRANS"):
+            for name in ("INVUSELINESPLIT","INVUSELINE","INVUSE","MATUSETRANS","MATRECTRANS","MAINRECORD"):
                 try:
                     b=app.getDataBean(name)
                     if b is not None:
@@ -817,7 +817,7 @@ def execute(context):
             cxwhere=scope_where(context,"CXSTOCURI")
             cxset,raw=query("CXSTOCURI",cxwhere)
             all_journal=[journal_row(m) for m in raw]
-            bind_screen_journal(context,all_journal)
+            assert_screen_fresh(context,all_journal)
             if any(m.getString("CURRENCYCODE")!=rm.getString("CURRENCYCODE") for m in raw if not m.isNull("CURRENCYCODE")):
                 fail("Monede diferite intre jurnal si MATRECTRANS")
             journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
@@ -880,7 +880,7 @@ def execute(context):
                 message+="\nNu modifica receptia/destinatia legata din acest pas."
                 message+="\nRuleaza Check FIFO. Reconcilierea INVLIFOFIFOCOST ramane separata."
             try:
-                if not refresh_table():
+                if not refresh_table(context):
                     message+="\nRedeschide articolul pentru refresh."
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
@@ -917,7 +917,7 @@ def execute(context):
             cxwhere=scope_where(context,"CXSTOCURI")
             cxset,raw=query("CXSTOCURI",cxwhere)
             all_journal=[journal_row(m) for m in raw]
-            bind_screen_journal(context,all_journal)
+            assert_screen_fresh(context,all_journal)
             journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
             rows=[r for r in journal if r["id"]==context.getLong("CXSTOCURIID")]
             if len(rows)!=1 or rows[0]["ref"]!=rm.getLong("MATUSETRANSID") or rows[0]["kind"]!="RETURN":
@@ -991,7 +991,7 @@ def execute(context):
                 message="SALVAT retur %s la %s, pretul FIFO al consumului %s." % (
                     rm.getLong("MATUSETRANSID"),fmt(cost),issue_id)
             try:
-                if not refresh_table():
+                if not refresh_table(context):
                     message+="\nRedeschide articolul pentru refresh."
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
@@ -1037,7 +1037,7 @@ def execute(context):
             cxwhere=scope_where(context,"CXSTOCURI")
             cxset,raw=query("CXSTOCURI",cxwhere)
             all_journal=[journal_row(m) for m in raw]
-            bind_screen_journal(context,all_journal)
+            assert_screen_fresh(context,all_journal)
             if any(m.getString("CURRENCYCODE")!=first.getString("CURRENCYCODE") for m in raw):
                 fail("Monede diferite intre jurnal si consum")
             journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
@@ -1103,7 +1103,7 @@ def execute(context):
                 committed=True
                 message="SALVAT consum %s la %s, valoare %s. Linia de utilizare lipseste si nu a fost recreata." % (first.getLong("MATUSETRANSID"),fmt(cost),fmt(value))
             try:
-                if not refresh_table():
+                if not refresh_table(context):
                     message+="\nRedeschide articolul pentru refresh."
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
@@ -1183,7 +1183,7 @@ def execute(context):
         cxwhere=scope_where(context,"CXSTOCURI")
         cxset,raw=query("CXSTOCURI",cxwhere)
         all_journal=[journal_row(m) for m in raw]
-        bind_screen_journal(context,all_journal)
+        assert_screen_fresh(context,all_journal)
         if any(m.getString("CURRENCYCODE")!=currency for m in raw):
             fail("Monede diferite intre jurnal si consum")
         journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
@@ -1243,7 +1243,8 @@ def execute(context):
         if missing_journal:
             if template_j is None:
                 fail("Nu exista sablon CXSTOCURI pe linie pentru PAS 3")
-            info_row=context
+            # Scrie info pe sablonul din setul MXServer, nu pe mbo-ul din DataBean (evita BMXAA8229W).
+            info_row=template_j["mbo"]
             for mem in missing_journal:
                 jm=cxset.addAtEnd(FLAGS)
                 for f in ("ITEMNUM","LOCATION","ORGID","SITEID","COMMODITYGROUP","CURRENCYCODE",
@@ -1287,7 +1288,7 @@ def execute(context):
             message="PAS 3/3 SALVAT: creat CXSTOCURI pentru MATUSETRANS %s.\nNu apasa Save pe ecran (deja comis). Ruleaza Check FIFO." % clicked_ref
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
             try:
-                if not refresh_table():
+                if not refresh_table(context):
                     message+="\nRedeschide articolul pentru refresh."
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
@@ -1397,7 +1398,7 @@ def execute(context):
                 ",".join(text(i) for i in created_split_ids) if created_split_ids else "-")
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
             try:
-                if not refresh_table():
+                if not refresh_table(context):
                     message+="\nRedeschide articolul pentru refresh."
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
@@ -1491,7 +1492,7 @@ def execute(context):
                     c["new_id"],fmt(-c["qty"]),fmt(c["cost"]),receipt_label(c["receipt"]),c["split_id"])
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
             try:
-                if not refresh_table():
+                if not refresh_table(context):
                     message+="\nRedeschide articolul pentru refresh."
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
@@ -1572,6 +1573,7 @@ def execute(context):
             message+="\nMATUSETRANS %s: %s la %s; receptie %s." % (a["member"]["id"],fmt(-a["qty"]),fmt(a["cost"]),receipt_label(a["receipt"]))
         message+="\nCelelalte consumuri de pe linie nu au fost modificate; apasa pe fiecare rand BADFIFO=Y separat."
         message+="\nReturul se corecteaza cand selectezi randul lui."
+        message+="\nNu apasa Save pe ecran (deja comis in script; Save pe ROWSTAMP vechi = BMXAA8229W)."
         try:
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+operation+" "+message.replace("\n"," | "))
         except Exception:
@@ -1605,7 +1607,7 @@ def execute(context):
             except Exception:
                 pass
     try:
-        if not refresh_table():
+        if not refresh_table(context):
             message+="\nRedeschide articolul pentru refresh."
     except Exception:
         message+="\nRefresh nereusit; redeschide articolul."
