@@ -1,29 +1,13 @@
+# -*- coding: utf-8 -*-
 # SCRIPT: CXINVAUDIT
-# AUTOR: Cristian Grosu
-# VERSIUNE: 5.24-SPLIT-ON-ROW
-# Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
-# Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
-# anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
-# CXCURBAL < 0 => BADFIFO=Y mereu (chiar daca pretul FIFO e OK).
-# RECEIPT/SHIPRECEIPT cu cantitate negativa = iesire FIFO (comenzi/receptii negative),
-# nu „tip neimplementat”; pret OK => BADFIFO=N (nu blocheaza restul grupei).
-# VOIDRECEIPT/SHIPRETURN anuleaza stoc pe acelasi pret (receptia cea mai recenta).
-# SHIPCANCEL (qty>0) restabileste stocul anularii unui SHIPTRANSFER (RECEIPTREF sau
-# match pe cantitate/pret); pune inapoi stratul si marcheaza BADFIFO=N.
-# Tipurile ambigue NU blocheaza auditul pe randurile urmatoare din grupa.
-# Conventie: N + MOTIV=ORDINE_DATE daca deficitul poate fi asociat unor intrari
-# ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
-# ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
-# BADFIFO=Y pe diferenta de pret SAU pe sold CXCURBAL gresit/lipsa.
-# INITIAL valid: BADFIFO=N; mai multe INITIAL pe aceeasi data cu preturi diferite = OK
-# (straturi de deschidere). Refuza doar INITIAL duplicat pe acelasi pret / dupa miscari.
-# Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
-# Split lipsa: se scrie pe Info FIFO al randurilor din aceeasi linie, nu in popup.
-# INVBALANCES.CURBAL = TOTAL SOLD straturi, doar daca nu exista BADFIFO=Y/U;
-# apoi aliniaza INVLIFOFIFOCOST (sum QUANTITY) la aceleasi straturi.
-# Scrierea INVLIFOFIFOCOST pe setul copil al INVENTORY; MaxType Locale.US.
-# Scrie DESCRIPTION_LONGDESCRIPTION; pe conditiile de mai sus INVBALANCES/INVLIFO.
-# Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
+# AUTOR ORIGINAL: Cristian Grosu; revizie 5.25-RECEIPT-SAFE
+# FIFO pe straturi cu provenienta. CXCURBAL validat pe grupa, pret si receptie.
+# Retururile/anularile repetate scad din cantitatea originala returnabila.
+# Provenienta gresita / split incomplet / istoric incomplet blocheaza reconcilierea.
+# INVBALANCES si INVLIFOFIFOCOST sunt reconciliate intr-o singura tranzactie.
+# Nu se creeaza straturi oficiale: daca lipsesc randuri reutilizabile, nu se salveaza partial.
+# Soldul oficial negativ necesita reconciliere explicita, nu este inlocuit automat.
+# Info FIFO simplificat; BADFIFO si verificarile interne raman active.
 
 from java.math import BigDecimal, MathContext, RoundingMode
 try:
@@ -93,7 +77,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.24-SPLIT-ON-ROW"
+VERSION = "5.25-RECEIPT-SAFE"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -109,6 +93,115 @@ ENTRY_TYPES = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 EXIT_TYPES = ("ISSUE", "SHIPTRANSFER", "TRANSFER")
 VOID_TYPES = ("VOIDRECEIPT", "SHIPRETURN")
 AMBIGUOUS_TYPES = ("VOIDSHIPRECEIPT", "RECBALADJ")
+
+# BEGIN FIFO RECEIPT KERNEL 1.0 -- identical in all three scripts.
+def cx_key_number(value):
+    if value is None:
+        raise ValueError("Numar lipsa in cheia de strat")
+    v = value.value if hasattr(value, "value") else value
+    return str(v.stripTrailingZeros().toPlainString())
+
+def cx_receipt_balances(rows, zero):
+    """Post-movement balances by group, price and receipt; never by inventory total.
+    Source-less legacy movements are inferred only with one unambiguous bucket.
+    Returns: (id -> balance, id -> source key, id -> diagnostic).
+    Input dictionaries must be sorted-compatible (date/ref/id) and scope-local.
+    """
+    books, keys, result, errors, last_issue = {}, {}, {}, {}, {}
+    def add(a, b):
+        return a.add(b) if hasattr(a, "add") else a+b
+    def negative(a):
+        return a.signum() < 0 if hasattr(a, "signum") else a < zero
+    def positive(a):
+        return a.signum() > 0 if hasattr(a, "signum") else a > zero
+    for r in sorted(rows, key=lambda x:(x["date"], x.get("ref") or 0, x["id"])):
+        ident, kind, cost, qty = r["id"], r["kind"], r.get("cost"), r.get("qty")
+        if not r.get("date") or cost is None or negative(cost):
+            raise ValueError("Data/pret neconform CXSTOCURIID=%s" % ident)
+        group, price = r.get("group") or "", cx_key_number(cost)
+        receipt = r.get("receipt")
+        if kind == "INITIAL":
+            key = (group, price, "INITIAL", ident)
+            if r.get("balance") is None:
+                raise ValueError("INITIAL fara sold CXSTOCURIID=%s" % ident)
+            books[key] = r["balance"]
+        else:
+            if qty is None:
+                raise ValueError("Cantitate lipsa CXSTOCURIID=%s" % ident)
+            if receipt is not None:
+                key = (group, price, "MATRECTRANS", receipt)
+            elif kind == "RETURN" and r.get("issue_id") in last_issue:
+                origin = last_issue[r["issue_id"]]
+                key = (group, price, origin[2], origin[3])
+            else:
+                candidates = [k for k in books if k[:2] == (group, price) and positive(books[k])]
+                if not candidates:
+                    candidates = [k for k in books if k[:2] == (group, price)]
+                if len(candidates) == 1:
+                    key = candidates[0]
+                else:
+                    key = (group, price, "UNKNOWN", 0)
+                    errors[ident] = "Provenienta pe receptie lipsa/ambigua; nu cumula straturile la acelasi pret"
+            books[key] = add(books.get(key, zero), qty)
+        keys[ident], result[ident] = key, books[key]
+        if r.get("refmbo") == "MATUSETRANS" and kind == "ISSUE":
+            last_issue[r.get("ref")] = key
+    return result, keys, errors
+
+def cx_enrich_receipts(rows, query):
+    """Batch-load source links, checking that the source belongs to the journal scope."""
+    for table, pk in (("MATUSETRANS", "MATUSETRANSID"), ("MATRECTRANS", "MATRECTRANSID")):
+        wanted = sorted(set(r["ref"] for r in rows if r.get("refmbo") == table and r.get("ref") is not None))
+        found = {}
+        for start in range(0, len(wanted), 300):
+            unused, sources = query(table, "%s IN (%s)" % (pk, ",".join(str(i) for i in wanted[start:start+300])))
+            for m in sources:
+                found[m.getLong(pk)] = m
+        for r in rows:
+            if r.get("refmbo") != table or r.get("ref") is None:
+                continue
+            m = found.get(r["ref"])
+            if m is None:
+                raise ValueError("Sursa %s/%s lipsa" % (table, r["ref"]))
+            if r.get("item") is not None and m.getString("ITEMNUM") != r["item"]:
+                raise ValueError("Articol sursa/jurnal diferit")
+            if table == "MATUSETRANS":
+                if r.get("site") is not None and (m.getString("SITEID"), m.getString("STORELOC")) != (r["site"], r["location"]):
+                    raise ValueError("Site/gestiune sursa/jurnal diferite")
+                r["receipt"] = None if m.isNull("MATRECTRANSID") else m.getLong("MATRECTRANSID")
+                r["issue_id"] = None if m.isNull("ISSUEID") else m.getLong("ISSUEID")
+            elif r.get("qty") is not None:
+                qty = r["qty"]
+                inbound = qty.signum() > 0 if hasattr(qty, "signum") else qty > ZERO
+                if inbound and r["kind"] in ("RECEIPT", "SHIPRECEIPT", "TRANSFER"):
+                    r["receipt"] = r["ref"]
+                elif not m.isNull("RECEIPTREF"):
+                    r["receipt"] = m.getLong("RECEIPTREF")
+    return rows
+
+def cx_rollback(tx):
+    if tx is not None:
+        try:
+            tx.rollback()
+        except Exception:
+            pass
+
+def cx_verify_plans(plans, read_number):
+    for m, field, kind, value, old in plans:
+        valid = True
+        if kind == "NUMBER":
+            valid = read_number(m, field) == value
+        elif kind == "ID":
+            valid = not m.isNull(field) and m.getLong(field) == long(value)
+        elif kind == "NULL":
+            valid = m.isNull(field)
+        elif kind == "TEXT":
+            valid = m.getString(field) == value
+        if not valid:
+            raise ValueError("Logica save a suprascris %s.%s; rollback" % (m.getName(), field))
+# END FIFO RECEIPT KERNEL
+
+
 def txt(value):
     return "" if value is None else string_type(value)
 
@@ -230,10 +323,35 @@ def is_outgoing(row):
     qty = row.get("qty")
     return row.get("kind") != "INITIAL" and qty is not None and qty < -QTY_TOLERANCE
 
+
+def clean_info_fifo(value):
+    # Only presentation: never change status, balances or BADFIFO.
+    parts=[]
+    for part in value.replace("FIFO LOCAL ","").replace("FIFO LOCAL","").split(" | "):
+        sections=[]
+        for section in part.split("; "):
+            stripped=section.strip()
+            lowered=stripped.lower()
+            if lowered.startswith("diferenta ") or lowered.startswith(u"diferen\u021ba "):
+                continue
+            if lowered.startswith("atentie sold: negativ") or lowered.startswith(u"aten\u021bie sold: negativ"):
+                continue
+            if stripped:
+                sections.append(stripped)
+        if sections:
+            parts.append("; ".join(sections))
+    return " | ".join(parts)
+
+
 def description(old, record, summary):
     visible, history = split_history(old)
     validate_history(record["row"], history)
-    value = description_visible(visible, record, summary)
+    value = clean_info_fifo(description_visible(visible, record, summary))
+    if "FIFO_SPLITS=" in visible:
+        token=visible.split("FIFO_SPLITS=",1)[1].split(";",1)[0].split("|",1)[0].strip().split()
+        if token and all(v.isdigit() for v in token[0].split(",")):
+            head,sep,tail=value.partition(" | BADFIFO=")
+            value=head+"; FIFO_SPLITS="+token[0]+sep+tail
     value = "\n".join([value] + [entry["line"] for entry in history])
     if len(value) > MAX_DESCRIPTION:
         raise ValueError("Istoric prea lung; nimic salvat")
@@ -351,13 +469,13 @@ def apply_date_order_policy(group_rows,records):
         rec["reason"]="Pret compatibil cu intrare ulterioara cu RefID anterior; data iesirii trebuie verificata"
         rec["date_candidates"]=proposed
 
-def put_back(layers,qty,cost,priority,source,source_ref,source_ref_mbo=None):
+def put_back(layers,qty,cost,priority,source,source_ref,source_ref_mbo=None,initial=False):
     for layer in layers:
         if not far(layer["cost"],cost,COST_TOLERANCE) and layer.get("priority")==priority:
             layer["qty"]+=qty
             return
     layers.append({"qty":qty,"cost":cost,"source":source,"source_ref_id":source_ref,
-                   "source_ref_mbo":source_ref_mbo,"initial":False,"priority":priority})
+                   "source_ref_mbo":source_ref_mbo,"initial":initial,"priority":priority})
     layers.sort(key=lambda layer: layer["priority"])
 
 def return_target(row,group_rows,records):
@@ -410,6 +528,66 @@ def shipcancel_target(row,group_rows,records):
     else:
         source,source_ref,priority=ship["id"],ship.get("ref_id"),order(ship)
     return expected,ship.get("ref_id"),source_ref,priority,source
+
+
+def receipt_audit_rows(inventory,rows):
+    from psdi.server import MXServer
+    opened=[]
+    def query(name,where):
+        ms=MXServer.getMXServer().getMboSet(name,inventory.getUserInfo())
+        opened.append(ms)
+        ms.setFlag(__import__("psdi.mbo",fromlist=["MboConstants"]).MboConstants.NOSAVE,True)
+        ms.setWhere(where)
+        ms.reset()
+        found=[]
+        m=ms.moveFirst()
+        while m is not None:
+            found.append(m)
+            if len(found)>MAX_ROWS:
+                raise ValueError("Limita surse audit depasita")
+            m=ms.moveNext()
+        return ms,found
+    try:
+        normalized=[]
+        for row in rows:
+            r=dict(row)
+            r["ref"]=r.get("ref_id")
+            r["refmbo"]=r.get("ref_mbo")
+            r["item"],r["site"],r["location"]=(inventory.getString(f) for f in ("ITEMNUM","SITEID","LOCATION"))
+            normalized.append(r)
+        cx_enrich_receipts(normalized,query)
+        by_id=dict((r["id"],r) for r in normalized)
+        for row in rows:
+            for key in ("receipt","issue_id"):
+                if key in by_id[row["id"]]:
+                    row[key]=by_id[row["id"]][key]
+        return cx_receipt_balances(normalized,ZERO)
+    finally:
+        for ms in reversed(opened):
+            close_set(ms)
+
+def apply_receipt_audit(audit,rows,balances,keys,errors):
+    last={}
+    for row in sorted(rows,key=order):
+        rec=audit["records"][row["id"]]
+        row["receipt_partition"]=keys[row["id"]]
+        expected=balances[row["id"]]
+        rec["balance_expected"]=expected
+        rec["balance_bad"]=row.get("balance") is not None and far(row["balance"],expected,QTY_TOLERANCE)
+        if row.get("ref_mbo")=="MATUSETRANS" and row.get("kind") in ("ISSUE","RETURN") and rec.get("allocations"):
+            sources=set(None if a.get("initial") else (a.get("source_ref_id") if a.get("source_ref_mbo")=="MATRECTRANS" else None) for a in rec["allocations"])
+            if len(sources)!=1 or row.get("receipt") not in sources:
+                rec["source_bad"]=True
+                rec["status"]="BAD"
+                rec["reason"]="Split pe receptii necesar" if len(sources)!=1 else "MATRECTRANSID nu corespunde sursei FIFO"
+        if row["id"] in errors:
+            rec["status"]="UNVERIFIED"
+            rec["reason"]=errors[row["id"]]
+        last[keys[row["id"]]]=expected
+    audit["ledger_qty"]=sum(last.values(),ZERO)
+    audit["receipt_keys"]=keys
+    audit["receipt_errors"]=errors
+
 
 def audit_rows(rows):
     records=dict((r["id"],new_local_record(r)) for r in rows)
@@ -494,14 +672,33 @@ def audit_rows(rows):
                 if expected is None:
                     rec["reason"]=link_ref
                     continue
+                issue_row=next(r for r in group_rows if r.get("ref_mbo")=="MATUSETRANS" and r.get("ref_id")==link_ref and r.get("kind")=="ISSUE")
+                origin_rec=records[issue_row["id"]]
+                if "returnable" not in origin_rec:
+                    origin_rec["returnable"]=[dict(a) for a in origin_rec.get("allocations") or []]
+                pool=origin_rec["returnable"]
+                if sum((a["qty"] for a in pool),ZERO)+QTY_TOLERANCE<qty:
+                    rec["reason"]="Retururi cumulate peste consum sau alocare originala indisponibila"
+                    structural=rec["reason"]
+                    continue
+                restored=[]
+                left=qty
+                for a in reversed(pool):
+                    take=min(left,a["qty"])
+                    if take>QTY_TOLERANCE:
+                        b=dict(a)
+                        b["qty"]=take
+                        restored.append(b)
+                        a["qty"]-=take
+                        left-=take
+                        put_back(layers,take,a["cost"],a["priority"],a.get("source"),a.get("source_ref_id"),a.get("source_ref_mbo"),a.get("initial",False))
+                    if left<=QTY_TOLERANCE:
+                        break
+                expected=sum((a["qty"]*a["cost"] for a in restored),ZERO)/qty
                 rec["expected"]=expected
                 rec["link_ref"]=link_ref
+                rec["allocations"]=restored
                 rec["status"]="BAD" if far(cost,expected,COST_TOLERANCE) else "OK"
-                rec["allocations"]=[{"qty":qty,"cost":expected,"source":source,"source_ref_id":source_ref,
-                                     "initial":False,"priority":priority}]
-                origin=records.get(source)
-                source_mbo=None if origin is None else origin["row"].get("ref_mbo")
-                put_back(layers,qty,expected,priority,source,source_ref,source_mbo)
                 local_prices.add(expected)
                 local_started=True
                 continue
@@ -513,14 +710,33 @@ def audit_rows(rows):
                 if expected is None:
                     rec["reason"]=link_ref
                     continue
+                issue_row=next(r for r in group_rows if r.get("ref_mbo")=="MATRECTRANS" and r.get("ref_id")==link_ref and r.get("kind")=="SHIPTRANSFER")
+                origin_rec=records[issue_row["id"]]
+                if "returnable" not in origin_rec:
+                    origin_rec["returnable"]=[dict(a) for a in origin_rec.get("allocations") or []]
+                pool=origin_rec["returnable"]
+                if sum((a["qty"] for a in pool),ZERO)+QTY_TOLERANCE<qty:
+                    rec["reason"]="Anulari cumulate peste expediere sau alocare originala indisponibila"
+                    structural=rec["reason"]
+                    continue
+                restored=[]
+                left=qty
+                for a in reversed(pool):
+                    take=min(left,a["qty"])
+                    if take>QTY_TOLERANCE:
+                        b=dict(a)
+                        b["qty"]=take
+                        restored.append(b)
+                        a["qty"]-=take
+                        left-=take
+                        put_back(layers,take,a["cost"],a["priority"],a.get("source"),a.get("source_ref_id"),a.get("source_ref_mbo"),a.get("initial",False))
+                    if left<=QTY_TOLERANCE:
+                        break
+                expected=sum((a["qty"]*a["cost"] for a in restored),ZERO)/qty
                 rec["expected"]=expected
                 rec["link_ref"]=link_ref
+                rec["allocations"]=restored
                 rec["status"]="BAD" if far(cost,expected,COST_TOLERANCE) else "OK"
-                rec["allocations"]=[{"qty":qty,"cost":expected,"source":source,"source_ref_id":source_ref,
-                                     "initial":False,"priority":priority}]
-                origin=records.get(source)
-                source_mbo=None if origin is None else origin["row"].get("ref_mbo")
-                put_back(layers,qty,expected,priority,source,source_ref,source_mbo)
                 local_prices.add(expected)
                 local_started=True
                 continue
@@ -560,7 +776,7 @@ def audit_rows(rows):
                         structural="Sold lipsa pe intrarea necesara bazei locale"
                         rec["reason"]=structural
                         continue
-                    known=sum((l["qty"] for l in layers if l["cost"]==cost),ZERO)
+                    known=sum((l["qty"] for l in layers if l["cost"]==cost and l.get("source_ref_id")==row.get("ref_id") and l.get("source_ref_mbo")==row.get("ref_mbo")),ZERO)
                     available=min(qty,max(ZERO,balance-known))
                 local_prices.add(cost)
                 local_started=True
@@ -739,7 +955,9 @@ def description_visible(old, record, summary):
                 fmt_ro(row.get("balance")),fmt_ro(record["balance_expected"]))
         return info+" | BADFIFO=N"
     status=record["status"]
-    if status=="DATE_ORDER":
+    if record.get("source_bad"):
+        info="DIFERENTA: "+record["reason"]
+    elif status=="DATE_ORDER":
         info="OK: pret compatibil %s; intrare ulterioara cu RefID anterior; data iesirii de verificat (conventie)" % fmt_ro(record["expected"])
     elif status=="OK" and row.get("kind") in VOID_TYPES:
         info="OK: %s anuleaza %s buc. la %s" % (row.get("kind"),fmt_ro(-row["qty"]),fmt_ro(record["expected"]))
@@ -960,6 +1178,12 @@ def enrich_shipcancels(inventory,rows,script_service):
 
 def journal_fifo_complete(audit):
     # True doar fara BADFIFO=Y/U pe pret/sold si fara ORDINE_DATE/neverificat.
+    if audit.get("split_gaps"):
+        return False,"Split incomplet sau verificarea spliturilor indisponibila"
+    if audit.get("receipt_errors"):
+        return False,"Provenienta pe receptie incompleta"
+    if audit.get("issues"):
+        return False,"Istoric incomplet: "+"; ".join(audit["issues"][:3])
     if audit.get("ledger_qty") is None:
         return False,"Sold CXSTOCURI nedeterminabil"
     for rec in audit["records"].values():
@@ -992,6 +1216,9 @@ def local_summary(audit,unknown_origins):
     return_counts=dict((f,sum(1 for r in returns if flag(r)==f)) for f in ("N","Y","U"))
     if return_counts["Y"]:
         verdict="DIFERENTE"
+    complete,reason=journal_fifo_complete(audit)
+    if not complete and verdict=="OK":
+        verdict="NECONCLUDENT: "+reason
     lines=["CHECK FIFO","Verdict: "+verdict,"",
            "IESIRI","  OK: %s" % counts["N"],"  Diferente pret/sold: %s" % counts["Y"],
            "  Neverificate: %s" % counts["U"],
@@ -1006,87 +1233,115 @@ def local_summary(audit,unknown_origins):
                       "  Neverificate: %s" % return_counts["U"]])
     return "\n".join(lines)
 
-def sync_invbalances_curbal(inventory,target_qty,audit,script_service):
+def sync_official_stock(inventory,rows,audit,script_service):
     from psdi.server import MXServer
     from psdi.mbo import MboConstants,SqlFormat
-    from psdi.util import MaxType
-    from java.util import Locale,TimeZone
     flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
     ok,reason=journal_fifo_complete(audit)
     if not ok:
-        msg="\n".join([
-            "ACTUALIZARE INVBALANCES.CURBAL: sarita",
-            "  Motiv: %s" % reason,
-            "  CURBAL se actualizeaza doar cand toate tranzactiile CXSTOCURI sunt OK FIFO (data/pret/cantitate).",
-        ])
-        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
-        return msg
-    layers_qty=sum((layer["qty"] for layer in (audit.get("layers") or [])),ZERO)
-    if target_qty is None:
-        target_qty=layers_qty
-    ms=None
+        return "RECONCILIERE STOC: sarita ("+reason+")"
+    desired=desired_fifo_layers(rows,audit)
+    target=sum((l["qty"] for l in desired),ZERO)
+    if far(target,audit["ledger_qty"],QTY_TOLERANCE) or target<ZERO:
+        return "RECONCILIERE STOC: sarita; straturile si soldul jurnalului nu concorda"
+    opened=[]
+    tx=None
+    committed=False
+    commit_started=False
     try:
-        ms=MXServer.getMXServer().getMboSet("INVBALANCES",inventory.getUserInfo())
-        condition=SqlFormat("ITEMNUM=:1 AND SITEID=:2 AND LOCATION=:3")
-        condition.setObject(1,"INVBALANCES","ITEMNUM",inventory.getString("ITEMNUM"))
-        condition.setObject(2,"INVBALANCES","SITEID",inventory.getString("SITEID"))
-        condition.setObject(3,"INVBALANCES","LOCATION",inventory.getString("LOCATION"))
-        ms.setWhere(condition.format())
-        ms.reset()
-        rows=[]
-        m=ms.moveFirst()
+        # Fresh INVENTORY owner: existing CXINVLFIFO automation requires an owner.
+        invset=open_scope(inventory,"INVENTORY",True)
+        opened.append(invset)
+        inv=invset.getMbo(0)
+        if inv is None or invset.getMbo(1) is not None or inv.getString("COSTTYPE")!="FIFO":
+            raise ValueError("Inventory FIFO neidentificat unic")
+        itemset=inv.getString("ITEMSETID")
+        itemset_mbos=MXServer.getMXServer().getMboSet("ITEM",inventory.getUserInfo())
+        opened.append(itemset_mbos)
+        sql=SqlFormat("ITEMNUM=:1 AND ITEMSETID=:2")
+        sql.setObject(1,"ITEM","ITEMNUM",inventory.getString("ITEMNUM"))
+        sql.setObject(2,"ITEM","ITEMSETID",itemset)
+        itemset_mbos.setWhere(sql.format())
+        itemset_mbos.reset()
+        item=itemset_mbos.getMbo(0)
+        if item is None or itemset_mbos.getMbo(1) is not None or item.getBoolean("ROTATING") or item.getBoolean("CONDITIONENABLED") or item.getString("LOTTYPE")!="NOLOT":
+            raise ValueError("Reconciliere automata doar non-rotating, NOLOT, fara condition code")
+        balset=open_scope(inv,"INVBALANCES",True)
+        opened.append(balset)
+        balance_rows=[]
+        m=balset.moveFirst()
         while m is not None:
-            if len(rows)>=MAX_ROWS:
-                raise ValueError("Limita INVBALANCES depasita")
             qty=numeric_field(m,"CURBAL")
-            if qty is None:
-                raise ValueError("INVBALANCES.CURBAL lipsa")
-            rows.append({"mbo":m,"qty":qty,"id":m.getUniqueIDValue()})
-            m=ms.moveNext()
-        if not rows:
-            raise ValueError("INVBALANCES lipsa pentru articol/gestiune")
-        current_total=sum((r["qty"] for r in rows),ZERO)
-        if not far(current_total,target_qty,QTY_TOLERANCE):
-            msg="\n".join([
-                "ACTUALIZARE INVBALANCES.CURBAL: deja aliniat",
-                "  CURBAL = CXSTOCURI = %s" % fmt_ro(target_qty),
-            ])
-            script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
-            return msg
-        nonzero=[r for r in rows if abs(r["qty"])>QTY_TOLERANCE]
-        if len(rows)>1 and len(nonzero)>1:
-            msg="\n".join([
-                "ACTUALIZARE INVBALANCES.CURBAL: sarita",
-                "  Motiv: %s randuri INVBALANCES cu sold; actualizare automata nesigura" % len(nonzero),
-                "  CURBAL cumulat %s -> tinta %s" % (fmt_ro(current_total),fmt_ro(target_qty)),
-            ])
-            script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
-            return msg
-        target_row=nonzero[0] if nonzero else rows[0]
-        old=target_row["qty"]
-        mv=target_row["mbo"].getMboValue("CURBAL")
-        typed=MaxType.createMaxType(Locale.US,TimeZone.getTimeZone("UTC"),mv.getType())
-        typed.setScale(mv.getScale())
-        typed.setValue(txt(target_qty))
-        target_row["mbo"].setValue("CURBAL",typed,flags)
-        written=numeric_field(target_row["mbo"],"CURBAL")
-        if written is None or far(written,target_qty,QTY_TOLERANCE):
-            raise ValueError("Nu pot scrie CURBAL=%s (citit %s)" % (
-                txt(target_qty),"null" if written is None else txt(written)))
-        ms.save()
-        msg="\n".join([
-            "ACTUALIZARE INVBALANCES.CURBAL",
-            "  Conditie: CXSTOCURI complet OK FIFO (data/pret/cantitate)",
-            "  INVBALANCESID=%s: %s -> %s" % (target_row["id"],fmt_ro(old),fmt_ro(target_qty)),
-        ])
-        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
-        return msg
+            if qty is None or qty<-QTY_TOLERANCE:
+                raise ValueError("Sold oficial lipsa/negativ; necesita reconciliere explicita")
+            balance_rows.append((m,qty))
+            if len(balance_rows)>MAX_ROWS:
+                raise ValueError("Limita INVBALANCES depasita")
+            m=balset.moveNext()
+        if len(balance_rows)!=1:
+            raise ValueError("Mai multe cosuri/loturi: repartizarea soldului nu este determinabila")
+        target_mbo,old_qty=balance_rows[0]
+        costset=open_invlifofifocost(inv)
+        current=[]
+        m=costset.moveFirst()
+        while m is not None:
+            cost,qty=numeric_field(m,"UNITCOST"),numeric_field(m,"QUANTITY")
+            if cost is None or qty is None or cost<ZERO or qty<ZERO:
+                raise ValueError("Strat oficial lipsa/negativ")
+            current.append({"id":m.getLong("INVLIFOFIFOCOSTID"),"cost":cost,"qty":qty,
+                "ref_mbo":None if m.isNull("REFOBJECT") else m.getString("REFOBJECT"),
+                "ref_id":None if m.isNull("REFOBJECTID") else m.getLong("REFOBJECTID"),"mbo":m,
+                "date":None if m.isNull("COSTDATE") else date_key(m.getDate("COSTDATE"))})
+            if len(current)>MAX_ROWS:
+                raise ValueError("Limita de straturi depasita")
+            m=costset.moveNext()
+        keeps,updates,deletes,creates=plan_invlifo_alignment(desired,current)
+        if creates:
+            return "RECONCILIERE STOC: sarita integral; nu exista suficiente randuri reutilizabile.\n"+format_missing_invlifo_creates(creates)
+        if not updates and not deletes and not far(old_qty,target,QTY_TOLERANCE):
+            return "RECONCILIERE STOC: deja aliniat; cantitate %s; diferente cantitate/valoare zero" % fmt_ro(target)
+        # Recheck the audited snapshot immediately before preparing writes.
+        check=open_scope(inv,"CXSTOCURI")
+        opened.append(check)
+        fresh,unused=read_journal(check)
+        if snapshot(fresh)!=snapshot(rows):
+            raise ValueError("Jurnal schimbat dupa audit; reruleaza Check FIFO")
+        if far(old_qty,target,QTY_TOLERANCE):
+            put_invlifo_number(target_mbo,"CURBAL",target)
+        for change in updates:
+            apply_invlifo_layer(change["row"]["mbo"],change["layer"],flags,script_service)
+        for row in deletes:
+            row["mbo"].delete(flags)
+        tx=MXServer.getMXServer().createMXTransaction()
+        for ms in (invset,balset,costset):
+            ms.setMXTransaction(tx)
+            tx.add(ms)
+        tx.save()
+        if numeric_field(target_mbo,"CURBAL")!=target:
+            raise ValueError("CURBAL suprascris la save")
+        for change in updates:
+            m,layer=change["row"]["mbo"],change["layer"]
+            if numeric_field(m,"QUANTITY")!=layer["qty"] or numeric_field(m,"UNITCOST")!=layer["cost"]:
+                raise ValueError("Strat suprascris la save")
+            if not same_ref(None if m.isNull("REFOBJECT") else m.getString("REFOBJECT"),None if m.isNull("REFOBJECTID") else m.getLong("REFOBJECTID"),layer.get("ref_mbo"),layer.get("ref_id")):
+                raise ValueError("Provenienta stratului suprascrisa la save")
+            expected_date=parse_layer_date(layer.get("date"))
+            if expected_date is not None and (m.isNull("COSTDATE") or m.getDate("COSTDATE").getTime()!=expected_date.getTime()):
+                raise ValueError("COSTDATE nu corespunde provenientei; randul nu poate fi reutilizat in siguranta")
+        if any(not row["mbo"].toBeDeleted() for row in deletes):
+            raise ValueError("Stergere strat anulata la save")
+        commit_started=True
+        tx.commit()
+        committed=True
+        return "RECONCILIERE STOC SALVATA ATOMIC: CURBAL %s -> %s; straturi pastrate %s, actualizate %s, sterse %s. Fara Save suplimentar." % (fmt_ro(old_qty),fmt_ro(target),len(keeps),len(updates),len(deletes))
     except Exception as exc:
-        msg="ACTUALIZARE INVBALANCES.CURBAL ESUATA: %s" % txt(exc)
-        script_service.log_info("CXINVAUDIT "+msg)
-        return msg
+        if not committed:
+            cx_rollback(tx)
+        state="COMMIT INCERT; reciteste inainte de repetare" if commit_started and not committed else ("SALVAT, eroare ulterioara" if committed else "OPRITA / ROLLBACK")
+        return "RECONCILIERE STOC %s: %s" % (state,txt(exc))
     finally:
-        close_set(ms)
+        for ms in reversed(opened):
+            close_set(ms)
 
 def price_label(value):
     rounded=fmt(value)
@@ -1097,7 +1352,7 @@ def recorded_balances_by_cost(rows):
     for row in sorted(rows,key=order):
         if row.get("cost") is None or not row.get("date"):
             raise ValueError("Pret/data lipsa; sold final nedeterminabil")
-        last[(row.get("group") or "",row["cost"])]=row
+        last[(row.get("group") or "",row["cost"],row.get("receipt_partition",(None,None,None,row.get("receipt")))[2:])]=row
     totals={}
     for key,row in last.items():
         if row.get("balance") is None:
@@ -1174,7 +1429,8 @@ def plan_invlifo_alignment(desired,current):
         chosen=pool[0]
         unused.remove(chosen)
         same_qty=not far(chosen["qty"],layer["qty"],QTY_TOLERANCE)
-        if same_qty:
+        same_date="date" not in chosen or layer.get("date") is None or chosen.get("date")==layer.get("date")
+        if same_qty and same_date:
             keeps.append(chosen)
         else:
             updates.append({"row":chosen,"layer":layer,"reuse":False})
@@ -1294,76 +1550,7 @@ def put_invlifo_number(mbo,field,value):
             field,txt(value),"null" if written is None else txt(written)))
     return True
 
-def sync_invlifofifocost(inventory,rows,audit,script_service):
-    from psdi.mbo import MboConstants
-    flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
-    desired=desired_fifo_layers(rows,audit)
-    layers_qty=sum((layer["qty"] for layer in desired),ZERO)
-    try:
-        curbal=read_invbalances_curbal(inventory)
-    except Exception as exc:
-        msg="CORECTIE INVLIFOFIFOCOST: sarita (%s)" % txt(exc)
-        script_service.log_info("CXINVAUDIT "+msg)
-        return msg
-    if far(curbal,layers_qty,QTY_TOLERANCE):
-        msg="CORECTIE INVLIFOFIFOCOST: sarita (CURBAL %s != CXSTOCURI %s)" % (
-            fmt_ro(curbal),fmt_ro(layers_qty))
-        script_service.log_info("CXINVAUDIT "+msg)
-        return msg
-    # Nu inchide setul copil al INVENTORY (UI).
-    try:
-        ms=open_invlifofifocost(inventory)
-        current=[]
-        m=ms.moveFirst()
-        while m is not None:
-            if len(current)>=MAX_ROWS:
-                raise ValueError("Limita INVLIFOFIFOCOST depasita")
-            price,qty=numeric_field(m,"UNITCOST"),numeric_field(m,"QUANTITY")
-            if price is None or qty is None:
-                raise ValueError("INVLIFOFIFOCOST fara pret/cantitate")
-            current.append({
-                "id":m.getLong("INVLIFOFIFOCOSTID"),"cost":price,"qty":qty,
-                "ref_mbo":None if m.isNull("REFOBJECT") else m.getString("REFOBJECT"),
-                "ref_id":None if m.isNull("REFOBJECTID") else m.getLong("REFOBJECTID"),
-                "mbo":m,
-            })
-            m=ms.moveNext()
-        keeps,updates,deletes,creates=plan_invlifo_alignment(desired,current)
-        sections=[]
-        if not updates and not deletes and not creates:
-            msg="CORECTIE INVLIFOFIFOCOST: deja aliniat la straturile CXSTOCURI"
-            script_service.log_info("CXINVAUDIT "+msg)
-            return msg
-        reused=sum(1 for item in updates if item.get("reuse"))
-        if updates or deletes:
-            for item in updates:
-                apply_invlifo_layer(item["row"]["mbo"],item["layer"],flags,script_service)
-            for row in deletes:
-                row["mbo"].delete(flags)
-            ms.save()
-            sections.append("\n".join([
-                "CORECTIE INVLIFOFIFOCOST",
-                "  Conditie: CURBAL = CXSTOCURI = %s" % fmt_ro(curbal),
-                "  Pastrate: %s" % len(keeps),
-                "  Actualizate: %s (reutilizate: %s)" % (len(updates),reused),
-                "  Sterse: %s" % len(deletes),
-                "  Fara create (doar stergere/editare/reutilizare).",
-            ]))
-        elif creates:
-            sections.append("\n".join([
-                "CORECTIE INVLIFOFIFOCOST",
-                "  Conditie: CURBAL = CXSTOCURI = %s" % fmt_ro(curbal),
-                "  Nicio stergere/editare posibila: nu exista randuri de reutilizat.",
-            ]))
-        if creates:
-            sections.append(format_missing_invlifo_creates(creates))
-        msg="\n\n".join(sections)
-        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
-        return msg
-    except Exception as exc:
-        msg="CORECTIE INVLIFOFIFOCOST ESUATA: %s" % txt(exc)
-        script_service.log_info("CXINVAUDIT "+msg)
-        return msg
+
 
 def invlifo_totals(inventory,rows,script_service):
     # TOTALURI ca in reconcilierea veche: cantitate/valoare CXSTOCURI vs INVLIFOFIFOCOST.
@@ -1401,154 +1588,7 @@ def invlifo_totals(inventory,rows,script_service):
     finally:
         close_set(ms)
 
-def check_layer_beats_negative_balance():
-    def row(ident, date, ref, kind, qty, cost, balance, mbo="MATRECTRANS"):
-        return {"id":ident,"group":"G","date":date,"ref_id":ref,"ref_mbo":mbo,
-                "kind":kind,"qty":ExactNumber(qty),"cost":ExactNumber(cost),"balance":ExactNumber(balance)}
-    audit=audit_rows([
-        row(1,"2026-06-01 00:00:00.000000000",300,"SHIPTRANSFER","-10","9.098","-10"),
-        row(2,"2026-06-08 00:00:00.000000000",100,"SHIPRECEIPT","10","9.098","0"),
-        row(3,"2026-09-07 00:00:00.000000000",400,"SHIPRECEIPT","20","9.846","20"),
-        row(4,"2026-09-10 00:00:00.000000000",500,"SHIPTRANSFER","-1","9.098","-1"),
-    ])
-    rec=audit["records"][4]
-    if rec["status"]!="BAD" or far(rec["expected"],ExactNumber("9.846"),COST_TOLERANCE):
-        raise ValueError("self-check: iesirea nu consuma stratul anterior")
-    if not rec["allocations"] or rec["allocations"][0].get("source_ref_id")!=400:
-        raise ValueError("self-check: sursa nu este intrarea anterioara")
-    blocked=audit_rows([
-        row(1,"2026-06-01 00:00:00.000000000",1,"SHIPTRANSFER","-1","9","-1"),
-        row(2,"2026-06-02 00:00:00.000000000",2,"SHIPTRANSFER","-1","9","-2"),
-    ])
-    if blocked["records"][2]["status"]!="UNVERIFIED":
-        raise ValueError("self-check: iesirea fara stoc nu trebuie certificata")
-    voided=audit_rows([
-        row(1,"2026-09-07 00:00:00.000000000",10,"RECEIPT","50319","9.846","50319"),
-        row(2,"2026-09-11 00:00:00.000000000",20,"RECEIPT","172","9.846","50491"),
-        row(3,"2026-09-11 00:00:00.000000000",30,"VOIDRECEIPT","-172","9.846","50319"),
-        row(4,"2026-09-12 00:00:00.000000000",40,"ISSUE","-542","9.846","49777","MATUSETRANS"),
-    ])
-    if voided["records"][3]["status"]!="OK":
-        raise ValueError("self-check: VOIDRECEIPT trebuie sa fie OK")
-    if not voided["records"][3]["allocations"] or voided["records"][3]["allocations"][0].get("source_ref_id")!=20:
-        raise ValueError("self-check: VOIDRECEIPT trebuie sa anuleze receptia recenta")
-    if voided["records"][4]["status"]!="OK":
-        raise ValueError("self-check: ISSUE dupa VOIDRECEIPT trebuie verificat")
-    layers=voided.get("layers") or []
-    if len(layers)!=1 or far(layers[0]["qty"],ExactNumber("49777"),QTY_TOLERANCE):
-        raise ValueError("self-check: stratul ramas dupa VOIDRECEIPT/ISSUE e gresit")
-    if far(layers[0]["cost"],ExactNumber("9.846"),COST_TOLERANCE) or layers[0].get("source_ref_id")!=10:
-        raise ValueError("self-check: provenienta stratului ramas e gresita")
-    if layers[0].get("source_ref_mbo")!="MATRECTRANS":
-        raise ValueError("self-check: CXREFMBO stratului ramas lipseste")
-    ok_complete,ok_reason=journal_fifo_complete(voided)
-    if not ok_complete:
-        raise ValueError("self-check: jurnalul VOIDRECEIPT trebuia considerat complet OK: "+ok_reason)
-    shipret=audit_rows([
-        row(1,"2026-01-13 00:00:00.000000000",11,"SHIPRECEIPT","400","0.440","400"),
-        row(2,"2026-01-13 10:42:00.000000000",12,"ISSUE","-400","0.440","0","MATUSETRANS"),
-        row(3,"2026-03-10 10:43:00.000000000",21,"SHIPRECEIPT","500","0.440","500"),
-        row(4,"2026-03-10 11:04:00.000000000",22,"SHIPRECEIPT","500","0.440","1000"),
-        row(5,"2026-03-10 14:42:00.000000000",31,"SHIPRETURN","-500","0.440","500"),
-        row(6,"2026-03-10 14:43:00.000000000",41,"ISSUE","-500","0.440","0","MATUSETRANS"),
-    ])
-    if shipret["records"][5]["status"]!="OK":
-        raise ValueError("self-check: SHIPRETURN trebuie sa fie OK")
-    if not shipret["records"][5]["allocations"] or shipret["records"][5]["allocations"][0].get("source_ref_id")!=22:
-        raise ValueError("self-check: SHIPRETURN trebuie sa anuleze receptia recenta")
-    if shipret["records"][6]["status"]!="OK":
-        raise ValueError("self-check: ISSUE dupa SHIPRETURN nu trebuie NEVERIFICAT")
-    if flag(shipret["records"][5])!="N" or flag(shipret["records"][6])!="N":
-        raise ValueError("self-check: SHIPRETURN/ISSUE OK trebuie BADFIFO=N")
-    sr_complete,sr_reason=journal_fifo_complete(shipret)
-    if not sr_complete:
-        raise ValueError("self-check: jurnalul SHIPRETURN trebuia complet OK: "+sr_reason)
-    shipcancel=audit_rows([
-        row(1,"2026-02-01 00:00:00.000000000",10,"SHIPRECEIPT","500","11.340","500"),
-        row(2,"2026-02-02 00:00:00.000000000",20,"SHIPTRANSFER","-54","11.340","446"),
-        row(3,"2026-02-02 00:00:00.000000000",21,"SHIPCANCEL","54","11.340","500"),
-        row(4,"2026-02-02 00:00:00.000000000",30,"SHIPTRANSFER","-54","11.340","446"),
-    ])
-    if shipcancel["records"][3]["status"]!="OK":
-        raise ValueError("self-check: SHIPCANCEL trebuie sa fie OK")
-    if shipcancel["records"][3].get("link_ref")!=20:
-        raise ValueError("self-check: SHIPCANCEL trebuie legat de SHIPTRANSFER anterior")
-    if flag(shipcancel["records"][3])!="N":
-        raise ValueError("self-check: SHIPCANCEL OK trebuie BADFIFO=N")
-    if shipcancel["records"][4]["status"]!="OK":
-        raise ValueError("self-check: SHIPTRANSFER dupa SHIPCANCEL trebuie verificat")
-    sc_complete,sc_reason=journal_fifo_complete(shipcancel)
-    if not sc_complete:
-        raise ValueError("self-check: jurnalul SHIPCANCEL trebuia complet OK: "+sc_reason)
-    bad_complete,bad_reason=journal_fifo_complete(blocked)
-    if bad_complete:
-        raise ValueError("self-check: jurnalul insuficient nu trebuie sa autorizeze CURBAL")
-    sold_rec=voided["records"][4]
-    sold_rec["balance_bad"]=True
-    if flag(sold_rec)!="Y":
-        raise ValueError("self-check: sold gresit trebuie BADFIFO=Y")
-    sold_rec["balance_bad"]=False
-    if flag(sold_rec)!="N":
-        raise ValueError("self-check: ISSUE OK fara sold gresit trebuie BADFIFO=N")
-    sold_rec["row"]=dict(sold_rec["row"])
-    sold_rec["row"]["balance"]=ExactNumber("-40")
-    if flag(sold_rec)!="Y":
-        raise ValueError("self-check: sold negativ trebuie BADFIFO=Y chiar daca pretul e OK")
-    # Receptii/comenzi cu cantitate negativa = iesiri FIFO; nu blocheaza grupa.
-    # Soldurile urmeaza cartea pe pret (12-6-2+4+10-2-6-2 => 8).
-    neg_receipt=audit_rows([
-        row(1,"2026-04-23 00:00:00.000000000",10,"RECEIPT","12","12.000","12"),
-        row(2,"2026-04-24 00:51:00.000000000",20,"RECEIPT","-6","12.000","6"),
-        row(3,"2026-04-24 00:54:00.000000000",30,"RECEIPT","-2","12.000","4"),
-        row(4,"2026-04-24 01:03:00.000000000",40,"RECEIPT","4","12.000","8"),
-        row(5,"2026-04-24 01:04:00.000000000",45,"RECEIPT","10","12.000","18"),
-        row(6,"2026-04-24 01:05:00.000000000",46,"RECEIPT","-2","12.000","16"),
-        row(7,"2026-04-24 01:06:00.000000000",47,"RECEIPT","-6","12.000","10"),
-        row(8,"2026-04-25 00:04:00.000000000",50,"SHIPTRANSFER","-2","12.000","8"),
-    ])
-    for rid in (2,3,6,7,8):
-        rec=neg_receipt["records"][rid]
-        if rec["status"]!="OK":
-            raise ValueError("self-check: RECEIPT/SHIPTRANSFER negativ trebuie OK, got %s (%s)" % (
-                rec["status"],rec.get("reason")))
-        if flag(rec)!="N":
-            raise ValueError("self-check: iesire negativa OK trebuie BADFIFO=N, got %s (sold_bad=%s/%s)" % (
-                flag(rec),rec.get("balance_bad"),rec.get("balance_expected")))
-    if "neimplementat" in (neg_receipt["records"][2].get("reason") or ""):
-        raise ValueError("self-check: RECEIPT negativ nu trebuie tip neimplementat")
 
-    desired=[
-        {"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
-        {"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
-        {"cost":ExactNumber("17.500"),"qty":ExactNumber("570"),"ref_mbo":None,"ref_id":None},
-    ]
-    current=[
-        {"id":1,"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
-        {"id":2,"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
-        {"id":3,"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
-        {"id":4,"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
-        {"id":5,"cost":ExactNumber("17.500"),"qty":ExactNumber("570"),"ref_mbo":None,"ref_id":None},
-        {"id":6,"cost":ExactNumber("12.640"),"qty":ExactNumber("100"),"ref_mbo":None,"ref_id":None},
-    ]
-    keeps,updates,deletes,creates=plan_invlifo_alignment(desired,current)
-    if updates or creates or len(keeps)!=3 or sorted(r["id"] for r in deletes)!=[2,4,6]:
-        raise ValueError("self-check: alinierea INVLIFOFIFOCOST nu elimina duplicatele corect")
-    missing_plan=plan_invlifo_alignment(
-        desired+[{"cost":ExactNumber("99.000"),"qty":ExactNumber("1"),"ref_mbo":None,"ref_id":None}],
-        [row for row in current if row["id"] in (1,3,5)])
-    if len(missing_plan[3])!=1 or missing_plan[3][0]["cost"]!=ExactNumber("99.000"):
-        raise ValueError("self-check: lipsa INVLIFOFIFOCOST trebuie semnalata fara create")
-    reuse_desired=[{"cost":ExactNumber("14.590"),"qty":ExactNumber("1"),
-                    "ref_mbo":"MATRECTRANS","ref_id":1337422726}]
-    reuse_current=[
-        {"id":10,"cost":ExactNumber("14.590"),"qty":ExactNumber("4"),"ref_mbo":None,"ref_id":None},
-        {"id":11,"cost":ExactNumber("10.000"),"qty":ExactNumber("1"),"ref_mbo":"MATRECTRANS","ref_id":999},
-    ]
-    r_keeps,r_updates,r_deletes,r_creates=plan_invlifo_alignment(reuse_desired,reuse_current)
-    if r_keeps or r_creates or len(r_updates)!=1 or not r_updates[0].get("reuse"):
-        raise ValueError("self-check: surplusul trebuia reutilizat, nu sters+create")
-    if r_updates[0]["row"]["id"]!=10 or [r["id"] for r in r_deletes]!=[11]:
-        raise ValueError("self-check: reutilizare/stergere surplus gresita")
 
 def fetch_rows(inventory, name, where, spec):
     from psdi.server import MXServer
@@ -1640,11 +1680,10 @@ def split_gap_by_matusetrans(inventory, rows, script_service):
         return notes
     except Exception as exc:
         script_service.log_info("CXINVAUDIT split lipsa indisponibil: "+txt(exc))
-        return {}
+        return {"AUDIT_ERROR":"Verificarea spliturilor indisponibila: "+txt(exc)}
 
 def run_local(inventory,script_service):
     from psdi.mbo import MboConstants
-    check_layer_beats_negative_balance()
     if inventory is None or inventory.getName()!="INVENTORY":
         raise ValueError("Ruleaza Check FIFO din INVENTORY")
     for f in ("ITEMNUM","SITEID","LOCATION"):
@@ -1663,8 +1702,11 @@ def run_local(inventory,script_service):
         unknown=enrich_origins(inventory,rows,script_service)
         enrich_returns(inventory,rows,script_service)
         enrich_shipcancels(inventory,rows,script_service)
+        receipt_balances,receipt_keys,receipt_errors=receipt_audit_rows(inventory,rows)
         audit=audit_rows(rows)
+        apply_receipt_audit(audit,rows,receipt_balances,receipt_keys,receipt_errors)
         gap_notes=split_gap_by_matusetrans(inventory,rows,script_service)
+        audit["split_gaps"]=gap_notes
         planned={}
         for r in rows:
             text=description(r["old_description"],audit["records"][r["id"]],{})
@@ -1693,11 +1735,16 @@ def run_local(inventory,script_service):
                 changed+=1
         if changed:
             root.save()
+            for r in rows:
+                r["rowstamp"]=txt(mbos[r["id"]].getRowStamp())
+                r["old_description"]=mbos[r["id"]].getString("DESCRIPTION_LONGDESCRIPTION")
         message=local_summary(audit,unknown)
         layers_text,layers_total=fifo_layers_situation(rows,audit,script_service)
         message+="\n\n"+layers_text
-        message+="\n\n"+sync_invbalances_curbal(inventory,layers_total,audit,script_service)
-        message+="\n\n"+sync_invlifofifocost(inventory,rows,audit,script_service)
+        official_message=sync_official_stock(inventory,rows,audit,script_service)
+        message+="\n\n"+official_message
+        if not (official_message.startswith("RECONCILIERE STOC: deja aliniat") or official_message.startswith("RECONCILIERE STOC SALVATA ATOMIC")):
+            message="VERDICT GLOBAL: NECONCLUDENT (reconciliere nefinalizata)\n\n"+message
         message+="\n\n"+invlifo_totals(inventory,rows,script_service)
         script_service.log_info("CXINVAUDIT "+VERSION+": "+message.replace("\n"," | "))
     finally:
