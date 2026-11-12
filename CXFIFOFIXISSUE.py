@@ -1,5 +1,6 @@
-# CXFIFOFIXISSUE 3.31-COMPACT
+# CXFIFOFIXISSUE 3.32-OUTSIDE-SPLIT
 # Split: 1 INVUSELINESPLIT, 2 MATUSETRANS, 3 CXSTOCURI. UUID. Fara CXSENTEBS stop.
+# MATUSETRANS nou de split: OUTSIDE=1, ca Maximo sa nu mai scoata din cos (BMXAA3496E).
 
 from java.math import BigDecimal, MathContext, RoundingMode
 from java.text import NumberFormat, ParsePosition
@@ -74,7 +75,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.31-COMPACT"
+VERSION="3.32-OUTSIDE-SPLIT"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -1382,6 +1383,7 @@ def execute(context):
                     put_number(mm,"QTYRETURNED",ZERO)
                 mm.setValue("CXSENTEBS",0,FLAGS)
                 mm.setValue("HASLD",0,FLAGS)
+                mm.setValue("OUTSIDE",1,FLAGS)
                 created_rows.append((mm.getLong("MATUSETRANSID"),qty,cost,sm.getLong("INVUSELINESPLITID")))
                 service.log_info("CXFIFOFIXISSUE PAS2 MATUSETRANS=%s split=%s qty=%s cost=%s" % (
                     mm.getLong("MATUSETRANSID"),sm.getLong("INVUSELINESPLITID"),fmt(-qty),fmt(cost)))
@@ -1394,7 +1396,7 @@ def execute(context):
             commit_started=True
             tx.commit()
             committed=True
-            message="PAS 2/3 SALVAT: doar MATUSETRANS %s.\nCXSTOCURI nu e scris inca (depinde de acest ID).\nNu apasa Save. Reapeasa butonul (PAS 3)." % ids
+            message="PAS 2/3 SALVAT: doar MATUSETRANS %s.\nCXSTOCURI nu e scris inca (depinde de acest ID).\nOUTSIDE=1: cosul (INVBALANCES) nu e miscat; soldul negativ din jurnal ramane pana la corectia de dupa PAS 3.\nNu apasa Save. Reapeasa butonul (PAS 3)." % ids
             for mid,qty,cost,sid in created_rows:
                 message+="\nMATUSETRANS %s: %s la %s; split %s." % (mid,fmt(-qty),fmt(cost),sid)
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
@@ -1655,6 +1657,7 @@ def execute(context):
                     mm.setValueNull("FINCNTRLID",FLAGS)
                 mm.setValue("CXSENTEBS",0,FLAGS)
                 mm.setValue("HASLD",0,FLAGS)
+                mm.setValue("OUTSIDE",1,FLAGS)
                 c["new_id"]=mm.getLong("MATUSETRANSID")
                 c["mbo"]=mm
                 c["actual_key"]=datekey(mm.getDate("ACTUALDATE"))
@@ -1689,7 +1692,7 @@ def execute(context):
             message=""
             if pas1_message:
                 message=pas1_message+"\n"
-            message+="PAS 2/3 SALVAT: MATUSETRANS noi %s.\nACTUALDATE = original + N minute.\nNu apasa Save (deja comis; Save pe ROWSTAMP vechi = BMXAA8229W). Reapeasa butonul 2 (PAS 3 = CXSTOCURI)." % ids
+            message+="PAS 2/3 SALVAT: MATUSETRANS noi %s.\nACTUALDATE = original + N minute.\nOUTSIDE=1: cosul nu e miscat, ca sa nu apara BMXAA3496E pe sold negativ.\nNu apasa Save (deja comis; Save pe ROWSTAMP vechi = BMXAA8229W). Reapeasa butonul 2 (PAS 3 = CXSTOCURI)." % ids
             for c in created_rows:
                 message+="\nMATUSETRANS %s: %s la %s; receptie %s; split %s." % (
                     c["new_id"],fmt(-c["qty"]),fmt(c["cost"]),receipt_label(c["receipt"]),c["split_id"])
