@@ -1,9 +1,10 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.19-SHIPCANCEL
+# VERSIUNE: 5.20-NEGSOLD-Y
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
+# CXCURBAL < 0 => BADFIFO=Y mereu (chiar daca pretul FIFO e OK).
 # VOIDRECEIPT/SHIPRETURN anuleaza stoc pe acelasi pret (receptia cea mai recenta).
 # SHIPCANCEL (qty>0) restabileste stocul anularii unui SHIPTRANSFER (RECEIPTREF sau
 # match pe cantitate/pret); pune inapoi stratul si marcheaza BADFIFO=N.
@@ -89,7 +90,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.19-SHIPCANCEL"
+VERSION = "5.20-NEGSOLD-Y"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -262,9 +263,11 @@ def ordinary_entry(row):
     return row.get("kind") in ENTRY_TYPES and row.get("qty") is not None and row["qty"] > QTY_TOLERANCE
 
 def flag(record):
-    # Y = pret gresit SAU sold CXCURBAL gresit/lipsa. INITIAL valid = N.
+    # Y = pret gresit SAU sold CXCURBAL gresit/lipsa/negativ. INITIAL valid = N.
     row=record["row"]
-    sold_bad=bool(record.get("balance_bad") or record.get("balance_missing"))
+    bal=row.get("balance")
+    neg_sold=bal is not None and bal < -QTY_TOLERANCE
+    sold_bad=bool(record.get("balance_bad") or record.get("balance_missing") or neg_sold)
     if ordinary_entry(row):
         return "Y" if sold_bad else None
     if row.get("kind")=="INITIAL":
@@ -761,6 +764,8 @@ def description_visible(old, record, summary):
         info+="; audit reluat pe aceasta iesire"
     if record.get("balance_missing"):
         info+="; ATENTIE SOLD: CXCURBAL lipsa"
+    elif row.get("balance") is not None and row["balance"] < -QTY_TOLERANCE:
+        info+="; ATENTIE SOLD: negativ %s" % fmt_ro(row.get("balance"))
     elif record["balance_bad"]:
         info+="; ATENTIE SOLD: inregistrat %s; calculat %s" % (fmt_ro(row.get("balance")),fmt_ro(record["balance_expected"]))
     sources=[]
@@ -1481,6 +1486,11 @@ def check_layer_beats_negative_balance():
     sold_rec["balance_bad"]=False
     if flag(sold_rec)!="N":
         raise ValueError("self-check: ISSUE OK fara sold gresit trebuie BADFIFO=N")
+    sold_rec["row"]=dict(sold_rec["row"])
+    sold_rec["row"]["balance"]=ExactNumber("-40")
+    if flag(sold_rec)!="Y":
+        raise ValueError("self-check: sold negativ trebuie BADFIFO=Y chiar daca pretul e OK")
+
     desired=[
         {"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
         {"cost":ExactNumber("15.700"),"qty":ExactNumber("360"),"ref_mbo":"MATRECTRANS","ref_id":1337445303},
