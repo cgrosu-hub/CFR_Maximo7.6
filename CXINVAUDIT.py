@@ -1,10 +1,12 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.20-NEGSOLD-Y
+# VERSIUNE: 5.21-NEG-RECEIPT
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
 # CXCURBAL < 0 => BADFIFO=Y mereu (chiar daca pretul FIFO e OK).
+# RECEIPT/SHIPRECEIPT cu cantitate negativa = iesire FIFO (comenzi/receptii negative),
+# nu „tip neimplementat”; pret OK => BADFIFO=N (nu blocheaza restul grupei).
 # VOIDRECEIPT/SHIPRETURN anuleaza stoc pe acelasi pret (receptia cea mai recenta).
 # SHIPCANCEL (qty>0) restabileste stocul anularii unui SHIPTRANSFER (RECEIPTREF sau
 # match pe cantitate/pret); pune inapoi stratul si marcheaza BADFIFO=N.
@@ -90,7 +92,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.20-NEGSOLD-Y"
+VERSION = "5.21-NEG-RECEIPT"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -568,7 +570,8 @@ def audit_rows(rows):
                     layers.sort(key=lambda l:l["priority"])
                 rec["status"]="INPUT"
                 continue
-            if kind not in EXIT_TYPES:
+            # qty < 0: iesire FIFO. Include RECEIPT/SHIPRECEIPT negative (comenzi/receptii).
+            if kind not in EXIT_TYPES and kind not in ENTRY_TYPES:
                 structural="Tip de iesire neimplementat: "+txt(kind)
                 rec["reason"]=structural
                 continue
@@ -1490,6 +1493,21 @@ def check_layer_beats_negative_balance():
     sold_rec["row"]["balance"]=ExactNumber("-40")
     if flag(sold_rec)!="Y":
         raise ValueError("self-check: sold negativ trebuie BADFIFO=Y chiar daca pretul e OK")
+    # Receptii/comenzi cu cantitate negativa = iesiri FIFO; nu blocheaza grupa.
+    neg_receipt=audit_rows([
+        row(1,"2026-04-23 00:00:00.000000000",10,"RECEIPT","12","12.000","12"),
+        row(2,"2026-04-24 00:51:00.000000000",20,"RECEIPT","-6","12.000","6"),
+        row(3,"2026-04-24 00:54:00.000000000",30,"RECEIPT","-2","12.000","4"),
+        row(4,"2026-04-24 01:03:00.000000000",40,"RECEIPT","4","12.000","8"),
+        row(5,"2026-04-25 00:04:00.000000000",50,"SHIPTRANSFER","-2","12.000","8"),
+    ])
+    for rid in (2,3,5):
+        if neg_receipt["records"][rid]["status"]!="OK":
+            raise ValueError("self-check: RECEIPT/SHIPTRANSFER negativ trebuie OK, nu NEVERIFICAT")
+        if flag(neg_receipt["records"][rid])!="N":
+            raise ValueError("self-check: RECEIPT negativ OK trebuie BADFIFO=N")
+    if "neimplementat" in (neg_receipt["records"][2].get("reason") or ""):
+        raise ValueError("self-check: RECEIPT negativ nu trebuie tip neimplementat")
 
     desired=[
         {"cost":ExactNumber("18.990"),"qty":ExactNumber("634"),"ref_mbo":"MATRECTRANS","ref_id":1337445295},
