@@ -1,12 +1,11 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.18-UI16-NOSPLITDUP
-# Revenire la scrierea pe jurnalul din ecran (bind_screen) ca in 3.16 — resetul agresiv
-# pe INVENTORY/MAINRECORD din 3.17 dezactiva Save dupa Bine.
-# Refresh UI bland (doar tabel FIFO + bean-uri split), fara reset pe owner.
+# VERSIUNE: 3.19-FREESPLIT-LINE
+# bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
 # ISSUE un pret: MATUSETRANS costuri + CXSTOCURI cost/CXCURBAL pe grupa.
-# ISSUE multi-pret: PAS 1/2/3; la PAS 2 nu creeaza MATUSETRANS daca split-ul e deja legat
-# (evita DB2 -803 duplicate).
+# ISSUE multi-pret: PAS 1/2/3. Spliturile „libere” se calculeaza pe TOATA INVUSELINE
+# (nu doar pe consumul apasat) si se prefera cele mai noi; daca un split e deja legat
+# de alt MATUSETRANS, PAS 2 creeaza split nou — nu blocheaza cu mesaj mort.
 # Cu INVUSELINE: FIFO pe consumul apasat. Cale normala: NU atinge INVUSELINESPLIT.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
@@ -83,7 +82,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.18-UI16-NOSPLITDUP"
+VERSION="3.19-FREESPLIT-LINE"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -1180,6 +1179,13 @@ def execute(context):
             fail("MATUSETRANS apasat nu face parte din linia de utilizare")
         sset,splitrows=query("INVUSELINESPLIT","INVUSELINEID=%s" % lineid,MAX_SPLITS)
         splits=dict((m.getLong("INVUSELINESPLITID"),m) for m in splitrows)
+        # Splituri ocupate = orice MATUSETRANS de pe linie (nu doar cel apasat).
+        line_members=list(members)
+        mt_by_split={}
+        for mem in line_members:
+            if not mem["mbo"].isNull("INVUSELINESPLITID"):
+                sid=mem["mbo"].getLong("INVUSELINESPLITID")
+                mt_by_split.setdefault(sid,[]).append(mem["mbo"])
         # FIFO doar pe consumul apasat; celelalte MATUSETRANS de pe linie raman neschimbate.
         members=[clicked_mem]
         total=clicked_mem["old_qty"]
@@ -1297,12 +1303,14 @@ def execute(context):
         new_total=sum((a["value"] for a in mapped),ZERO)+sum((c["value"] for c in creates),ZERO)
         if different(sum((a["qty"] for a in mapped),ZERO)+sum((c["qty"] for c in creates),ZERO),total):
             fail("Suma cantitatilor pe straturi difera de consumul original")
-        used_splits=set()
+        # Ocupate pe toata linia + split-ul consumului apasat.
+        used_splits=set(mt_by_split.keys())
         for mem in members:
             if not mem["mbo"].isNull("INVUSELINESPLITID"):
                 used_splits.add(mem["mbo"].getLong("INVUSELINESPLITID"))
+        # Cele mai noi libere primele (PAS 1 tocmai create).
         free_splits=sorted([m for m in splitrows if m.getLong("INVUSELINESPLITID") not in used_splits],
-                           key=lambda m: m.getLong("INVUSELINESPLITID"))
+                           key=lambda m: m.getLong("INVUSELINESPLITID"),reverse=True)
         if creates:
             for mem in members:
                 if mem["mbo"].isNull("INVUSELINESPLITID") or mem["mbo"].getLong("INVUSELINESPLITID") not in splits:
@@ -1413,19 +1421,32 @@ def execute(context):
             from java.util import Date
             created_rows=[]
             base_actual=template.getDate("ACTUALDATE")
-            existing_by_split={}
-            for mem in mts:
-                if not mem.isNull("INVUSELINESPLITID"):
-                    sid=mem.getLong("INVUSELINESPLITID")
-                    existing_by_split.setdefault(sid,[]).append(mem)
+            new_split_idx=0
             for idx,c in enumerate(creates):
-                sm=c["split_mbo"]
-                sid=long(c["split_id"])
-                # Evita DB2 -803: un split nu poate primi un al doilea MATUSETRANS.
-                prior_mt=existing_by_split.get(sid) or []
-                if prior_mt:
-                    fail("PAS 2: INVUSELINESPLIT %s are deja MATUSETRANS %s; redeschide articolul si reia din PAS 3 sau sterge duplicatul" % (
-                        sid,prior_mt[0].getLong("MATUSETRANSID")))
+                sid=long(c["split_id"]) if c.get("split_id") is not None else None
+                prior_mt=mt_by_split.get(sid) if sid is not None else None
+                # Split deja legat de alt MATUSETRANS (ex. fratele 240360): creeaza split nou.
+                if prior_mt or sid is None or c.get("split_mbo") is None:
+                    if template_split is None:
+                        fail("PAS 2: split sablon lipsa pentru creare INVUSELINESPLIT")
+                    sm=sset.addAtEnd(FLAGS)
+                    for f in SPLIT_COPY:
+                        copy_value(template_split,sm,f)
+                    put_number(sm,"QUANTITY",c["qty"])
+                    put_number(sm,"UNITCOST",c["cost"])
+                    sm.setValue("AUTOCREATED",1,FLAGS)
+                    src_uid="" if template_split.isNull("CONTENTUID") else template_split.getString("CONTENTUID")
+                    sm.setValue("CONTENTUID",split_contentuid(src_uid,100+new_split_idx),FLAGS)
+                    new_split_idx+=1
+                    c["split_mbo"]=sm
+                    c["split_id"]=sm.getLong("INVUSELINESPLITID")
+                    c["new_split"]=True
+                    sid=long(c["split_id"])
+                    service.log_info("CXFIFOFIXISSUE PAS2 create split=%s (inlocuire split ocupat)" % sid)
+                else:
+                    sm=c["split_mbo"]
+                    plan_number(sm,"QUANTITY",c["qty"])
+                    plan_number(sm,"UNITCOST",c["cost"])
                 mm=mset.addAtEnd(FLAGS)
                 for f in MATUSE_COPY:
                     if f=="ACTUALDATE":
@@ -1460,7 +1481,7 @@ def execute(context):
                 c["new_id"]=mm.getLong("MATUSETRANSID")
                 c["actual_key"]=datekey(mm.getDate("ACTUALDATE"))
                 created_rows.append(c)
-                existing_by_split.setdefault(sid,[]).append(mm)
+                mt_by_split.setdefault(sid,[]).append(mm)
                 service.log_info("CXFIFOFIXISSUE PAS2 create MATUSETRANS=%s split=%s qty=%s cost=%s actualdate=+%smin" % (
                     c["new_id"],c["split_id"],fmt(-c["qty"]),fmt(c["cost"]),idx+1))
             ids=",".join(text(c["new_id"]) for c in created_rows)
