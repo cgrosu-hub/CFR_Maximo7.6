@@ -1,14 +1,13 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.25-LINE-QTY-WARN
+# VERSIUNE: 3.26-PAS2-ORPHAN-SPLIT
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
 # RETURN pe prioritatea stratului; multi-pret => PAS 1/2/3.
 # CONTENTUID pe INVUSELINESPLIT noi: UUID unic.
-# Cascada conservatoare (cale normala, fara split): dupa ISSUE-ul apasat, corecteaza
-# ISSUE-urile contigue urmatoare din aceeasi grupa (max N); stop la split/stoc/eroare.
-# Fara stop pe CXSENTEBS / FINCNTRLID.
-# Daca sum(MATUSETRANS) != INVUSELINE.QUANTITY: doar avertizeaza in log; nu blocheaza
-# splitul pe consumul apasat (nu se forteaza totusi cantitatea documentului).
+# PAS 1 incomplet: dupa ce Maximo sincronizeaza MATUSETRANS la primul segment (ex. 38),
+# PAS 2 trebuie sa foloseasca MT + splituri libere (ex. 38+10=48), altfel nu mai creeaza
+# al doilea MATUSETRANS/CXSTOCURI.
+# Cascada conservatoare; fara stop CXSENTEBS/FINCNTRLID; mismatch linie = warn.
 # Cu INVUSELINE: FIFO pe consumul apasat (+ cascada jurnal). Cale normala: NU atinge split.
 # Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
 
@@ -85,7 +84,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.25-LINE-QTY-WARN"
+VERSION="3.26-PAS2-ORPHAN-SPLIT"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -1444,6 +1443,30 @@ def execute(context):
         if len(positions)!=1:
             fail("Consumul apasat nu are un singur rand in jurnal")
         pos=positions[0]
+        # Splituri libere inainte de alocare: dupa PAS 1 Maximo poate reduce MT la primul
+        # segment (38); restul e in INVUSELINESPLIT liber (10) — trebuie inclus in total.
+        used_splits=set(mt_by_split.keys())
+        for mem in members:
+            if not mem["mbo"].isNull("INVUSELINESPLITID"):
+                used_splits.add(mem["mbo"].getLong("INVUSELINESPLITID"))
+        free_splits=sorted([m for m in splitrows if m.getLong("INVUSELINESPLITID") not in used_splits],
+                           key=lambda m: m.getLong("INVUSELINESPLITID"),reverse=True)
+        free_qty=sum((number(s,"QUANTITY") for s in free_splits if number(s,"QUANTITY")>EPS),ZERO)
+        if free_qty>EPS:
+            combined=total+free_qty
+            pas1_info=""
+            try:
+                if clicked is not None:
+                    pas1_info=text(clicked["mbo"].getString("DESCRIPTION_LONGDESCRIPTION"))
+            except Exception:
+                pas1_info=""
+            line_match=not different(combined,line_qty)
+            info_pas1=("PAS 1/3" in pas1_info) or ("CXFIFOFIX PAS 1" in pas1_info)
+            # Completeaza consumul original: MT redus de Maximo + split liber din PAS 1.
+            if line_match or info_pas1 or line_qty_mismatch:
+                service.log_info("CXFIFOFIXISSUE PAS2-orphan: total %s + free_splits %s => %s (line=%s pas1=%s)" % (
+                    fmt(total),fmt(free_qty),fmt(combined),fmt(line_qty),info_pas1))
+                total=combined
         prior=journal[:pos]
         layers=replay(prior,issue_of_returns(prior,query))
         allocation,short=consume(layers,total)
@@ -1470,12 +1493,7 @@ def execute(context):
         new_total=sum((a["value"] for a in mapped),ZERO)+sum((c["value"] for c in creates),ZERO)
         if different(sum((a["qty"] for a in mapped),ZERO)+sum((c["qty"] for c in creates),ZERO),total):
             fail("Suma cantitatilor pe straturi difera de consumul original")
-        # Ocupate pe toata linia + split-ul consumului apasat.
-        used_splits=set(mt_by_split.keys())
-        for mem in members:
-            if not mem["mbo"].isNull("INVUSELINESPLITID"):
-                used_splits.add(mem["mbo"].getLong("INVUSELINESPLITID"))
-        # Cele mai noi libere primele (PAS 1 tocmai create).
+        # Reia lista libera (nu consumata mai sus); cele mai noi libere primele.
         free_splits=sorted([m for m in splitrows if m.getLong("INVUSELINESPLITID") not in used_splits],
                            key=lambda m: m.getLong("INVUSELINESPLITID"),reverse=True)
         if creates:
