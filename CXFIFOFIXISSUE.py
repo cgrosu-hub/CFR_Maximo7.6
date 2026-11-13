@@ -1,11 +1,12 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.40-INFO-SAVE
+# VERSIUNE: 3.41-NO-COMMODITY
 # Info FIFO la split: Salveaza (fara text Fara Save). Dupa PAS 3 actualizeaza
 # Info pe randul apasat si pe CXSTOCURI-urile noi (scriere pe set MXServer).
 # Dupa commit-ul MATUSETRANS (PAS 2), o tranzactie separata scrie CXSTOCURI
 # pentru ID-urile noi. La o apasare urmatoare, orice MATUSETRANS de split de pe
 # linie fara jurnal primeste CXSTOCURI (nu doar randul apasat).
+# COMMODITYGROUP nu filtreaza jurnalul FIFO.
 # Pastrate dupa 3.20: split multi-pret, retur pe prioritate, UUID, cascada,
 # fara stop CXSENTEBS/FINCNTRLID, avertisment daca suma MATUSETRANS difera de linie.
 # bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
@@ -92,7 +93,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.40-INFO-SAVE"
+VERSION="3.41-NO-COMMODITY"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -227,7 +228,7 @@ def journal_row(m):
             "refmbo":m.getString("CXREFMBO"),"kind":m.getString("CXREF"),
             "date":datekey(None if m.isNull("CXDOCUMENTDATE") else m.getDate("CXDOCUMENTDATE")),
             "qty":number(m,"CXQTY",True),"cost":number(m,"UNITCOST"),"balance":number(m,"CXCURBAL",True),
-            "group":m.getString("COMMODITYGROUP"),"mbo":m}
+            "group":"","mbo":m}
 
 def order(row):
     return (row["date"],row["ref"] or 0,row["id"])
@@ -715,9 +716,6 @@ def cascade_following_issues(journal,start_pos,group,changes,query,max_n=None):
         if r.get("kind")!="ISSUE" or r.get("refmbo")!="MATUSETRANS":
             stop="intrerupt de %s RefID=%s" % (r.get("kind"),r.get("ref"))
             break
-        if r.get("group")!=group:
-            stop="grupa diferita"
-            break
         if r.get("qty") is None or r["qty"]>=ZERO or r.get("cost") is None:
             stop="date incomplete RefID=%s" % r.get("ref")
             break
@@ -935,7 +933,7 @@ def execute(context):
             bind_screen_journal(context,all_journal)
             if any(m.getString("CURRENCYCODE")!=rm.getString("CURRENCYCODE") for m in raw if not m.isNull("CURRENCYCODE")):
                 fail("Monede diferite intre jurnal si MATRECTRANS")
-            journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
+            journal=sorted(all_journal,key=order)
             positions=[i for i,r in enumerate(journal)
                        if r["refmbo"]=="MATRECTRANS" and r["ref"]==rm.getLong("MATRECTRANSID")
                        and r["kind"]==kind and r["qty"] is not None and r["qty"]<ZERO]
@@ -1031,7 +1029,7 @@ def execute(context):
             cxset,raw=query("CXSTOCURI",cxwhere)
             all_journal=[journal_row(m) for m in raw]
             bind_screen_journal(context,all_journal)
-            journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
+            journal=sorted(all_journal,key=order)
             rows=[r for r in journal if r["id"]==context.getLong("CXSTOCURIID")]
             if len(rows)!=1 or rows[0]["ref"]!=rm.getLong("MATUSETRANSID") or rows[0]["kind"]!="RETURN":
                 fail("Randul de jurnal al returului lipseste")
@@ -1151,7 +1149,7 @@ def execute(context):
             bind_screen_journal(context,all_journal)
             if any(m.getString("CURRENCYCODE")!=first.getString("CURRENCYCODE") for m in raw):
                 fail("Monede diferite intre jurnal si consum")
-            journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
+            journal=sorted(all_journal,key=order)
             positions=[i for i,r in enumerate(journal) if r["refmbo"]=="MATUSETRANS" and r["ref"]==first.getLong("MATUSETRANSID") and r["kind"]=="ISSUE"]
             if len(positions)!=1:
                 fail("Consumul %s nu are un singur rand ISSUE in jurnal" % first.getLong("MATUSETRANSID"))
@@ -1333,7 +1331,7 @@ def execute(context):
         bind_screen_journal(context,all_journal)
         if any(m.getString("CURRENCYCODE")!=currency for m in raw):
             fail("Monede diferite intre jurnal si consum")
-        journal=sorted([r for r in all_journal if r["group"]==context.getString("COMMODITYGROUP")],key=order)
+        journal=sorted(all_journal,key=order)
         mids=set(m["id"] for m in members)
         line_targets=[r for r in journal if r["refmbo"]=="MATUSETRANS" and r["ref"] in mids]
         line_jbyref=dict((r["ref"],r) for r in line_targets)

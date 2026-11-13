@@ -1,9 +1,10 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.26-INVLIFO-SUM
+# VERSIUNE: 5.28-NO-COMMODITY
 # DIFERENTA: fara textul FIFO LOCAL si fara sectiunea diferenta.
 # INVLIFOFIFOCOST: pe acelasi pret suma cantitatilor; REFOBJECTID = cel mai vechi MATRECTRANS.
 # Afisarea SITUATIE STRATURI FIFO ramane pe straturi detaliate din CXSTOCURI.
+# COMMODITYGROUP nu filtreaza FIFO: o singura carte pe articol/gestiune.
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -96,7 +97,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.26-INVLIFO-SUM"
+VERSION = "5.28-NO-COMMODITY"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -268,6 +269,12 @@ def refresh_fifo_table(bean):
 def ordinary_entry(row):
     return row.get("kind") in ENTRY_TYPES and row.get("qty") is not None and row["qty"] > QTY_TOLERANCE
 
+def normalize_fifo_groups(rows):
+    # Nu folosim COMMODITYGROUP la identificare: tot jurnalul e o carte FIFO.
+    for row in rows:
+        row["group"]=""
+    return rows
+
 def flag(record):
     # Y = pret gresit SAU sold CXCURBAL gresit/lipsa/negativ. INITIAL valid = N.
     row=record["row"]
@@ -418,6 +425,7 @@ def audit_rows(rows):
     records=dict((r["id"],new_local_record(r)) for r in rows)
     if len(records)!=len(rows):
         raise ValueError("CXSTOCURIID duplicat")
+    normalize_fifo_groups(rows)
     groups,issues,remaining_layers={},[],[]
     for row in rows:
         groups.setdefault(row.get("group") or "",[]).append(row)
@@ -572,6 +580,9 @@ def audit_rows(rows):
                                    "source_ref_id":row.get("ref_id"),"source_ref_mbo":row.get("ref_mbo"),
                                    "initial":False,"priority":order(row)})
                     layers.sort(key=lambda l:l["priority"])
+                    # Intrare cu sold >= 0 reface baza locala (ca in CXFIFOFIX replay).
+                    if balance is not None and balance>=ZERO:
+                        recovering=False
                 rec["status"]="INPUT"
                 continue
             # qty < 0: iesire FIFO. Include RECEIPT/SHIPRECEIPT negative (comenzi/receptii).
@@ -1100,12 +1111,12 @@ def recorded_balances_by_cost(rows):
     for row in sorted(rows,key=order):
         if row.get("cost") is None or not row.get("date"):
             raise ValueError("Pret/data lipsa; sold final nedeterminabil")
-        last[(row.get("group") or "",row["cost"])]=row
+        last[row["cost"]]=row
     totals={}
-    for key,row in last.items():
+    for cost,row in last.items():
         if row.get("balance") is None:
             raise ValueError("Sold final lipsa")
-        totals[key[1]]=totals.get(key[1],ZERO)+row["balance"]
+        totals[cost]=totals.get(cost,ZERO)+row["balance"]
     return totals
 
 def normalize_ref_mbo(value):
@@ -1463,6 +1474,15 @@ def check_layer_beats_negative_balance():
     ])
     if blocked["records"][2]["status"]!="UNVERIFIED":
         raise ValueError("self-check: iesirea fara stoc nu trebuie certificata")
+    # COMMODITYGROUP diferit nu trebuie sa separe SHIPRECEIPT de SHIPTRANSFER.
+    cross=audit_rows([
+        dict(row(1,"2026-08-07 00:00:00.000000000",1337476211,"SHIPRECEIPT","1","1","1"),group="A"),
+        dict(row(2,"2026-09-25 00:00:00.000000000",1337483496,"SHIPTRANSFER","-1","1","-1"),group="B"),
+    ])
+    if cross["records"][2]["status"]!="OK":
+        raise ValueError("self-check: SHIPTRANSFER trebuie sa consume SHIPRECEIPT indiferent de COMMODITYGROUP")
+    if not cross["records"][2]["allocations"] or cross["records"][2]["allocations"][0].get("source_ref_id")!=1337476211:
+        raise ValueError("self-check: sursa SHIPTRANSFER trebuie sa fie SHIPRECEIPT")
     voided=audit_rows([
         row(1,"2026-09-07 00:00:00.000000000",10,"RECEIPT","50319","9.846","50319"),
         row(2,"2026-09-11 00:00:00.000000000",20,"RECEIPT","172","9.846","50491"),

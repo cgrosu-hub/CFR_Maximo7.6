@@ -1,12 +1,13 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.8-TRANSFER-AFTER-RECEIPT
+# VERSIUNE: 3.9-NO-COMMODITY
 # Implicit: muta la maximul orelor din aceeasi zi (acelasi site/gestiune) + 1 minut.
 # RETURN inainte de ISSUE (ISSUEID): data = ISSUE + 1 minut (MATUSETRANS+CXSTOCURI).
 # ISSUE/SHIPTRANSFER/TRANSFER(iesire) cu stoc anterior insuficient: muta dupa prima
 # receptie ulterioara in jurnal (RECEIPT/SHIPRECEIPT/TRANSFER intrare) cu CXQTY >= |qty|
 # (+1 minut). Include si receptia de pe aceeasi data/ora, dar dupa iesire
 # (CXREFID/CXSTOCURIID).
+# COMMODITYGROUP nu face parte din cartea FIFO.
 # SHIPTRANSFER: daca receptia legata (RECEIPTREF) ar ramane inaintea noii date,
 # o muta si pe ea (MATRECTRANS+CXSTOCURI) la aceeasi data — nu blocheaza.
 # ACTUALDATE/CXDOCUMENTDATE: NOACCESSCHECK+NOVALIDATION (evita BMXAA1198E pe perioada
@@ -27,7 +28,7 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
-VERSION = "3.8-TRANSFER-AFTER-RECEIPT"
+VERSION = "3.9-NO-COMMODITY"
 COVERING_RECEIPT = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 DATE_FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 SUPPORTED = {
@@ -97,14 +98,13 @@ def signature(rows):
 
 def partition(r):
     return (r.getString("ITEMNUM"), r.getString("SITEID"), r.getString("LOCATION"),
-            r.getString("COMMODITYGROUP"), canonical(number(r, "UNITCOST")))
+            canonical(number(r, "UNITCOST")))
 
 def scope(r):
     return (r.getString("SITEID"), r.getString("LOCATION"))
 
 def same_fifo_book(r, target):
-    return (scope(r) == scope(target) and
-            r.getString("COMMODITYGROUP") == target.getString("COMMODITYGROUP"))
+    return scope(r) == scope(target)
 
 def is_inbound(r):
     if r.getString("CXREF") == "INITIAL":
