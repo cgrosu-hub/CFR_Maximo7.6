@@ -1,20 +1,15 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.9-NO-COMMODITY
-# Implicit: muta la maximul orelor din aceeasi zi (acelasi site/gestiune) + 1 minut.
-# RETURN inainte de ISSUE (ISSUEID): data = ISSUE + 1 minut (MATUSETRANS+CXSTOCURI).
-# ISSUE/SHIPTRANSFER/TRANSFER(iesire) cu stoc anterior insuficient: muta dupa prima
-# receptie ulterioara in jurnal (RECEIPT/SHIPRECEIPT/TRANSFER intrare) cu CXQTY >= |qty|
-# (+1 minut). Include si receptia de pe aceeasi data/ora, dar dupa iesire
-# (CXREFID/CXSTOCURIID).
-# COMMODITYGROUP nu face parte din cartea FIFO.
-# SHIPTRANSFER: daca receptia legata (RECEIPTREF) ar ramane inaintea noii date,
-# o muta si pe ea (MATRECTRANS+CXSTOCURI) la aceeasi data — nu blocheaza.
-# ACTUALDATE/CXDOCUMENTDATE: NOACCESSCHECK+NOVALIDATION (evita BMXAA1198E pe perioada
-# deschisa cand validarea Maximo totusi respinge scrierea).
-# INITIAL: doar CXDOCUMENTDATE. INVTRANS netratat.
+# VERSIUNE: 3.12-CXSTOCURI-ONLY-BAL
+# Mutare data: soldul se scrie DOAR pe CXSTOCURI (CXDOCUMENTDATE + CXCURBAL).
+# Pe MATUSETRANS/MATRECTRANS se sincronizeaza doar ACTUALDATE prin SQL UPDATE
+# (fara MboSet.save) — save() pe sursa declansa BMXAA3496E (validare sold cos /
+# INVBALANCES), desi nu scriam CURBAL pe obiectele standard.
+# Nu se scrie CURBAL/OUTSIDE/INVBALANCES pe obiecte Maximo standard.
+# AFTER_RECEIPT: pe acelasi UNITCOST. COMMODITYGROUP nu e cheie FIFO.
 
 from java.math import BigDecimal
+from java.sql import Timestamp
 from java.util import Calendar, Date
 from java.text import SimpleDateFormat
 from psdi.server import MXServer
@@ -28,7 +23,7 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
-VERSION = "3.9-NO-COMMODITY"
+VERSION = "3.12-CXSTOCURI-ONLY-BAL"
 COVERING_RECEIPT = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 DATE_FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 SUPPORTED = {
@@ -38,15 +33,16 @@ SUPPORTED = {
 
 def after_receipt_exit(kind, table, qty=None):
     # TRANSFER pe MATRECTRANS poate fi iesire (qty<0) sau intrare (qty>0).
+    # RECEIPT/SHIPRECEIPT cu qty<0 = iesire FIFO (comanda/receptie negativa).
     if kind == "ISSUE" and table == "MATUSETRANS":
         return True
     if table != "MATRECTRANS":
         return False
     if kind == "SHIPTRANSFER":
         return True
-    if kind == "TRANSFER":
+    if kind in ("TRANSFER", "RECEIPT", "SHIPRECEIPT"):
         if qty is None:
-            return True
+            return kind == "TRANSFER"
         return qty.compareTo(ZERO) < 0
     return False
 
@@ -106,6 +102,9 @@ def scope(r):
 def same_fifo_book(r, target):
     return scope(r) == scope(target)
 
+def same_unitcost(r, target):
+    return not different(number(r, "UNITCOST"), number(target, "UNITCOST"))
+
 def is_inbound(r):
     if r.getString("CXREF") == "INITIAL":
         return True
@@ -114,10 +113,10 @@ def is_inbound(r):
     return number(r, "CXQTY").compareTo(ZERO) > 0
 
 def total_inbound_stock(all_rows, target):
-    # suma soldurilor de pe toate intrarile FIFO din cartea locala
+    # Intrari pe acelasi pret ca iesirea (alt pret nu acopera consumul FIFO).
     total = ZERO
     for r in all_rows:
-        if not same_fifo_book(r, target):
+        if not same_fifo_book(r, target) or not same_unitcost(r, target):
             continue
         if r.getString("CXREF") == "INITIAL":
             if r.isNull("CXCURBAL"):
@@ -128,10 +127,11 @@ def total_inbound_stock(all_rows, target):
     return total
 
 def stock_before(all_rows, target):
+    # Sold cronologic pe acelasi pret inaintea iesirii.
     tid = target.getUniqueIDValue()
     tms = stamp(target)
     bal = ZERO
-    rows = [r for r in all_rows if same_fifo_book(r, target)]
+    rows = [r for r in all_rows if same_fifo_book(r, target) and same_unitcost(r, target)]
     for r in sorted(rows, key=lambda x: (stamp(x), 0 if x.isNull("CXREFID") else x.getLong("CXREFID"), x.getUniqueIDValue())):
         if stamp(r) > tms or (stamp(r) == tms and r.getUniqueIDValue() >= tid):
             break
@@ -152,12 +152,11 @@ def journal_key(r):
             r.getUniqueIDValue())
 
 def first_covering_inbound(all_rows, target, after_ms, needed):
-    # Prima receptie (nu RETURN) dupa iesire in jurnal, cu cantitate care acopera consumul.
-    # Include aceeasi data/ora daca e dupa target pe CXREFID/CXSTOCURIID.
+    # Prima receptie ulterioara pe acelasi pret, cu cantitate care acopera consumul.
     t_key = journal_key(target)
     later = []
     for r in all_rows:
-        if not same_fifo_book(r, target):
+        if not same_fifo_book(r, target) or not same_unitcost(r, target):
             continue
         if journal_key(r) <= t_key:
             continue
@@ -299,14 +298,42 @@ def plan_balances(all_rows, linked, new_ms, require_before=True):
                if different(number(r, "CXCURBAL"), after[r.getUniqueIDValue()])]
     return after, changed
 
-def apply_dates_and_balances(linked, changed, after, new_ms, source=None, date_field=None, extra_sources=None):
+def sync_actualdate_sql(user, table, pk_field, pk_value, new_ms):
+    # Doar coloana ACTUALDATE. Fara MBO.save => fara validare sold cos (BMXAA3496E).
+    if table not in SUPPORTED or SUPPORTED[table][0] != pk_field:
+        fail("Sursa SQL nepermisa: %s.%s" % (table, pk_field))
+    db = MXServer.getMXServer().getDBManager()
+    key = user.getConnectionKey()
+    con = None
+    ps = None
+    try:
+        con = db.getConnection(key)
+        ps = con.prepareStatement("UPDATE %s SET ACTUALDATE=? WHERE %s=?" % (table, pk_field))
+        ps.setTimestamp(1, Timestamp(long(new_ms)))
+        ps.setLong(2, long(pk_value))
+        n = ps.executeUpdate()
+        if n != 1:
+            fail("ACTUALDATE %s=%s: %s randuri (asteptat 1)" % (pk_field, pk_value, n))
+        con.commit()
+    except Exception:
+        if con is not None:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if ps is not None:
+            try:
+                ps.close()
+            except Exception:
+                pass
+        if con is not None:
+            db.freeConnection(key)
+
+def apply_journal_dates_and_balances(linked, changed, after, new_ms):
+    # Sold + data DOAR pe CXSTOCURI (nu CURBAL/OUTSIDE pe MATUSETRANS/MATRECTRANS).
     new_date = Date(new_ms)
-    if source is not None and date_field is not None:
-        source.setValue(date_field, new_date, DATE_FLAGS)
-    for extra in (extra_sources or []):
-        extra.setValue("ACTUALDATE", new_date, DATE_FLAGS)
-        if extra.getDate("ACTUALDATE").getTime() != new_ms:
-            fail("Validarile au schimbat data receptiei/anularii legate")
     for r in linked:
         r.setValue("CXDOCUMENTDATE", new_date, DATE_FLAGS)
         if stamp(r) != new_ms:
@@ -316,9 +343,6 @@ def apply_dates_and_balances(linked, changed, after, new_ms, source=None, date_f
         r.setValue("CXCURBAL", expected.doubleValue(), DATE_FLAGS)
         if different(number(r, "CXCURBAL"), expected):
             fail("Precizia CXCURBAL nu pastreaza rezultatul")
-    if source is not None and date_field is not None:
-        if source.getDate(date_field).getTime() != new_ms:
-            fail("Validarile au schimbat data sursei")
 
 def refresh_table():
     from psdi.common.context import UIContext
@@ -414,7 +438,7 @@ def execute(context):
             after, changed = plan_balances(all_rows, linked, new_ms)
             formatter = SimpleDateFormat("dd.MM.yyyy HH:mm:ss")
             formatter.setTimeZone(timezone)
-            message = "INITIAL CXSTOCURIID=%s: %s -> %s; jurnal date=1; solduri=%s; doar CXDOCUMENTDATE" % (
+            message = "INITIAL CXSTOCURIID=%s: %s -> %s; jurnal date=1; solduri=%s; doar CXSTOCURI" % (
                 target_id, formatter.format(Date(old_ms)), formatter.format(Date(new_ms)), len(changed))
             if DRY_RUN:
                 return "SIMULARE; nimic salvat. " + message
@@ -423,7 +447,7 @@ def execute(context):
                 fail("Jurnal modificat concurent; nimic salvat")
             close_set(verify)
             verify = None
-            apply_dates_and_balances(linked, changed, after, new_ms)
+            apply_journal_dates_and_balances(linked, changed, after, new_ms)
             root.save()
             service.log_info("CXUPDFIFOROW user=%s CXSTOCURIID=%s; %s" % (
                 context.getUserInfo().getUserName(), target_id, message))
@@ -455,27 +479,25 @@ def execute(context):
                     new_ms = issue_ms + SHIFT_MS
                     date_mode = "AFTER_ISSUE"
                     daymax_blocked = False
-            # ISSUE/SHIPTRANSFER/TRANSFER(iesire): stoc insuficient -> dupa prima receptie care acopera |qty|.
+            # Iesire cu stoc pe pret insuficient -> dupa prima receptie care acopera |qty|.
+            # Daca nu exista acoperire: pastreaza DAYMAX; soldul negativ e acceptat (CXFIFOFIX ulterior).
             if date_mode == "DAYMAX" and after_receipt_exit(kind, table, number(target, "CXQTY")):
                 consumed = number(target, "CXQTY").abs()
                 inbound = total_inbound_stock(all_rows, target)
                 prior = stock_before(all_rows, target)
-                if prior.compareTo(consumed) < 0:
-                    if consumed.compareTo(inbound) > 0:
-                        fail("Stoc total pe intrari (%s) < |iesire| %s; nu pot muta dupa o receptie" % (
-                            canonical(inbound), canonical(consumed)))
+                if prior.compareTo(consumed) < 0 and consumed.compareTo(inbound) <= 0:
                     nxt = first_covering_inbound(all_rows, target, old_ms, consumed)
-                    if nxt is None:
-                        fail("Nu exista receptie ulterioara (RECEIPT/SHIPRECEIPT/TRANSFER) cu cantitate >= %s" %
-                             canonical(consumed))
-                    new_ms = stamp(nxt) + SHIFT_MS
-                    date_mode = "AFTER_RECEIPT"
-                    daymax_blocked = False
+                    if nxt is not None:
+                        new_ms = stamp(nxt) + SHIFT_MS
+                        date_mode = "AFTER_RECEIPT"
+                        daymax_blocked = False
+                        require_before = False
+                        service.log_info("CXUPDFIFOROW AFTER_RECEIPT cover CXREF=%s RefID=%s qty=%s -> +1min" % (
+                            nxt.getString("CXREF"),
+                            "" if nxt.isNull("CXREFID") else str(nxt.getLong("CXREFID")),
+                            canonical(number(nxt, "CXQTY"))))
+                if not target.isNull("CXCURBAL") and number(target, "CXCURBAL").compareTo(ZERO) < 0:
                     require_before = False
-                    service.log_info("CXUPDFIFOROW AFTER_RECEIPT cover CXREF=%s RefID=%s qty=%s -> +1min" % (
-                        nxt.getString("CXREF"),
-                        "" if nxt.isNull("CXREFID") else str(nxt.getLong("CXREFID")),
-                        canonical(number(nxt, "CXQTY"))))
             if date_mode == "DAYMAX" and daymax_blocked:
                 fail("Maximul zilei + un minut depaseste ziua curenta; nimic modificat")
             check_shipment_parent(source, new_ms)
@@ -510,15 +532,13 @@ def execute(context):
                 fail("Sursa modificata concurent; nimic salvat")
             close_set(verify)
             verify = None
-            apply_dates_and_balances(moved, changed, after, new_ms, source, date_field, child_sources)
-            # ACTUALDATE pe MATRECTRANS (sursa + receptii legate) trebuie salvat explicit.
-            saved_sets = []
-            for mbo_src in [source] + list(child_sources):
-                ms = mbo_src.getThisMboSet()
-                if ms is not None and ms not in saved_sets:
-                    ms.save()
-                    saved_sets.append(ms)
+            apply_journal_dates_and_balances(moved, changed, after, new_ms)
             root.save()
+            # ACTUALDATE pe sursa: SQL only (fara MBO.save / fara sold pe obiecte standard).
+            sync_actualdate_sql(context.getUserInfo(), table, pk, refid, new_ms)
+            for child in child_sources:
+                sync_actualdate_sql(context.getUserInfo(), "MATRECTRANS", "MATRECTRANSID",
+                                    child.getLong("MATRECTRANSID"), new_ms)
             service.log_info("CXUPDFIFOROW user=%s CXSTOCURIID=%s; %s" % (
                 context.getUserInfo().getUserName(), target_id, message))
     finally:

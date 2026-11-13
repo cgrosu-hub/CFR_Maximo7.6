@@ -72,6 +72,31 @@ def shouldCreateMatUseJournal():
         return False
     return True
 
+def shouldCreateMatRecJournal():
+    # Evita jurnal duplicat cand CXFIFOFIX creeaza deja CXSTOCURI pentru RECEIPT split.
+    if bool(globals().get('ondelete', False)):
+        return False
+    if 'onadd' in globals():
+        is_creation = bool(globals().get('onadd'))
+    elif bool(globals().get('onupdate', False)):
+        is_creation = False
+    else:
+        is_creation = mbo.toBeAdded()
+    if not is_creation:
+        return False
+    if mbo.isNull('MATRECTRANSID') or mbo.getLong('MATRECTRANSID') <= 0:
+        raise ValueError('MATRECTRANS nou fara ID persistent; jurnalul nu poate fi creat.')
+    existing = mbo.getMboSet(
+        '$CXFIFO_EXISTING_REC_JOURNAL', 'CXSTOCURI',
+        "CXREFMBO='MATRECTRANS' AND CXREFID=:MATRECTRANSID"
+    )
+    existing.reset()
+    if existing.getMbo(0) is not None:
+        service.log_info('CXADDTOCXSTOCURI: jurnal MATRECTRANS deja existent; fara duplicare. ID=' +
+                         str(mbo.getLong('MATRECTRANSID')))
+        return False
+    return True
+
 
 
 #####################################
@@ -329,7 +354,7 @@ if launchPoint == 'CXNEWMATRECTRANS':
         linieStocMbo.getThisMboSet().save()
     
     # speta SHIPRECEIPT
-    if mbo.getString('ISSUETYPE') == 'SHIPRECEIPT':
+    if mbo.getString('ISSUETYPE') == 'SHIPRECEIPT' and shouldCreateMatRecJournal():
         cxStocuriMboSet=mxServer.getMboSet("CXSTOCURI", userInfo)
         # add new line to CXSTOCURI
         linieStocMbo=cxStocuriMboSet.addAtEnd()
@@ -452,7 +477,7 @@ if launchPoint == 'CXNEWMATRECTRANS':
     
     
     #   speta RECEIPT        
-    if mbo.getString('ISSUETYPE') == 'RECEIPT':
+    if mbo.getString('ISSUETYPE') == 'RECEIPT' and shouldCreateMatRecJournal():
         
         
         # set cod tip gestiune din inventar daca are valoare acolo

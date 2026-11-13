@@ -1,24 +1,11 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.41-NO-COMMODITY
-# Info FIFO la split: Salveaza (fara text Fara Save). Dupa PAS 3 actualizeaza
-# Info pe randul apasat si pe CXSTOCURI-urile noi (scriere pe set MXServer).
-# Dupa commit-ul MATUSETRANS (PAS 2), o tranzactie separata scrie CXSTOCURI
-# pentru ID-urile noi. La o apasare urmatoare, orice MATUSETRANS de split de pe
-# linie fara jurnal primeste CXSTOCURI (nu doar randul apasat).
-# COMMODITYGROUP nu filtreaza jurnalul FIFO.
-# Pastrate dupa 3.20: split multi-pret, retur pe prioritate, UUID, cascada,
-# fara stop CXSENTEBS/FINCNTRLID, avertisment daca suma MATUSETRANS difera de linie.
-# bind_screen ca in 3.16; refresh UI bland (fara reset INVENTORY/owner).
-# RETURN pe prioritatea stratului; multi-pret => PAS 1/2/3.
-# CONTENTUID pe INVUSELINESPLIT noi: UUID unic.
-# Cascada conservatoare (cale normala, fara split): dupa ISSUE-ul apasat, corecteaza
-# ISSUE-urile contigue urmatoare din aceeasi grupa (max N); stop la split/stoc/eroare.
-# Fara stop pe CXSENTEBS / FINCNTRLID.
-# Daca sum(MATUSETRANS) != INVUSELINE.QUANTITY: doar avertizeaza in log; nu blocheaza
-# splitul pe consumul apasat (nu se forteaza totusi cantitatea documentului).
-# Cu INVUSELINE: FIFO pe consumul apasat (+ cascada jurnal). Cale normala: NU atinge split.
-# Necesita protectia CXADDTOCXSTOCURI. Calcule BigDecimal; fara decimal/json/re.
+# VERSIUNE: 3.42-RECEIPT-SPLIT
+# MATUSETRANS ISSUE multi-pret: PAS 1 INVUSELINESPLIT / PAS 2 MATUSETRANS / PAS 3 CXSTOCURI.
+# MATRECTRANS RECEIPT|SHIPRECEIPT cu qty<0 multi-pret: split pe MATRECTRANS noi + CXSTOCURI
+# (echivalent line-split; INVUSELINESPLIT nu exista pe receptie).
+# SHIPTRANSFER/TRANSFER iesire: un singur pret (fara split). COMMODITYGROUP nu filtreaza.
+# Info: Salveaza. Necesita protectia CXADDTOCXSTOCURI. BigDecimal; fara decimal/json/re.
 
 from java.math import BigDecimal, MathContext, RoundingMode
 from java.text import NumberFormat, ParsePosition
@@ -93,7 +80,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.41-NO-COMMODITY"
+VERSION="3.42-RECEIPT-SPLIT"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -111,12 +98,14 @@ FLAGS=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 ENTRIES=("RECEIPT","SHIPRECEIPT","TRANSFER")
 EXITS=("ISSUE","SHIPTRANSFER","TRANSFER")
 VOID_TYPES=("VOIDRECEIPT","SHIPRETURN")
-MATREC_EXITS=("SHIPTRANSFER","TRANSFER")
+MATREC_TRANSFER_EXITS=("SHIPTRANSFER","TRANSFER")
+MATREC_RECEIPT_EXITS=("RECEIPT","SHIPRECEIPT")
+MATREC_EXITS=MATREC_TRANSFER_EXITS+MATREC_RECEIPT_EXITS
 WRITE_TABLES=("INVUSELINESPLIT","MATUSETRANS","MATRECTRANS","CXSTOCURI")
 SPLIT_COPY=("INVUSENUM","ORGID","SITEID","INVUSELINEID","FROMLOT","ROTASSETNUM","FROMBIN",
             "PHYSCNT","PHYSCNTDATE","SENDERSYSID","INVUSELINENUM","ITEMNUM","ITEMSETID",
             "FROMSTORELOC","FROMCONDITIONCODE","STAGINGBIN","STAGINGLOT","PLSTATE","RETURNBIN","RETURNQTY")
-MATUSE_COPY=("ITEMNUM","STORELOC","ACTUALDATE","CURBAL","PHYSCNT","PONUM","CONVERSION","ASSETNUM",
+MATUSE_COPY=("ITEMNUM","STORELOC","ACTUALDATE","PHYSCNT","PONUM","CONVERSION","ASSETNUM",
              "IT1","IT2","IT3","IT4","IT5","MEMO","OUTSIDE","ISSUETO","PACKINGSLIPNUM","POLINENUM",
              "ROLLUP","ITIN1","ITIN2","ITIN3","BINNUM","LOTNUM","ISSUETYPE","GLDEBITACCT","GLCREDITACCT",
              "FINANCIALPERIOD","CURRENCYCODE","ROTASSETNUM","LOCATION","DESCRIPTION","EXCHANGERATE",
@@ -124,6 +113,10 @@ MATUSE_COPY=("ITEMNUM","STORELOC","ACTUALDATE","CURBAL","PHYSCNT","PONUM","CONVE
              "ITIN4","ITIN5","ITIN6","ITIN7","ORGID","SITEID","REFWO","ENTEREDASTASK","LINETYPE",
              "ITEMSETID","CONDITIONCODE","CONDRATE","COMMODITYGROUP","COMMODITY","TOSITEID","LANGCODE",
              "POREVISIONNUM","INVUSELINEID","INVUSEID","CONSIGNMENT","ISSUEUNIT","WPITEMID","INVPICKLISTID")
+MATREC_COPY=("ITEMNUM","ITEMSETID","ORGID","SITEID","FROMSITEID","FROMSTORELOC","TOSTORELOC","ISSUETYPE",
+             "PONUM","POLINENUM","POREVISIONNUM","CURRENCYCODE","CONVERSION","EXCHANGERATE","EXCHANGERATE2",
+             "GLDEBITACCT","GLCREDITACCT","DESCRIPTION","COMMODITYGROUP","COMMODITY","LINETYPE","ENTERBY",
+             "STATUS","RECEIPTREF","ISSUEUNIT")
 
 class FixError(Exception):
     pass
@@ -249,7 +242,6 @@ def consume(layers,required):
     return allocations,max(ZERO,required)
 
 def consume_at_cost(layers,required,cost,newest_first=False):
-    # VOIDRECEIPT anuleaza pe pret; newest_first leaga de receptia recenta anulata.
     allocations=[]
     indexes=range(len(layers)-1,-1,-1) if newest_first else range(len(layers))
     for index in indexes:
@@ -281,7 +273,6 @@ def issue_of_returns(rows,query):
     return links
 
 def put_back(layers,qty,cost,priority,ref=None,refmbo=None,cxid=None,initial=False):
-    # Ca Check FIFO: restabileste pe aceeasi prioritate de strat, nu pe primul pret egal din coada.
     for layer in layers:
         if not different(layer["cost"],cost,PRICE_EPS) and layer.get("priority")==priority:
             layer["qty"]+=qty
@@ -291,7 +282,6 @@ def put_back(layers,qty,cost,priority,ref=None,refmbo=None,cxid=None,initial=Fal
     layers.sort(key=lambda layer: layer.get("priority") or ())
 
 def restore_return(layers,qty,issue_row,allocations,return_cost=None,prior=None):
-    # Intoarce stocul LIFO pe alocarile ISSUE-ului legat (prioritate strat sursa).
     remaining=qty
     if allocations:
         for a in reversed(allocations):
@@ -307,7 +297,6 @@ def restore_return(layers,qty,issue_row,allocations,return_cost=None,prior=None)
         if cost is None:
             fail("Retur fara pret de restabilire pentru ISSUEID=%s" % issue_row.get("ref"))
         priority=order(issue_row)
-        # Fara alocare salvata: pune pe cea mai veche sursa cu acelasi pret (ca INITIAL).
         if prior:
             for p in sorted(prior,key=order):
                 if order(p)>=order(issue_row):
@@ -332,7 +321,6 @@ def replay(prior,links=None):
             fail("Data lipsa/pret negativ in istoricul anterior")
         kind,qty,cost=r["kind"],r["qty"],r["cost"]
         if kind=="INITIAL":
-            # Mai multe INITIAL aceeasi data / preturi diferite = straturi deschidere OK.
             if movement or cost in opening or r["balance"] is None or r["balance"]<ZERO:
                 fail("INITIAL ambiguu")
             opening.add(cost)
@@ -355,7 +343,6 @@ def replay(prior,links=None):
             matches=[p for p in prior if p.get("kind")=="ISSUE" and p.get("ref")==issue_id and order(p)<order(r)]
             if len(matches)!=1:
                 fail("Retur anterior %s fara consum unic anterior" % r["ref"])
-            # Pret jurnal retur (ex. 2,630) + pozitia FIFO a alocarii ISSUEID.
             restore_cost=cost if cost is not None else matches[0]["cost"]
             restore_return(layers,qty,matches[0],issue_allocs.get(issue_id) or [],restore_cost,prior)
             started=True
@@ -399,7 +386,6 @@ def replay(prior,links=None):
             if available>EPS:
                 layers.append({"qty":available,"cost":cost,"ref":r["ref"],"refmbo":r["refmbo"],
                                "cxid":r["id"],"initial":False,"priority":order(r)})
-                # CXCURBAL>=0 pe intrare reface baza locala; gap-ul anterior nu blocheaza iesirea curenta.
                 if r["balance"] is not None and r["balance"]>=ZERO:
                     recovering=False
         else:
@@ -410,7 +396,6 @@ def replay(prior,links=None):
                 continue
             available=sum((l["qty"] for l in layers),ZERO)
             covered=available+EPS>=-qty
-            # Soldul negativ e pe pretul curent; stratul de la alt pret poate acoperi iesirea.
             if recovering and (r["balance"] is None or r["balance"]<ZERO) and not covered:
                 consume(layers,-qty)
                 continue
@@ -440,7 +425,6 @@ def copy_value(src,dst,field):
     dst.setValue(field,src.getMboValue(field).getCurrentValue(),FLAGS)
 
 def split_contentuid(source,index,used=None):
-    # Mereu UUID nou: vechiul cgFIA2026+suffix colisiona cu splitul PAS 1 deja comis (DB2 -803).
     from java.util import UUID
     uid=text(UUID.randomUUID().toString())
     if used is not None:
@@ -459,7 +443,6 @@ def add_minutes(value,minutes):
     return cal.getTime()
 
 def audit_info(message):
-    # CXINVAUDIT generated_compact_info: o linie, prefix OK/DIFERENTA/NEVERIFICAT..., | BADFIFO=*
     msg=text(message).replace("\n"," ").strip()
     prefixes=("OK: ","DIFERENTA: ","NEVERIFICAT: ","FARA MISCARE: ","INITIAL: ",
               "ANULAT: ","CORECTAT: ","FROMSTORELOC=")
@@ -477,7 +460,6 @@ def set_info(mbo,message):
 def layer_segments(allocations):
     segments=[]
     for a in allocations:
-        # INITIAL e provenienta legitima (sold deschidere / RETURN pe cost INITIAL).
         if a.get("refmbo")=="MATRECTRANS" and a.get("ref") is not None:
             is_initial=False
             receipt=a["ref"]
@@ -495,8 +477,6 @@ def layer_segments(allocations):
             segments.append({"qty":a["qty"],"cost":a["cost"],"receipt":receipt,"initial":is_initial,"source_cxid":a.get("cxid")})
     if not segments:
         fail("Nu exista alocare FIFO")
-    # Un singur pret FIFO pe consum => un singur segment (fara split pe receptii).
-    # MATRECTRANSID pastreaza prima receptie din alocare; cantitatile se cumuleaza.
     costs=[]
     for seg in segments:
         if not any(not different(seg["cost"],c,PRICE_EPS) for c in costs):
@@ -633,7 +613,6 @@ def screen_rows(context):
     return found
 
 def bind_screen_journal(context, rows):
-    # Ca in 3.16: randul din tabel se scrie o singura data (aceeasi instanta ca DataBean).
     ui=screen_rows(context)
     for row in rows:
         other=ui.get(row["id"])
@@ -659,8 +638,6 @@ def owns(plans):
     return ordered
 
 def refresh_table(context=None):
-    # Refresh bland (3.16): doar tabelul FIFO + bean-uri split. NU reseta INVENTORY/owner
-    # — asta dezactiva Save dupa Bine in 3.17.
     from psdi.common.context import UIContext
     ui=UIContext.getCurrentContext()
     session=ui.getWebClientSession() if ui else None
@@ -702,7 +679,6 @@ def apply_journal_overrides(journal,changes):
     return out
 
 def cascade_following_issues(journal,start_pos,group,changes,query,max_n=None):
-    # ISSUE contigue imediat dupa start, acelasi grup; stop la split / stoc / eroare.
     if max_n is None:
         max_n=CASCADE_MAX_ISSUES
     fixed=[]
@@ -776,87 +752,69 @@ def single_fifo_cost(prior,exit_qty,links=None):
     layers=replay(prior,links)
     allocation,short=consume(layers,-exit_qty)
     if short>EPS:
-        fail("Stoc anterior insuficient; receptiile viitoare nu autorizeaza update")
+        fail("Stoc anterior insuficient")
     costs=set(a["cost"] for a in allocation)
     if len(costs)!=1:
-        fail("Iesirea are mai multe preturi FIFO; corectia automata refuza splitul pe MATRECTRANS")
+        fail("Multi-pret pe MATRECTRANS transfer: split refuzat")
     cost=allocation[0]["cost"]
     if cost<ZERO or ExactNumber(cost.fixed(3))!=cost:
         fail("Pretul FIFO nu poate fi scris")
     return cost,allocation
 
 def check_matrectrans_exit_cost():
-    def row(ident,date,ref,kind,qty,cost,balance,group="G"):
-        return {"id":ident,"group":group,"date":date,"ref":ref,"refmbo":"MATRECTRANS",
-                "kind":kind,"qty":ExactNumber(qty),"cost":ExactNumber(cost),
+    def row(ident,date,ref,kind,qty,cost,balance,mbo="MATRECTRANS"):
+        return {"id":ident,"group":"G","date":date,"ref":ref,"refmbo":mbo,"kind":kind,
+                "qty":ExactNumber(qty),"cost":ExactNumber(cost),
                 "balance":None if balance is None else ExactNumber(balance)}
-    prior=[
+    cost,allocation=single_fifo_cost([
         row(1,"2026-06-01 00:00:00.000000000",300,"SHIPTRANSFER","-10","9.098","-10"),
         row(2,"2026-06-08 00:00:00.000000000",100,"SHIPRECEIPT","10","9.098","0"),
         row(3,"2026-09-07 00:00:00.000000000",400,"SHIPRECEIPT","20","9.846","20"),
-    ]
-    cost,allocation=single_fifo_cost(prior,ExactNumber("-1"))
-    if different(cost,ExactNumber("9.846"),PRICE_EPS):
-        raise ValueError("self-check: SHIPTRANSFER nu preia pretul receptiei anterioare")
-    if not allocation or allocation[0].get("ref")!=400:
-        raise ValueError("self-check: sursa FIFO gresita pentru SHIPTRANSFER")
-    same_cost_alloc=[
+    ],ExactNumber("-1"))
+    if different(cost,ExactNumber("9.846"),PRICE_EPS) or not allocation or allocation[0].get("ref")!=400:
+        raise ValueError("self-check: SHIPTRANSFER FIFO")
+    merged=layer_segments([
         {"qty":ExactNumber("10"),"cost":ExactNumber("8.320"),"ref":100,"refmbo":"MATRECTRANS","cxid":1,"initial":False},
-        {"qty":ExactNumber("10"),"cost":ExactNumber("8.320"),"ref":200,"refmbo":"MATRECTRANS","cxid":2,"initial":False},
-    ]
-    merged=layer_segments(same_cost_alloc)
-    if len(merged)!=1 or different(merged[0]["qty"],ExactNumber("20")) or different(merged[0]["cost"],ExactNumber("8.320"),PRICE_EPS):
-        raise ValueError("self-check: acelasi pret FIFO trebuie un singur segment, fara split")
-    if merged[0]["receipt"]!=100:
-        raise ValueError("self-check: receptia pastrata pe segmentul unic trebuie sa fie prima")
-    mixed=layer_segments([
+        {"qty":ExactNumber("10"),"cost":ExactNumber("8.320"),"ref":200,"refmbo":"MATRECTRANS","cxid":2,"initial":False}])
+    if len(merged)!=1 or merged[0]["receipt"]!=100:
+        raise ValueError("self-check: merge same-cost")
+    if len(layer_segments([
         {"qty":ExactNumber("10"),"cost":ExactNumber("8.320"),"ref":100,"refmbo":"MATRECTRANS","cxid":1,"initial":False},
-        {"qty":ExactNumber("10"),"cost":ExactNumber("9.360"),"ref":200,"refmbo":"MATRECTRANS","cxid":2,"initial":False},
-    ])
-    if len(mixed)!=2:
-        raise ValueError("self-check: preturi FIFO diferite trebuie sa pastreze splitul")
-
+        {"qty":ExactNumber("10"),"cost":ExactNumber("9.360"),"ref":200,"refmbo":"MATRECTRANS","cxid":2,"initial":False}]))!=2:
+        raise ValueError("self-check: keep multi-cost")
     try:
-        single_fifo_cost([
-            row(1,"2026-06-01 00:00:00.000000000",1,"SHIPTRANSFER","-1","9","-1"),
-        ],ExactNumber("-1"))
-        raise ValueError("self-check: iesirea fara stoc trebuia respinsa")
+        single_fifo_cost([row(1,"2026-06-01 00:00:00.000000000",1,"SHIPTRANSFER","-1","9","-1")],ExactNumber("-1"))
+        raise ValueError("self-check: no-stock")
     except FixError:
         pass
-    # Speta 206686: VOIDRECEIPT OK pe pret anuleaza receptia recenta; ISSUE ulterior pe FIFO vechi.
-    void_prior=[
+    cost,allocation=single_fifo_cost([
         row(1,"2026-06-01 00:00:00.000000000",10,"RECEIPT","100","9.501","100"),
         row(2,"2026-06-18 00:00:00.000000000",20,"RECEIPT","200","9.099","300"),
         row(3,"2026-06-18 00:03:00.000000000",30,"VOIDRECEIPT","-200","9.099","100"),
         row(4,"2026-06-18 00:04:00.000000000",40,"RECEIPT","200","9.099","300"),
-    ]
-    cost,allocation=single_fifo_cost(void_prior,ExactNumber("-50"))
-    if different(cost,ExactNumber("9.501"),PRICE_EPS):
-        raise ValueError("self-check: ISSUE dupa VOIDRECEIPT trebuie sa preia 9.501")
-    if not allocation or allocation[0].get("ref")!=10:
-        raise ValueError("self-check: VOIDRECEIPT trebuie sa lase stratul vechi FIFO")
-    # Speta 175368: RETURN pe 2,630 nu se lipea in spatele lui 2,960; ISSUE -40 => split.
-    def jrow(ident,date,ref,kind,qty,cost,balance,mbo="MATUSETRANS"):
-        return {"id":ident,"group":"G","date":date,"ref":ref,"refmbo":mbo,
-                "kind":kind,"qty":ExactNumber(qty),"cost":ExactNumber(cost),
-                "balance":None if balance is None else ExactNumber(balance)}
-    return_prior=[
-        jrow(1,"2026-01-01 00:00:00.000000000",1,"INITIAL","100","2.630","100","CXSTOCURI"),
-        jrow(2,"2026-01-01 00:00:00.000000000",2,"INITIAL","1000","2.960","1000","CXSTOCURI"),
-        jrow(3,"2026-02-01 00:00:00.000000000",154452,"ISSUE","-100","2.630","0"),
-        jrow(4,"2026-03-01 00:00:00.000000000",20,"ISSUE","-50","2.960","950"),
-        jrow(5,"2026-04-22 10:41:00.000000000",30,"RETURN","30","2.630","980"),
-    ]
-    layers=replay(return_prior,{30:154452})
+    ],ExactNumber("-50"))
+    if different(cost,ExactNumber("9.501"),PRICE_EPS) or not allocation or allocation[0].get("ref")!=10:
+        raise ValueError("self-check: VOIDRECEIPT prior")
+    cost,allocation=single_fifo_cost([
+        row(1,"2017-06-01 01:00:00.000000000",1,"INITIAL","1","5.590","1","CXSTOCURI"),
+        row(2,"2026-01-20 00:00:00.000000000",2,"SHIPRECEIPT","1","7.500","1"),
+    ],ExactNumber("-1"))
+    if different(cost,ExactNumber("5.590"),PRICE_EPS):
+        raise ValueError("self-check: RECEIPT negativ pe INITIAL")
+    layers=replay([
+        row(1,"2026-01-01 00:00:00.000000000",1,"INITIAL","100","2.630","100","CXSTOCURI"),
+        row(2,"2026-01-01 00:00:00.000000000",2,"INITIAL","1000","2.960","1000","CXSTOCURI"),
+        row(3,"2026-02-01 00:00:00.000000000",154452,"ISSUE","-100","2.630","0","MATUSETRANS"),
+        row(4,"2026-03-01 00:00:00.000000000",20,"ISSUE","-50","2.960","950","MATUSETRANS"),
+        row(5,"2026-04-22 10:41:00.000000000",30,"RETURN","30","2.630","980","MATUSETRANS"),
+    ],{30:154452})
     allocation,short=consume(layers,ExactNumber("40"))
-    if short>EPS:
-        raise ValueError("self-check: dupa RETURN trebuie stoc pentru -40")
-    if len(allocation)<2:
-        raise ValueError("self-check: ISSUE dupa RETURN trebuie multi-pret (split), nu un singur strat")
+    if short>EPS or len(allocation)<2:
+        raise ValueError("self-check: RETURN multi-cost")
     if different(allocation[0]["cost"],ExactNumber("2.630"),PRICE_EPS) or different(allocation[0]["qty"],ExactNumber("30")):
-        raise ValueError("self-check: primul segment trebuie 30@2.630")
+        raise ValueError("self-check: seg1")
     if different(allocation[1]["cost"],ExactNumber("2.960"),PRICE_EPS) or different(allocation[1]["qty"],ExactNumber("10")):
-        raise ValueError("self-check: al doilea segment trebuie 10@2.960")
+        raise ValueError("self-check: seg2")
 
 def execute(context):
     check_matrectrans_exit_cost()
@@ -878,11 +836,11 @@ def execute(context):
             fail("Directie neconforma pentru "+kind)
     elif refmbo=="MATRECTRANS":
         if kind not in MATREC_EXITS:
-            fail("Pentru MATRECTRANS selecteaza SHIPTRANSFER sau TRANSFER de iesire")
+            fail("MATRECTRANS: SHIPTRANSFER/TRANSFER sau RECEIPT/SHIPRECEIPT (qty<0)")
         if number(context,"CXQTY")>=ZERO:
             fail("Selecteaza randul de iesire (cantitate negativa) din jurnal")
     else:
-        fail("Selecteaza ISSUE/RETURN din MATUSETRANS sau SHIPTRANSFER/TRANSFER din MATRECTRANS")
+        fail("Selecteaza iesire MATUSETRANS/MATRECTRANS")
     if context.isNull("CXREFID"):
         fail("CXREFID lipsa")
     if "MOTIV=ORDINE_DATE" in context.getString("DESCRIPTION_LONGDESCRIPTION"):
@@ -904,14 +862,22 @@ def execute(context):
         if "def shouldCreateMatUseJournal" not in content or "and shouldCreateMatUseJournal()" not in content:
             fail("Instaleaza protectia CXADDTOCXSTOCURI")
         if refmbo=="MATRECTRANS":
+            receipt_exit=kind in MATREC_RECEIPT_EXITS
             rmset,receipts=query("MATRECTRANS","MATRECTRANSID=%s" % context.getLong("CXREFID"),2)
             if len(receipts)!=1:
                 fail("MATRECTRANS tinta lipsa/neunic")
             rm=receipts[0]
             if rm.getString("ISSUETYPE")!=kind:
                 fail("ISSUETYPE pe MATRECTRANS difera de CXREF")
-            if number(rm,"QUANTITY")<=ZERO:
-                fail("MATRECTRANS %s nu are cantitate pozitiva de expediere/transfer" % rm.getLong("MATRECTRANSID"))
+            qty_doc=number(rm,"QUANTITY")
+            if receipt_exit:
+                if qty_doc>=ZERO:
+                    fail("RECEIPT iesire: QUANTITY trebuie negativa")
+                qty_journal=qty_doc
+            else:
+                if qty_doc<=ZERO:
+                    fail("MATRECTRANS %s: QUANTITY trebuie pozitiva" % rm.getLong("MATRECTRANSID"))
+                qty_journal=-qty_doc
             if number(rm,"CONVERSION")!=ONE or number(rm,"EXCHANGERATE")!=ONE:
                 fail("Conversie unitati/valuta diferita de 1")
             rate2=number(rm,"EXCHANGERATE2",True)
@@ -921,12 +887,16 @@ def execute(context):
                 fail("Data sursa lipsa")
             if rm.getString("ITEMNUM")!=context.getString("ITEMNUM"):
                 fail("Articol diferit fata de randul apasat")
-            if rm.getString("FROMSITEID")!=context.getString("SITEID"):
-                fail("Site sursa neconform")
-            if rm.isNull("FROMSTORELOC") or rm.getString("FROMSTORELOC")!=context.getString("LOCATION"):
-                fail("Gestiune sursa neconforma")
-            qty_doc=number(rm,"QUANTITY")
-            qty_journal=-qty_doc
+            loc=context.getString("LOCATION")
+            site=context.getString("SITEID")
+            if receipt_exit:
+                if rm.getString("SITEID")!=site:
+                    fail("Site receptie neconform")
+            else:
+                if rm.getString("FROMSITEID")!=site:
+                    fail("Site sursa neconform")
+                if rm.isNull("FROMSTORELOC") or rm.getString("FROMSTORELOC")!=loc:
+                    fail("Gestiune sursa neconforma")
             cxwhere=scope_where(context,"CXSTOCURI")
             cxset,raw=query("CXSTOCURI",cxwhere)
             all_journal=[journal_row(m) for m in raw]
@@ -944,54 +914,147 @@ def execute(context):
             if ij["id"]!=context.getLong("CXSTOCURIID") or text(ij["mbo"].getRowStamp())!=text(context.getRowStamp()):
                 fail("Rand apasat schimbat; refresh necesar")
             if ij["date"]!=datekey(rm.getDate("ACTUALDATE")) or different(ij["qty"],qty_journal):
-                fail("Cantitatea sau data din jurnal difera de MATRECTRANS; nu le modificam in acest pas")
-            cost,allocation=single_fifo_cost(journal[:pos],ij["qty"],issue_of_returns(journal[:pos],query))
-            value=money(qty_doc*cost)
-            changes={ij["id"]:{"qty":qty_journal,"cost":cost}}
-            after=ledger(journal,changes)
+                fail("Cantitate/data jurnal != MATRECTRANS")
+            layers=replay(journal[:pos],issue_of_returns(journal[:pos],query))
+            allocation,short=consume(layers,-ij["qty"])
+            if short>EPS:
+                fail("Stoc anterior insuficient")
+            segments=layer_segments(allocation)
+            costs=[]
+            for a in allocation:
+                if not any(not different(a["cost"],c,PRICE_EPS) for c in costs):
+                    costs.append(a["cost"])
+            if len(costs)>1 and not receipt_exit:
+                fail("Multi-pret pe TRANSFER/SHIPTRANSFER: split refuzat")
+            if len(costs)>1 and len(segments)<2:
+                fail("RECEIPT multi-pret colapsat gresit")
             plans=[]
             def plan_number(m,field,value):
                 old=number(m,field,True)
                 if old is None or old!=value:
                     plans.append((m,field,"NUMBER",value,text(old)))
-            for f in ("UNITCOST","ACTUALCOST","CURRENCYUNITCOST"):
-                plan_number(rm,f,cost)
-            for f in ("LINECOST","CURRENCYLINECOST"):
-                plan_number(rm,f,value)
-            if not rm.isNull("LINECOST2"):
-                plan_number(rm,"LINECOST2",value)
-            for r in journal:
-                if r["id"] in changes:
-                    plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
-                plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
-            if not plans:
-                message="Iesirea MATRECTRANS %s este deja la pretul FIFO %s; nimic modificat." % (
-                    rm.getLong("MATRECTRANSID"),fmt(cost))
+            def plan_matrec_costs(mbo,doc_qty,cost):
+                value=money(doc_qty*cost)
+                for f in ("UNITCOST","ACTUALCOST","CURRENCYUNITCOST"):
+                    plan_number(mbo,f,cost)
+                for f in ("LINECOST","CURRENCYLINECOST"):
+                    plan_number(mbo,f,value)
+                if not mbo.isNull("LINECOST2"):
+                    plan_number(mbo,"LINECOST2",value)
+                return value
+            created_ids=[]
+            if len(segments)==1:
+                cost=segments[0]["cost"]
+                if cost<ZERO or ExactNumber(cost.fixed(3))!=cost:
+                    fail("Pretul FIFO nu poate fi scris")
+                value=plan_matrec_costs(rm,qty_doc,cost)
+                changes={ij["id"]:{"qty":qty_journal,"cost":cost}}
+                after=ledger(journal,changes)
+                plan_number(ij["mbo"],"UNITCOST",cost)
+                for r in journal:
+                    plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
+                if not plans:
+                    message="Iesirea MATRECTRANS %s este deja la pretul FIFO %s; nimic modificat." % (
+                        rm.getLong("MATRECTRANSID"),fmt(cost))
+                else:
+                    planned_tables=set(m.getName().upper() for m,f,k,v,old in plans)
+                    select_write_sets(planned_tables,{"MATRECTRANS":rmset,"CXSTOCURI":cxset})
+                    write_sets=owns(plans)
+                    tx=MXServer.getMXServer().createMXTransaction()
+                    for name,ms in write_sets:
+                        ms.setFlag(MboConstants.NOSAVE,False)
+                        ms.setMXTransaction(tx)
+                        tx.add(ms)
+                    for m,f,k,value,old in plans:
+                        writable(m)
+                        put_number(m,f,value)
+                    tx.save()
+                    for m,f,k,value,old in plans:
+                        if different(number(m,f),value):
+                            fail("Logica de salvare a suprascris planul pe %s.%s; rollback" % (m.getName(),f))
+                    commit_started=True
+                    tx.commit()
+                    committed=True
+                    receipt=segments[0].get("receipt")
+                    message="SALVAT %s MATRECTRANS %s la %s, valoare %s; sursa FIFO %s." % (
+                        kind,rm.getLong("MATRECTRANSID"),fmt(cost),fmt(value),
+                        "INITIAL" if segments[0].get("initial") or receipt is None else text(receipt))
+                    message+="\nFara modificare receptie/destinatie."
+                    message+="\nRuleaza Check FIFO."
             else:
-                planned_tables=set(m.getName().upper() for m,f,k,v,old in plans)
-                select_write_sets(planned_tables,{"MATRECTRANS":rmset,"CXSTOCURI":cxset})
-                write_sets=owns(plans)
+                from java.util import Date
+                first=segments[0]
+                first_doc=-first["qty"]
+                if ExactNumber(first_doc.fixed(3))!=first_doc or first["qty"]<STEP:
+                    fail("Cantitate strat RECEIPT nereprezentabila")
+                plan_number(rm,"QUANTITY",first_doc)
+                first_value=plan_matrec_costs(rm,first_doc,first["cost"])
+                plan_number(ij["mbo"],"CXQTY",first_doc)
+                plan_number(ij["mbo"],"UNITCOST",first["cost"])
+                base_actual=rm.getDate("ACTUALDATE")
+                rmset.setFlag(MboConstants.NOSAVE,False)
+                cxset.setFlag(MboConstants.NOSAVE,False)
+                extra_rows=[]
+                for idx,seg in enumerate(segments[1:]):
+                    doc_qty=-seg["qty"]
+                    if ExactNumber(doc_qty.fixed(3))!=doc_qty or seg["qty"]<STEP or ExactNumber(seg["cost"].fixed(3))!=seg["cost"] or seg["cost"]<ZERO:
+                        fail("Strat RECEIPT nereprezentabil")
+                    nm=rmset.addAtEnd(FLAGS)
+                    for f in MATREC_COPY:
+                        copy_value(rm,nm,f)
+                    nm.setValue("ACTUALDATE",add_minutes(base_actual,idx+1),FLAGS)
+                    nm.setValue("TRANSDATE",Date(),FLAGS)
+                    put_number(nm,"QUANTITY",doc_qty)
+                    for f in ("UNITCOST","ACTUALCOST","CURRENCYUNITCOST"):
+                        put_number(nm,f,seg["cost"])
+                    seg_value=money(doc_qty*seg["cost"])
+                    for f in ("LINECOST","CURRENCYLINECOST"):
+                        put_number(nm,f,seg_value)
+                    if not rm.isNull("LINECOST2"):
+                        put_number(nm,"LINECOST2",seg_value)
+                    nid=nm.getLong("MATRECTRANSID")
+                    created_ids.append(nid)
+                    jm=cxset.addAtEnd(FLAGS)
+                    for f in ("ITEMNUM","LOCATION","ORGID","SITEID","COMMODITYGROUP","CURRENCYCODE",
+                              "DESCRIPTION","GLCREDITACCT","GLDEBITACCT","ISSUETO","ROTASSETNUM"):
+                        copy_value(ij["mbo"],jm,f)
+                    put_number(jm,"CXQTY",doc_qty)
+                    put_number(jm,"UNITCOST",seg["cost"])
+                    jm.setValue("CXDOCUMENTDATE",nm.getDate("ACTUALDATE"),FLAGS)
+                    jm.setValue("CXREF",kind,FLAGS)
+                    jm.setValue("CXREFMBO","MATRECTRANS",FLAGS)
+                    jm.setValue("CXREFID",nid,FLAGS)
+                    set_info(jm,"CXFIFOFIX RECEIPT-SPLIT MATRECTRANS %s" % nid)
+                    extra_rows.append(journal_row(jm))
+                changes={ij["id"]:{"qty":first_doc,"cost":first["cost"]}}
+                for er in extra_rows:
+                    changes[er["id"]]={"qty":er["qty"],"cost":er["cost"]}
+                after=ledger(journal+extra_rows,changes)
+                for r in journal+extra_rows:
+                    if r["id"] in changes:
+                        plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
+                    plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
+                info=set_info(ij["mbo"],"CXFIFOFIX RECEIPT-SPLIT: %s + %s. Salveaza; Check FIFO." % (
+                    rm.getLong("MATRECTRANSID"),",".join(text(i) for i in created_ids)))
+                plans.append((ij["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
                 tx=MXServer.getMXServer().createMXTransaction()
-                for name,ms in write_sets:
+                for ms in (rmset,cxset):
                     ms.setFlag(MboConstants.NOSAVE,False)
                     ms.setMXTransaction(tx)
                     tx.add(ms)
                 for m,f,k,value,old in plans:
                     writable(m)
-                    put_number(m,f,value)
+                    if k=="TEXT":
+                        m.setValue(f,value,FLAGS)
+                    else:
+                        put_number(m,f,value)
                 tx.save()
-                for m,f,k,value,old in plans:
-                    if different(number(m,f),value):
-                        fail("Logica de salvare a suprascris planul pe %s.%s; rollback" % (m.getName(),f))
                 commit_started=True
                 tx.commit()
                 committed=True
-                receipt=allocation[0].get("ref")
-                message="SALVAT %s MATRECTRANS %s la %s, valoare %s; sursa FIFO %s." % (
-                    kind,rm.getLong("MATRECTRANSID"),fmt(cost),fmt(value),
-                    "INITIAL" if allocation[0].get("initial") or receipt is None else text(receipt))
-                message+="\nNu modifica receptia/destinatia legata din acest pas."
-                message+="\nRuleaza Check FIFO. Reconcilierea INVLIFOFIFOCOST ramane separata."
+                message="RECEIPT-SPLIT SALVAT: %s qty %s@%s; noi %s. Ruleaza Check FIFO." % (
+                    rm.getLong("MATRECTRANSID"),fmt(first_doc),fmt(first["cost"]),
+                    ",".join(text(i) for i in created_ids))
             try:
                 if not refresh_table(context):
                     message+="\nRedeschide articolul pentru refresh."
@@ -1163,7 +1226,7 @@ def execute(context):
             layers=replay(prior,issue_of_returns(prior,query))
             allocation,short=consume(layers,-ij["qty"])
             if short>EPS:
-                fail("Stoc anterior insuficient; receptiile viitoare nu autorizeaza update")
+                fail("Stoc anterior insuficient")
             costs=set(a["cost"] for a in allocation)
             if len(costs)!=1:
                 fail("Consumul %s are mai multe preturi FIFO; corectia fara linie nu se face automat" % first.getLong("MATUSETRANSID"))
@@ -1319,8 +1382,7 @@ def execute(context):
         line_qty=number(line,"QUANTITY")
         line_qty_mismatch=different(total,line_qty)
         if line_qty_mismatch:
-            # Nu bloca splitul pe consumul apasat; documentul tot nu e forțat (QUANTITY linie neschimbata).
-            service.log_info("CXFIFOFIXISSUE WARN sum MATUSETRANS=%s != INVUSELINE.QUANTITY=%s INVUSELINEID=%s; continui pe consumul apasat" % (
+            service.log_info("WARN MT sum!=linie %s/%s line=%s" % (
                 fmt(total),fmt(line_qty),lineid))
         if currency!=doc.getString("CURRENCYCODE") or number(doc,"EXCHANGERATE")!=ONE:
             fail("Moneda/conversie document neconforma")
@@ -1341,14 +1403,12 @@ def execute(context):
             fail("MATUSETRANS apasat nu face parte din linia de utilizare")
         sset,splitrows=query("INVUSELINESPLIT","INVUSELINEID=%s" % lineid,MAX_SPLITS)
         splits=dict((m.getLong("INVUSELINESPLITID"),m) for m in splitrows)
-        # Splituri ocupate = orice MATUSETRANS de pe linie (nu doar cel apasat).
         line_members=list(members)
         mt_by_split={}
         for mem in line_members:
             if not mem["mbo"].isNull("INVUSELINESPLITID"):
                 sid=mem["mbo"].getLong("INVUSELINESPLITID")
                 mt_by_split.setdefault(sid,[]).append(mem["mbo"])
-        # FIFO doar pe consumul apasat; celelalte MATUSETRANS de pe linie raman neschimbate.
         members=[clicked_mem]
         total=clicked_mem["old_qty"]
         clicked_missing=clicked_mem["id"] not in line_jbyref
@@ -1362,7 +1422,6 @@ def execute(context):
             if clicked["id"]!=context.getLong("CXSTOCURIID") or text(clicked["mbo"].getRowStamp())!=text(context.getRowStamp()):
                 fail("Rand apasat schimbat; refresh necesar")
         elif context.getLong("CXSTOCURIID") not in set(r["id"] for r in line_targets):
-            # PAS 3 pe consum fara jurnal: randul ecran trebuie sa fie tot din linie.
             pass
         template=clicked_mem["mbo"]
         template_j=targets[0] if targets else (line_targets[0] if line_targets else None)
@@ -1393,11 +1452,9 @@ def execute(context):
                 m.setValue(f,long(value),FLAGS)
         def receipt_label(receipt):
             return "INITIAL" if receipt is None else text(receipt)
-        # PAS 3: MATUSETRANS de split (sau cel apasat) exista, CXSTOCURI lipseste
         if missing_journal:
             if template_j is None:
                 fail("Nu exista sablon CXSTOCURI pe linie pentru PAS 3")
-            # Info pe set MXServer (nu pe DataBean): altfel PAS 2/3 ramane pe ecran.
             parent_cxid=context.getLong("CXSTOCURIID")
             parent_ms,parent_rows=query("CXSTOCURI","CXSTOCURIID=%s" % parent_cxid,2)
             if len(parent_rows)!=1:
@@ -1428,11 +1485,11 @@ def execute(context):
                     receipt=mem["mbo"].getLong("MATRECTRANSID")
                     bal=layer_balance(query,receipt,mem["date"],mem["id"],-mem["old_qty"],[])
                     put_number(jm,"CXCURBAL",bal)
-                set_info(jm,"CXFIFOFIX PAS 3/3: CXSTOCURI creat pentru MATUSETRANS %s. Salveaza; ruleaza Check FIFO." % mem["id"])
+                set_info(jm,"PAS3 CXSTOCURI MATUSETRANS %s. Salveaza; Check FIFO." % mem["id"])
                 made.append(mem["id"])
                 service.log_info("CXFIFOFIXISSUE PAS3 create CXSTOCURI for MATUSETRANS %s qty=%s cost=%s" % (
                     mem["id"],fmt(-mem["old_qty"]),fmt(mem["old_cost"])))
-            info=set_info(info_row,"CXFIFOFIX PAS 3/3: jurnal completat pentru MATUSETRANS %s. Salveaza; ruleaza Check FIFO." % ",".join(text(i) for i in made))
+            info=set_info(info_row,"PAS3 jurnal MATUSETRANS %s. Salveaza; Check FIFO." % ",".join(text(i) for i in made))
             plans.append((info_row,"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
             operation="PAS3 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
@@ -1468,8 +1525,7 @@ def execute(context):
         layers=replay(prior,issue_of_returns(prior,query))
         allocation,short=consume(layers,total)
         if short>EPS:
-            fail("Stoc anterior insuficient; receptiile viitoare nu autorizeaza update")
-        # Preturi FIFO diferite pe acelasi consum => split obligatoriu (fara medie ponderata).
+            fail("Stoc anterior insuficient")
         alloc_costs=[]
         for a in allocation:
             if not any(not different(a["cost"],c,PRICE_EPS) for c in alloc_costs):
@@ -1490,12 +1546,10 @@ def execute(context):
         new_total=sum((a["value"] for a in mapped),ZERO)+sum((c["value"] for c in creates),ZERO)
         if different(sum((a["qty"] for a in mapped),ZERO)+sum((c["qty"] for c in creates),ZERO),total):
             fail("Suma cantitatilor pe straturi difera de consumul original")
-        # Ocupate pe toata linia + split-ul consumului apasat.
         used_splits=set(mt_by_split.keys())
         for mem in members:
             if not mem["mbo"].isNull("INVUSELINESPLITID"):
                 used_splits.add(mem["mbo"].getLong("INVUSELINESPLITID"))
-        # Cele mai noi libere primele (PAS 1 tocmai create).
         free_splits=sorted([m for m in splitrows if m.getLong("INVUSELINESPLITID") not in used_splits],
                            key=lambda m: m.getLong("INVUSELINESPLITID"),reverse=True)
         if creates:
@@ -1524,7 +1578,6 @@ def execute(context):
             c["source_balance"]=running
             if running is not None:
                 running-=c["qty"]
-        # PAS 1: doar INVUSELINESPLIT noi/ajustate (pentru consumul apasat)
         if creates and any(c.get("new_split") for c in creates):
             for a in mapped:
                 m=a["member"]["mbo"]
@@ -1557,7 +1610,7 @@ def execute(context):
                 created_split_ids.append(sm.getLong("INVUSELINESPLITID"))
                 service.log_info("CXFIFOFIXISSUE PAS1 create split=%s qty=%s cost=%s uid=%s" % (
                     sm.getLong("INVUSELINESPLITID"),fmt(c["qty"]),fmt(c["cost"]),sm.getString("CONTENTUID")))
-            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 1/3: INVUSELINESPLIT actualizat (%s noi). Salveaza; reapeasa butonul 2." % len(created_split_ids))
+            info=set_info(clicked["mbo"],"PAS1 INVUSELINESPLIT +%s. Salveaza; reapeasa." % len(created_split_ids))
             plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
             operation="PAS1 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
@@ -1586,7 +1639,6 @@ def execute(context):
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
             return message
-        # PAS 2: creeaza MATUSETRANS suplimentare doar pentru straturile consumului apasat
         if creates:
             for a in mapped:
                 m=a["member"]["mbo"]
@@ -1598,8 +1650,6 @@ def execute(context):
                     plan_number(m,f,a["value"])
                 if not m.isNull("LINECOST2"):
                     plan_number(m,"LINECOST2",a["value"])
-                if a["source_balance"] is not None:
-                    plan_number(m,"CURBAL",a["source_balance"])
                 plan_receipt(m,a["receipt"])
                 if not m.isNull("INVUSELINESPLITID") and m.getLong("INVUSELINESPLITID") in splits:
                     sm=splits[m.getLong("INVUSELINESPLITID")]
@@ -1620,7 +1670,6 @@ def execute(context):
             for idx,c in enumerate(creates):
                 sid=long(c["split_id"]) if c.get("split_id") is not None else None
                 prior_mt=mt_by_split.get(sid) if sid is not None else None
-                # Split deja legat de alt MATUSETRANS (ex. fratele 240360): creeaza split nou.
                 if prior_mt or sid is None or c.get("split_mbo") is None:
                     if template_split is None:
                         fail("PAS 2: split sablon lipsa pentru creare INVUSELINESPLIT")
@@ -1659,8 +1708,6 @@ def execute(context):
                     put_number(mm,f,c["value"])
                 if not template.isNull("LINECOST2"):
                     put_number(mm,"LINECOST2",c["value"])
-                if c["source_balance"] is not None:
-                    put_number(mm,"CURBAL",c["source_balance"])
                 if c["receipt"] is None:
                     mm.setValueNull("MATRECTRANSID",FLAGS)
                 else:
@@ -1681,7 +1728,7 @@ def execute(context):
                 service.log_info("CXFIFOFIXISSUE PAS2 create MATUSETRANS=%s split=%s qty=%s cost=%s actualdate=+%smin" % (
                     c["new_id"],c["split_id"],fmt(-c["qty"]),fmt(c["cost"]),idx+1))
             ids=",".join(text(c["new_id"]) for c in created_rows)
-            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 2/3: MATUSETRANS noi %s (ACTUALDATE +N min). Salveaza; reapeasa butonul 2 pentru PAS 3." % ids)
+            info=set_info(clicked["mbo"],"PAS2 MATUSETRANS %s (+N min). Salveaza; reapeasa PAS3." % ids)
             plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
             operation="PAS2 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
@@ -1736,11 +1783,11 @@ def execute(context):
                         rid=src.getLong("MATRECTRANSID")
                         bal=layer_balance(query,rid,datekey(src.getDate("ACTUALDATE")),src.getLong("MATUSETRANSID"),-qty,[])
                         put_number(jm,"CXCURBAL",bal)
-                    set_info(jm,"CXFIFOFIX PAS 3/3: CXSTOCURI pentru MATUSETRANS %s. Salveaza; ruleaza Check FIFO." % src.getLong("MATUSETRANSID"))
+                    set_info(jm,"PAS3 CXSTOCURI MATUSETRANS %s. Salveaza; Check FIFO." % src.getLong("MATUSETRANSID"))
                     cx_ids.append(src.getLong("MATUSETRANSID"))
                     service.log_info("CXFIFOFIXISSUE PAS3 dupa PAS2 CXSTOCURI MATUSETRANS %s qty=%s cost=%s" % (
                         src.getLong("MATUSETRANSID"),fmt(-qty),fmt(cost)))
-                set_info(tmpl,"CXFIFOFIX PAS 3/3: jurnal completat pentru MATUSETRANS %s. Salveaza; ruleaza Check FIFO." % ",".join(text(i) for i in cx_ids))
+                set_info(tmpl,"PAS3 jurnal MATUSETRANS %s. Salveaza; Check FIFO." % ",".join(text(i) for i in cx_ids))
                 tx2=MXServer.getMXServer().createMXTransaction()
                 new_cx.setFlag(MboConstants.NOSAVE,False)
                 new_cx.setMXTransaction(tx2)
@@ -1755,9 +1802,9 @@ def execute(context):
                 service.log_info("CXFIFOFIXISSUE PAS3 dupa PAS2 esuat: "+cx_err)
             message="PAS 2/3 SALVAT: MATUSETRANS noi %s.\nACTUALDATE = original + N minute." % ids
             if cx_ids and not cx_err:
-                message+="\nPAS 3/3 SALVAT: CXSTOCURI pentru MATUSETRANS %s.\nSalveaza pe ecran; ruleaza Check FIFO." % ",".join(text(i) for i in cx_ids)
+                message+="\nPAS3 SALVAT CXSTOCURI MATUSETRANS %s. Salveaza; Check FIFO." % ",".join(text(i) for i in cx_ids)
             else:
-                message+="\nCXSTOCURI nu a fost scris (%s).\nSalveaza; reapeasa butonul pe acelasi rand pentru PAS 3." % (cx_err or "necunoscut")
+                message+="\nCXSTOCURI nescris (%s). Salveaza; reapeasa PAS3." % (cx_err or "necunoscut")
             for c in created_rows:
                 message+="\nMATUSETRANS %s: %s la %s; receptie %s; split %s." % (
                     c["new_id"],fmt(-c["qty"]),fmt(c["cost"]),receipt_label(c["receipt"]),c["split_id"])
@@ -1768,7 +1815,6 @@ def execute(context):
             except Exception:
                 message+="\nRefresh nereusit; redeschide articolul."
             return message
-        # cale normala: un strat FIFO pe consumul apasat (+ cascada ISSUE contigue)
         changes={}
         for a in mapped:
             jr=jbyref[a["member"]["id"]]
@@ -1790,10 +1836,7 @@ def execute(context):
                 plan_number(m,f,a["value"])
             if not m.isNull("LINECOST2"):
                 plan_number(m,"LINECOST2",a["value"])
-            if a["source_balance"] is not None:
-                plan_number(m,"CURBAL",a["source_balance"])
             plan_receipt(m,a["receipt"])
-            # fara creates nu atingem INVUSELINESPLIT (evita BMXAA8229W)
         for c in cascade_planned:
             m=c["mbo"]
             for f in ("UNITCOST","ACTUALCOST","CURRENCYUNITCOST"):
@@ -1871,7 +1914,7 @@ def execute(context):
         if cascade_stop:
             message+="\nCascada oprita: %s." % cascade_stop
         message+="\nReturul se corecteaza cand selectezi randul lui."
-        message+="\nNu apasa Save pe ecran (deja comis in script; Save pe ROWSTAMP vechi = BMXAA8229W)."
+        message+="\nNu Save pe ecran (ROWSTAMP vechi=BMXAA8229W)."
         try:
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+operation+" "+message.replace("\n"," | "))
         except Exception:
@@ -1886,7 +1929,7 @@ def execute(context):
         except Exception as exc:
             message+="\nControl post-commit indisponibil: "+text(exc)
         message+="\nINVUSE si INVUSELINE nu sunt reconciliate de acest handler."
-        message+="\nRuleaza Check FIFO. Reconcilierea INVLIFOFIFOCOST ramane separata."
+        message+="\nRuleaza Check FIFO."
     except Exception as exc:
         if tx is not None and not committed:
             try:
