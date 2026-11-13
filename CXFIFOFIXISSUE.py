@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.43-RECEIPT-EXIT-REPLAY
+# VERSIUNE: 3.44-NEG-RECEIPT-EXIT
 # RECEIPT/SHIPRECEIPT cu qty<0 = iesire FIFO in replay (ca in Check FIFO) si in handler.
 # MATUSETRANS ISSUE multi-pret: PAS 1/2/3. MATRECTRANS RECEIPT negativ multi-pret: split.
 # SHIPTRANSFER/TRANSFER iesire: un singur pret. Fara CURBAL pe MATUSETRANS.
@@ -79,7 +79,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.43-RECEIPT-EXIT-REPLAY"
+VERSION="3.44-NEG-RECEIPT-EXIT"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -319,7 +319,7 @@ def replay(prior,links=None):
     for r in sorted(prior,key=order):
         if not r["date"] or r["cost"]<ZERO:
             fail("Data lipsa/pret negativ in istoricul anterior")
-        kind,qty,cost=r["kind"],r["qty"],r["cost"]
+        kind,qty,cost=text(r["kind"]).strip(),r["qty"],r["cost"]
         if kind=="INITIAL":
             if movement or cost in opening or r["balance"] is None or r["balance"]<ZERO:
                 fail("INITIAL ambiguu")
@@ -389,9 +389,9 @@ def replay(prior,links=None):
                 if r["balance"] is not None and r["balance"]>=ZERO:
                     recovering=False
         else:
-            # qty<0: ISSUE/TRANSFER iesire SAU RECEIPT/SHIPRECEIPT negativa (comanda).
-            if kind not in EXITS and kind not in ENTRIES:
-                fail("Iesire/retur anterior netratat: "+kind)
+            # qty<0. RECEIPT/SHIPRECEIPT negativa = iesire FIFO (nu tip necunoscut).
+            if kind not in ("ISSUE","SHIPTRANSFER","TRANSFER","RECEIPT","SHIPRECEIPT"):
+                fail("Iesire anterioara netratata %s tip=%s" % (VERSION,kind))
             if not initial and not started:
                 recovering=True
                 continue
@@ -802,6 +802,14 @@ def check_matrectrans_exit_cost():
     ],ExactNumber("-1"))
     if different(cost,ExactNumber("5.590"),PRICE_EPS):
         raise ValueError("self-check: RECEIPT negativ pe INITIAL")
+    # ISSUE dupa RECEIPT negativ: RECEIPT consuma INITIAL@70, ISSUE ia SHIPRECEIPT@58.
+    cost,allocation=single_fifo_cost([
+        row(1,"2025-12-01 00:00:00.000000000",1,"INITIAL","1000","70","1000","CXSTOCURI"),
+        row(2,"2026-01-21 00:00:00.000000000",2,"SHIPRECEIPT","4000","58","4000"),
+        row(3,"2026-06-24 00:01:00.000000000",3,"RECEIPT","-1000","70","0"),
+    ],ExactNumber("-1"))
+    if different(cost,ExactNumber("58"),PRICE_EPS) or not allocation or allocation[0].get("ref")!=2:
+        raise ValueError("self-check: ISSUE dupa RECEIPT negativ trebuie 58")
     layers=replay([
         row(1,"2026-01-01 00:00:00.000000000",1,"INITIAL","100","2.630","100","CXSTOCURI"),
         row(2,"2026-01-01 00:00:00.000000000",2,"INITIAL","1000","2.960","1000","CXSTOCURI"),
