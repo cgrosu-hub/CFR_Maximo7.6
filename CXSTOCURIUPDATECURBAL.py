@@ -1,10 +1,18 @@
-# -*- coding: utf-8 -*-
 # SCRIPT: CXSTOCURIUPDATECURBAL
-# AUTORI ORIGINALI: Fernando Prajitura / Cristian Grosu
-# REVIZIE: 2026.11.13-RECEIPT-LEDGER
-# Cron task aliniat la cele trei scripturi FIFO: sold pe grupa, pret si receptie.
-# Pastreaza setarile cfr.inventory.updateAllCxStocuri / numHistoryDaysToUpdate.
-# Provenienta ambigua: partitia este sarita, fara cumulare artificiala pe pret.
+# AUTOR: Fernando Prajitura; aliniat la ledger-ul FIFO de Cristian Grosu
+# VERSIUNE: 2026.11.04-FIFO-LEDGER
+# Completeaza CXCURBAL pe partitiile care inca il au null.
+# Partitia e cea din CXUPDFIFOROW / CXFIFOFIXISSUE:
+#   ITEMNUM, SITEID, LOCATION, COMMODITYGROUP, UNITCOST
+# Ordinea e cea din ledger: CXDOCUMENTDATE, CXREFID (null = 0), CXSTOCURIID.
+# INITIAL, daca exista, e prima inregistrare din partitie si isi pastreaza soldul.
+# Celelalte randuri: sold = sold anterior + CXQTY.
+# Nu rescrie un sold care coincide deja. Nu atinge o partitie ambigua.
+#
+# cfr.inventory.updateAllCxStocuri = true  -> toate partitiile
+# altfel -> doar partitiile cu cel putin un CXCURBAL null
+# cfr.inventory.numHistoryDaysToUpdate = N -> in modul null, doar documentele
+# din ultimele N zile pornesc recalculul (partitia intreaga e recalculata)
 
 from java.math import BigDecimal
 from java.text import NumberFormat, ParsePosition, SimpleDateFormat
@@ -24,115 +32,56 @@ class Skip(Exception):
     pass
 
 
+def self_check():
+    def row(ident, date, ref, kind, qty, balance):
+        return {
+            "id": ident, "date": date, "ref": ref, "kind": kind,
+            "qty": None if qty is None else BigDecimal(qty),
+            "balance": None if balance is None else BigDecimal(balance),
+        }
 
-# BEGIN FIFO RECEIPT KERNEL 1.0 -- identical in all three scripts.
-def cx_key_number(value):
-    if value is None:
-        raise ValueError("Numar lipsa in cheia de strat")
-    v = value.value if hasattr(value, "value") else value
-    return str(v.stripTrailingZeros().toPlainString())
+    def expect(got, ident, text):
+        if got[ident].compareTo(BigDecimal(text)) != 0:
+            raise ValueError("self-check id %s: %s != %s" % (ident, got[ident].toPlainString(), text))
 
-def cx_receipt_balances(rows, zero):
-    """Post-movement balances by group, price and receipt; never by inventory total.
-    Source-less legacy movements are inferred only with one unambiguous bucket.
-    Returns: (id -> balance, id -> source key, id -> diagnostic).
-    Input dictionaries must be sorted-compatible (date/ref/id) and scope-local.
-    """
-    books, keys, result, errors, last_issue = {}, {}, {}, {}, {}
-    def add(a, b):
-        return a.add(b) if hasattr(a, "add") else a+b
-    def negative(a):
-        return a.signum() < 0 if hasattr(a, "signum") else a < zero
-    def positive(a):
-        return a.signum() > 0 if hasattr(a, "signum") else a > zero
-    for r in sorted(rows, key=lambda x:(x["date"], x.get("ref") or 0, x["id"])):
-        ident, kind, cost, qty = r["id"], r["kind"], r.get("cost"), r.get("qty")
-        if not r.get("date") or cost is None or negative(cost):
-            raise ValueError("Data/pret neconform CXSTOCURIID=%s" % ident)
-        group, price = r.get("group") or "", cx_key_number(cost)
-        receipt = r.get("receipt")
-        if kind == "INITIAL":
-            key = (group, price, "INITIAL", ident)
-            if r.get("balance") is None:
-                raise ValueError("INITIAL fara sold CXSTOCURIID=%s" % ident)
-            books[key] = r["balance"]
-        else:
-            if qty is None:
-                raise ValueError("Cantitate lipsa CXSTOCURIID=%s" % ident)
-            if receipt is not None:
-                key = (group, price, "MATRECTRANS", receipt)
-            elif kind == "RETURN" and r.get("issue_id") in last_issue:
-                origin = last_issue[r["issue_id"]]
-                key = (group, price, origin[2], origin[3])
-            else:
-                candidates = [k for k in books if k[:2] == (group, price) and positive(books[k])]
-                if not candidates:
-                    candidates = [k for k in books if k[:2] == (group, price)]
-                if len(candidates) == 1:
-                    key = candidates[0]
-                else:
-                    key = (group, price, "UNKNOWN", 0)
-                    errors[ident] = "Provenienta pe receptie lipsa/ambigua; nu cumula straturile la acelasi pret"
-            books[key] = add(books.get(key, zero), qty)
-        keys[ident], result[ident] = key, books[key]
-        if r.get("refmbo") == "MATUSETRANS" and kind == "ISSUE":
-            last_issue[r.get("ref")] = key
-    return result, keys, errors
-
-def cx_enrich_receipts(rows, query):
-    """Batch-load source links, checking that the source belongs to the journal scope."""
-    for table, pk in (("MATUSETRANS", "MATUSETRANSID"), ("MATRECTRANS", "MATRECTRANSID")):
-        wanted = sorted(set(r["ref"] for r in rows if r.get("refmbo") == table and r.get("ref") is not None))
-        found = {}
-        for start in range(0, len(wanted), 300):
-            unused, sources = query(table, "%s IN (%s)" % (pk, ",".join(str(i) for i in wanted[start:start+300])))
-            for m in sources:
-                found[m.getLong(pk)] = m
-        for r in rows:
-            if r.get("refmbo") != table or r.get("ref") is None:
-                continue
-            m = found.get(r["ref"])
-            if m is None:
-                raise ValueError("Sursa %s/%s lipsa" % (table, r["ref"]))
-            if r.get("item") is not None and m.getString("ITEMNUM") != r["item"]:
-                raise ValueError("Articol sursa/jurnal diferit")
-            if table == "MATUSETRANS":
-                if r.get("site") is not None and (m.getString("SITEID"), m.getString("STORELOC")) != (r["site"], r["location"]):
-                    raise ValueError("Site/gestiune sursa/jurnal diferite")
-                r["receipt"] = None if m.isNull("MATRECTRANSID") else m.getLong("MATRECTRANSID")
-                r["issue_id"] = None if m.isNull("ISSUEID") else m.getLong("ISSUEID")
-            elif r.get("qty") is not None:
-                qty = r["qty"]
-                inbound = qty.signum() > 0 if hasattr(qty, "signum") else qty > ZERO
-                if inbound and r["kind"] in ("RECEIPT", "SHIPRECEIPT", "TRANSFER"):
-                    r["receipt"] = r["ref"]
-                elif not m.isNull("RECEIPTREF"):
-                    r["receipt"] = m.getLong("RECEIPTREF")
-    return rows
-
-def cx_rollback(tx):
-    if tx is not None:
+    def must_fail(rows):
         try:
-            tx.rollback()
-        except Exception:
-            pass
+            running_balances(rows)
+        except ValueError:
+            return
+        raise ValueError("self-check trebuia sa respinga partida")
 
-def cx_verify_plans(plans, read_number):
-    for m, field, kind, value, old in plans:
-        valid = True
-        if kind == "NUMBER":
-            valid = read_number(m, field) == value
-        elif kind == "ID":
-            valid = not m.isNull(field) and m.getLong(field) == long(value)
-        elif kind == "NULL":
-            valid = m.isNull(field)
-        elif kind == "TEXT":
-            valid = m.getString(field) == value
-        if not valid:
-            raise ValueError("Logica save a suprascris %s.%s; rollback" % (m.getName(), field))
-# END FIFO RECEIPT KERNEL
+    # CXREFID null se sorteaza ca 0, deci receptia e inaintea ISSUE la aceeasi data
+    got = running_balances([
+        row(1, "2026-02-09 00:00:00.000000000", None, "INITIAL", None, "10"),
+        row(2, "2026-02-09 01:00:00.000000000", 5, "ISSUE", "-2", None),
+        row(3, "2026-02-09 01:00:00.000000000", None, "RECEIPT", "4", None),
+    ])
+    expect(got, 1, "10")
+    expect(got, 3, "14")
+    expect(got, 2, "12")
 
+    got = running_balances([
+        row(1, "2026-03-01 00:00:00.000000000", 1, "RECEIPT", "8.52", None),
+        row(2, "2026-03-02 00:00:00.000000000", 2, "ISSUE", "-8.52", None),
+    ])
+    expect(got, 1, "8.52")
+    expect(got, 2, "0")
 
+    must_fail([
+        row(1, "2026-03-01 00:00:00.000000000", 1, "RECEIPT", "1", None),
+        row(2, "2026-03-02 00:00:00.000000000", None, "INITIAL", None, "5"),
+    ])
+    must_fail([
+        row(1, "2026-01-01 00:00:00.000000000", None, "INITIAL", None, "1"),
+        row(2, "2026-01-02 00:00:00.000000000", None, "INITIAL", None, "2"),
+    ])
+    must_fail([
+        row(1, "2026-01-01 00:00:00.000000000", 1, "ISSUE", None, None),
+    ])
+    must_fail([
+        row(1, "2026-01-01 00:00:00.000000000", None, "INITIAL", None, None),
+    ])
 
 
 def running_balances(rows):
@@ -221,10 +170,6 @@ def snapshot(mbo):
         "date": None if when is None else datekey(when),
         "ref": None if mbo.isNull("CXREFID") else mbo.getLong("CXREFID"),
         "kind": mbo.getString("CXREF"),
-        "refmbo": mbo.getString("CXREFMBO"),
-        "cost": read_number(mbo,"UNITCOST"),
-        "group": mbo.getString("COMMODITYGROUP"),
-        "item": mbo.getString("ITEMNUM"),"site":mbo.getString("SITEID"),"location":mbo.getString("LOCATION"),
         "qty": read_number(mbo, "CXQTY"),
         "balance": read_number(mbo, "CXCURBAL"),
         "mbo": mbo,
@@ -275,29 +220,7 @@ def process_partition(user, seed):
         rows = read_rows(ms)
         if not rows:
             raise Skip("partitia nu a fost regasita")
-        sources=[]
-        def query(name,where):
-            source_set=MXServer.getMXServer().getMboSet(name,user)
-            sources.append(source_set)
-            source_set.setFlag(MboConstants.NOSAVE,True)
-            source_set.setWhere(where)
-            source_set.reset()
-            found=[]
-            source=source_set.moveFirst()
-            while source is not None:
-                found.append(source)
-                if len(found)>MAX_ROWS:
-                    raise Skip("Limita de surse depasita")
-                source=source_set.moveNext()
-            return source_set,found
-        try:
-            cx_enrich_receipts(rows,query)
-            expected,keys,errors=cx_receipt_balances(rows,ZERO)
-            if errors:
-                raise Skip("Provenienta pe receptie lipsa/ambigua; corecteaza intai sursele")
-        finally:
-            for source_set in reversed(sources):
-                close_set(source_set)
+        expected = running_balances(rows)
         changed = 0
         for row in rows:
             if row["kind"] == "INITIAL":
@@ -390,6 +313,7 @@ def label_of(seed):
 
 
 def main():
+    self_check()
     user = globals().get("runAsUserInfo")
     if user is None:
         service.log_error("CXSTOCURIUPDATECURBAL: runAsUserInfo lipsa")
