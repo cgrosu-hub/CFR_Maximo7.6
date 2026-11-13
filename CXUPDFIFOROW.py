@@ -1,12 +1,11 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.12-CXSTOCURI-ONLY-BAL
+# VERSIUNE: 3.13-RETURN-COVER
 # Mutare data: soldul se scrie DOAR pe CXSTOCURI (CXDOCUMENTDATE + CXCURBAL).
-# Pe MATUSETRANS/MATRECTRANS se sincronizeaza doar ACTUALDATE prin SQL UPDATE
-# (fara MboSet.save) — save() pe sursa declansa BMXAA3496E (validare sold cos /
-# INVBALANCES), desi nu scriam CURBAL pe obiectele standard.
-# Nu se scrie CURBAL/OUTSIDE/INVBALANCES pe obiecte Maximo standard.
-# AFTER_RECEIPT: pe acelasi UNITCOST. COMMODITYGROUP nu e cheie FIFO.
+# ACTUALDATE pe MATUSETRANS/MATRECTRANS: SQL UPDATE (fara MboSet.save / BMXAA3496E).
+# AFTER_RECEIPT (acelasi UNITCOST): acoperire din RECEIPT/SHIPRECEIPT/TRANSFER
+# sau RETURN/SHIPRETURN ulterioare in jurnal (ex. ISSUE -15 apoi RETURN +15).
+# COMMODITYGROUP nu e cheie FIFO.
 
 from java.math import BigDecimal
 from java.sql import Timestamp
@@ -23,8 +22,8 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
-VERSION = "3.12-CXSTOCURI-ONLY-BAL"
-COVERING_RECEIPT = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
+VERSION = "3.13-RETURN-COVER"
+COVERING_RECEIPT = ("RECEIPT", "SHIPRECEIPT", "TRANSFER", "RETURN", "SHIPRETURN")
 DATE_FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 SUPPORTED = {
     "MATRECTRANS": ("MATRECTRANSID", "ACTUALDATE", ("RECEIPT", "TRANSFER", "SHIPTRANSFER", "SHIPRECEIPT", "RETURN", "VOIDRECEIPT", "SHIPRETURN", "SHIPCANCEL")),
@@ -152,7 +151,8 @@ def journal_key(r):
             r.getUniqueIDValue())
 
 def first_covering_inbound(all_rows, target, after_ms, needed):
-    # Prima receptie ulterioara pe acelasi pret, cu cantitate care acopera consumul.
+    # Prima intrare ulterioara pe acelasi pret care acopera |iesire|:
+    # RECEIPT/SHIPRECEIPT/TRANSFER sau RETURN/SHIPRETURN (MATUSETRANS/MATRECTRANS).
     t_key = journal_key(target)
     later = []
     for r in all_rows:
@@ -479,8 +479,8 @@ def execute(context):
                     new_ms = issue_ms + SHIFT_MS
                     date_mode = "AFTER_ISSUE"
                     daymax_blocked = False
-            # Iesire cu stoc pe pret insuficient -> dupa prima receptie care acopera |qty|.
-            # Daca nu exista acoperire: pastreaza DAYMAX; soldul negativ e acceptat (CXFIFOFIX ulterior).
+            # Iesire cu stoc pe pret insuficient -> dupa prima intrare care acopera |qty|
+            # (receptie/transfer SAU RETURN/SHIPRETURN). Fara acoperire: DAYMAX.
             if date_mode == "DAYMAX" and after_receipt_exit(kind, table, number(target, "CXQTY")):
                 consumed = number(target, "CXQTY").abs()
                 inbound = total_inbound_stock(all_rows, target)
@@ -514,7 +514,7 @@ def execute(context):
             after, changed = plan_balances(all_rows, moved, new_ms, require_before)
             formatter = SimpleDateFormat("dd.MM.yyyy HH:mm:ss")
             formatter.setTimeZone(timezone)
-            mode_txt = {"AFTER_ISSUE": "ISSUE+1min", "AFTER_RECEIPT": "receptie+1min"}.get(date_mode, "zi+1min")
+            mode_txt = {"AFTER_ISSUE": "ISSUE+1min", "AFTER_RECEIPT": "intrare+1min"}.get(date_mode, "zi+1min")
             message = "%s/%s RefID=%s (%s): %s -> %s; jurnal date=%s; solduri=%s; receptii legate=%s; sursa %s.%s" % (
                 table, kind, refid, mode_txt, formatter.format(Date(old_ms)), formatter.format(Date(new_ms)),
                 len(moved), len(changed), len(child_sources), table, date_field)
