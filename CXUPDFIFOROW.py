@@ -1,12 +1,12 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.7-SAMESTAMP-RECEIPT
+# VERSIUNE: 3.8-TRANSFER-AFTER-RECEIPT
 # Implicit: muta la maximul orelor din aceeasi zi (acelasi site/gestiune) + 1 minut.
 # RETURN inainte de ISSUE (ISSUEID): data = ISSUE + 1 minut (MATUSETRANS+CXSTOCURI).
-# ISSUE/SHIPTRANSFER cu stoc anterior insuficient: muta dupa prima receptie ulterioara
-# in jurnal (RECEIPT/SHIPRECEIPT/TRANSFER) cu CXQTY >= |qty| (+1 minut). Include si
-# receptia de pe aceeasi data/ora, dar dupa ieșire (CXREFID/CXSTOCURIID) — ex. SHIPTRANSFER
-# si RECEIPT ambele 23.06 00:00.
+# ISSUE/SHIPTRANSFER/TRANSFER(iesire) cu stoc anterior insuficient: muta dupa prima
+# receptie ulterioara in jurnal (RECEIPT/SHIPRECEIPT/TRANSFER intrare) cu CXQTY >= |qty|
+# (+1 minut). Include si receptia de pe aceeasi data/ora, dar dupa iesire
+# (CXREFID/CXSTOCURIID).
 # SHIPTRANSFER: daca receptia legata (RECEIPTREF) ar ramane inaintea noii date,
 # o muta si pe ea (MATRECTRANS+CXSTOCURI) la aceeasi data — nu blocheaza.
 # ACTUALDATE/CXDOCUMENTDATE: NOACCESSCHECK+NOVALIDATION (evita BMXAA1198E pe perioada
@@ -27,7 +27,7 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
-VERSION = "3.7-SAMESTAMP-RECEIPT"
+VERSION = "3.8-TRANSFER-AFTER-RECEIPT"
 COVERING_RECEIPT = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
 DATE_FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 SUPPORTED = {
@@ -35,9 +35,19 @@ SUPPORTED = {
     "MATUSETRANS": ("MATUSETRANSID", "ACTUALDATE", ("ISSUE", "RETURN"))
 }
 
-def after_receipt_exit(kind, table):
-    return ((kind == "ISSUE" and table == "MATUSETRANS") or
-            (kind == "SHIPTRANSFER" and table == "MATRECTRANS"))
+def after_receipt_exit(kind, table, qty=None):
+    # TRANSFER pe MATRECTRANS poate fi iesire (qty<0) sau intrare (qty>0).
+    if kind == "ISSUE" and table == "MATUSETRANS":
+        return True
+    if table != "MATRECTRANS":
+        return False
+    if kind == "SHIPTRANSFER":
+        return True
+    if kind == "TRANSFER":
+        if qty is None:
+            return True
+        return qty.compareTo(ZERO) < 0
+    return False
 
 def fail(message):
     raise ValueError(message)
@@ -445,8 +455,8 @@ def execute(context):
                     new_ms = issue_ms + SHIFT_MS
                     date_mode = "AFTER_ISSUE"
                     daymax_blocked = False
-            # ISSUE/SHIPTRANSFER: stoc anterior insuficient -> dupa prima receptie care acopera |qty|.
-            if date_mode == "DAYMAX" and after_receipt_exit(kind, table):
+            # ISSUE/SHIPTRANSFER/TRANSFER(iesire): stoc insuficient -> dupa prima receptie care acopera |qty|.
+            if date_mode == "DAYMAX" and after_receipt_exit(kind, table, number(target, "CXQTY")):
                 consumed = number(target, "CXQTY").abs()
                 inbound = total_inbound_stock(all_rows, target)
                 prior = stock_before(all_rows, target)
