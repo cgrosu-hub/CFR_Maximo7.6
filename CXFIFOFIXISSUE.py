@@ -1,6 +1,8 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.39-SPLIT-CX
+# VERSIUNE: 3.40-INFO-SAVE
+# Info FIFO la split: Salveaza (fara text Fara Save). Dupa PAS 3 actualizeaza
+# Info pe randul apasat si pe CXSTOCURI-urile noi (scriere pe set MXServer).
 # Dupa commit-ul MATUSETRANS (PAS 2), o tranzactie separata scrie CXSTOCURI
 # pentru ID-urile noi. La o apasare urmatoare, orice MATUSETRANS de split de pe
 # linie fara jurnal primeste CXSTOCURI (nu doar randul apasat).
@@ -90,7 +92,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.39-SPLIT-CX"
+VERSION="3.40-INFO-SAVE"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -1397,13 +1399,22 @@ def execute(context):
         if missing_journal:
             if template_j is None:
                 fail("Nu exista sablon CXSTOCURI pe linie pentru PAS 3")
-            # Scrie info pe sablonul din setul MXServer, nu pe mbo-ul din DataBean (evita BMXAA8229W).
-            info_row=template_j["mbo"]
+            # Info pe set MXServer (nu pe DataBean): altfel PAS 2/3 ramane pe ecran.
+            parent_cxid=context.getLong("CXSTOCURIID")
+            parent_ms,parent_rows=query("CXSTOCURI","CXSTOCURIID=%s" % parent_cxid,2)
+            if len(parent_rows)!=1:
+                fail("Rand CXSTOCURI apasat lipsa la PAS 3")
+            info_row=parent_rows[0]
+            new_cx=MXServer.getMXServer().getMboSet("CXSTOCURI",user)
+            opened.append(new_cx)
+            new_cx.setWhere("1=2")
+            new_cx.reset()
+            made=[]
             for mem in missing_journal:
-                jm=cxset.addAtEnd(FLAGS)
+                jm=new_cx.addAtEnd(FLAGS)
                 for f in ("ITEMNUM","LOCATION","ORGID","SITEID","COMMODITYGROUP","CURRENCYCODE",
                           "DESCRIPTION","GLCREDITACCT","GLDEBITACCT","ISSUETO","ROTASSETNUM"):
-                    copy_value(template_j["mbo"],jm,f)
+                    copy_value(info_row,jm,f)
                 put_number(jm,"CXQTY",-mem["old_qty"])
                 put_number(jm,"UNITCOST",mem["old_cost"])
                 jm.setValue("CXDOCUMENTDATE",mem["mbo"].getDate("ACTUALDATE"),FLAGS)
@@ -1419,18 +1430,22 @@ def execute(context):
                     receipt=mem["mbo"].getLong("MATRECTRANSID")
                     bal=layer_balance(query,receipt,mem["date"],mem["id"],-mem["old_qty"],[])
                     put_number(jm,"CXCURBAL",bal)
-                set_info(jm,"CXFIFOFIX PAS 3/3: CXSTOCURI creat pentru MATUSETRANS %s. Ruleaza Check FIFO." % mem["id"])
+                set_info(jm,"CXFIFOFIX PAS 3/3: CXSTOCURI creat pentru MATUSETRANS %s. Salveaza; ruleaza Check FIFO." % mem["id"])
+                made.append(mem["id"])
                 service.log_info("CXFIFOFIXISSUE PAS3 create CXSTOCURI for MATUSETRANS %s qty=%s cost=%s" % (
                     mem["id"],fmt(-mem["old_qty"]),fmt(mem["old_cost"])))
-            info=set_info(info_row,"CXFIFOFIX PAS 3/3: jurnal completat pentru MATUSETRANS %s. Ruleaza Check FIFO." % clicked_ref)
+            info=set_info(info_row,"CXFIFOFIX PAS 3/3: jurnal completat pentru MATUSETRANS %s. Salveaza; ruleaza Check FIFO." % ",".join(text(i) for i in made))
             plans.append((info_row,"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
             operation="PAS3 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
             service.log_info("CXFIFOFIXISSUE PLAN "+VERSION+" "+operation)
             tx=MXServer.getMXServer().createMXTransaction()
-            cxset.setFlag(MboConstants.NOSAVE,False)
-            cxset.setMXTransaction(tx)
-            tx.add(cxset)
+            new_cx.setFlag(MboConstants.NOSAVE,False)
+            new_cx.setMXTransaction(tx)
+            tx.add(new_cx)
+            parent_ms.setFlag(MboConstants.NOSAVE,False)
+            parent_ms.setMXTransaction(tx)
+            tx.add(parent_ms)
             for m,f,kind,value,old in plans:
                 apply_plan(m,f,kind,value)
             tx.save()
@@ -1439,7 +1454,7 @@ def execute(context):
             commit_started=True
             tx.commit()
             committed=True
-            message="PAS 3/3 SALVAT: CXSTOCURI pentru MATUSETRANS %s.\nNu apasa Save pe ecran (deja comis). Ruleaza Check FIFO." % ",".join(text(m["id"]) for m in missing_journal)
+            message="PAS 3/3 SALVAT: CXSTOCURI pentru MATUSETRANS %s.\nSalveaza pe ecran; ruleaza Check FIFO." % ",".join(text(i) for i in made)
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
             try:
                 if not refresh_table(context):
@@ -1544,7 +1559,7 @@ def execute(context):
                 created_split_ids.append(sm.getLong("INVUSELINESPLITID"))
                 service.log_info("CXFIFOFIXISSUE PAS1 create split=%s qty=%s cost=%s uid=%s" % (
                     sm.getLong("INVUSELINESPLITID"),fmt(c["qty"]),fmt(c["cost"]),sm.getString("CONTENTUID")))
-            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 1/3: INVUSELINESPLIT actualizat (%s noi). Fara Save; reapeasa butonul 2." % len(created_split_ids))
+            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 1/3: INVUSELINESPLIT actualizat (%s noi). Salveaza; reapeasa butonul 2." % len(created_split_ids))
             plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
             operation="PAS1 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
@@ -1564,7 +1579,7 @@ def execute(context):
             commit_started=True
             tx.commit()
             committed=True
-            message="PAS 1/3 SALVAT: INVUSELINESPLIT. Splituri noi: %s.\nNu apasa Save (deja comis; Save da BMXAA8229W). Reapeasa butonul 2 (PAS 2)." % (
+            message="PAS 1/3 SALVAT: INVUSELINESPLIT. Splituri noi: %s.\nSalveaza pe ecran; reapeasa butonul 2 (PAS 2)." % (
                 ",".join(text(i) for i in created_split_ids) if created_split_ids else "-")
             service.log_info("CXFIFOFIXISSUE COMMIT "+VERSION+" "+message.replace("\n"," | "))
             try:
@@ -1668,7 +1683,7 @@ def execute(context):
                 service.log_info("CXFIFOFIXISSUE PAS2 create MATUSETRANS=%s split=%s qty=%s cost=%s actualdate=+%smin" % (
                     c["new_id"],c["split_id"],fmt(-c["qty"]),fmt(c["cost"]),idx+1))
             ids=",".join(text(c["new_id"]) for c in created_rows)
-            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 2/3: MATUSETRANS noi %s (ACTUALDATE +N min). Fara Save; reapeasa butonul 2 pentru PAS 3." % ids)
+            info=set_info(clicked["mbo"],"CXFIFOFIX PAS 2/3: MATUSETRANS noi %s (ACTUALDATE +N min). Salveaza; reapeasa butonul 2 pentru PAS 3." % ids)
             plans.append((clicked["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
             documents_before=document_values(doc,line)
             operation="PAS2 INVUSEID=%s INVUSELINEID=%s MATUSETRANSID=%s" % (invuseid,lineid,clicked_ref)
@@ -1697,7 +1712,10 @@ def execute(context):
                 opened.append(new_cx)
                 new_cx.setWhere("1=2")
                 new_cx.reset()
-                tmpl=clicked["mbo"]
+                parent_ms,parent_rows=query("CXSTOCURI","CXSTOCURIID=%s" % clicked["id"],2)
+                if len(parent_rows)!=1:
+                    fail("Rand CXSTOCURI apasat lipsa dupa PAS 2")
+                tmpl=parent_rows[0]
                 for src in fresh_rows:
                     qty=-number(src,"QUANTITY")
                     cost=number(src,"UNITCOST")
@@ -1720,14 +1738,18 @@ def execute(context):
                         rid=src.getLong("MATRECTRANSID")
                         bal=layer_balance(query,rid,datekey(src.getDate("ACTUALDATE")),src.getLong("MATUSETRANSID"),-qty,[])
                         put_number(jm,"CXCURBAL",bal)
-                    set_info(jm,"CXFIFOFIX PAS 3/3: CXSTOCURI pentru MATUSETRANS %s. Ruleaza Check FIFO." % src.getLong("MATUSETRANSID"))
+                    set_info(jm,"CXFIFOFIX PAS 3/3: CXSTOCURI pentru MATUSETRANS %s. Salveaza; ruleaza Check FIFO." % src.getLong("MATUSETRANSID"))
                     cx_ids.append(src.getLong("MATUSETRANSID"))
                     service.log_info("CXFIFOFIXISSUE PAS3 dupa PAS2 CXSTOCURI MATUSETRANS %s qty=%s cost=%s" % (
                         src.getLong("MATUSETRANSID"),fmt(-qty),fmt(cost)))
+                set_info(tmpl,"CXFIFOFIX PAS 3/3: jurnal completat pentru MATUSETRANS %s. Salveaza; ruleaza Check FIFO." % ",".join(text(i) for i in cx_ids))
                 tx2=MXServer.getMXServer().createMXTransaction()
                 new_cx.setFlag(MboConstants.NOSAVE,False)
                 new_cx.setMXTransaction(tx2)
                 tx2.add(new_cx)
+                parent_ms.setFlag(MboConstants.NOSAVE,False)
+                parent_ms.setMXTransaction(tx2)
+                tx2.add(parent_ms)
                 tx2.save()
                 tx2.commit()
             except Exception as exc:
@@ -1735,9 +1757,9 @@ def execute(context):
                 service.log_info("CXFIFOFIXISSUE PAS3 dupa PAS2 esuat: "+cx_err)
             message="PAS 2/3 SALVAT: MATUSETRANS noi %s.\nACTUALDATE = original + N minute." % ids
             if cx_ids and not cx_err:
-                message+="\nPAS 3/3 SALVAT: CXSTOCURI pentru MATUSETRANS %s.\nNu apasa Save. Ruleaza Check FIFO." % ",".join(text(i) for i in cx_ids)
+                message+="\nPAS 3/3 SALVAT: CXSTOCURI pentru MATUSETRANS %s.\nSalveaza pe ecran; ruleaza Check FIFO." % ",".join(text(i) for i in cx_ids)
             else:
-                message+="\nCXSTOCURI nu a fost scris (%s).\nReapeasa butonul pe acelasi rand: scrie jurnalul pentru MATUSETRANS deja salvat." % (cx_err or "necunoscut")
+                message+="\nCXSTOCURI nu a fost scris (%s).\nSalveaza; reapeasa butonul pe acelasi rand pentru PAS 3." % (cx_err or "necunoscut")
             for c in created_rows:
                 message+="\nMATUSETRANS %s: %s la %s; receptie %s; split %s." % (
                     c["new_id"],fmt(-c["qty"]),fmt(c["cost"]),receipt_label(c["receipt"]),c["split_id"])

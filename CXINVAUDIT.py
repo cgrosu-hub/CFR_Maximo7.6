@@ -1,6 +1,7 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.24-SPLIT-ON-ROW
+# VERSIUNE: 5.25-INFO-MSG
+# DIFERENTA: fara textul FIFO LOCAL si fara sectiunea diferenta.
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -93,7 +94,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.24-SPLIT-ON-ROW"
+VERSION = "5.25-INFO-MSG"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -748,11 +749,11 @@ def description_visible(old, record, summary):
     elif status=="OK":
         info="OK: FIFO LOCAL asteptat %s" % fmt_ro(record["expected"])
     elif status=="BAD" and row.get("kind")=="SHIPCANCEL":
-        info="DIFERENTA: SHIPCANCEL pret %s; asteptat %s; diferenta %s" % (
-            fmt_ro(row["cost"]),fmt_ro(record["expected"]),fmt_ro(row["cost"]-record["expected"]))
+        info="DIFERENTA: SHIPCANCEL pret %s; asteptat %s" % (
+            fmt_ro(row["cost"]),fmt_ro(record["expected"]))
     elif status=="BAD":
-        info="DIFERENTA: FIFO LOCAL pret %s; asteptat %s; diferenta %s" % (
-            fmt_ro(row["cost"]),fmt_ro(record["expected"]),fmt_ro(row["cost"]-record["expected"]))
+        info="DIFERENTA: pret %s; asteptat %s" % (
+            fmt_ro(row["cost"]),fmt_ro(record["expected"]))
     elif status=="N/A":
         info="FARA MISCARE: cantitate zero"
     else:
