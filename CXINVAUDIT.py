@@ -1,8 +1,9 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.28-NO-COMMODITY
+# VERSIUNE: 5.29-SKIP-ROTATING-INVLIFO
 # DIFERENTA: fara textul FIFO LOCAL si fara sectiunea diferenta.
 # INVLIFOFIFOCOST: pe acelasi pret suma cantitatilor; REFOBJECTID = cel mai vechi MATRECTRANS.
+# Doar ITEM.ROTATING=0. La ROTATING=1 straturile raman qty=1 / assetnum, fara comasare.
 # Afisarea SITUATIE STRATURI FIFO ramane pe straturi detaliate din CXSTOCURI.
 # COMMODITYGROUP nu filtreaza FIFO: o singura carte pe articol/gestiune.
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
@@ -97,7 +98,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.28-NO-COMMODITY"
+VERSION = "5.29-SKIP-ROTATING-INVLIFO"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -1346,9 +1347,41 @@ def put_invlifo_number(mbo,field,value):
             field,txt(value),"null" if written is None else txt(written)))
     return True
 
+def item_is_rotating(inventory):
+    # True = ROTATING=1 (strat pe asset, qty 1). None = ITEM negasit.
+    from psdi.server import MXServer
+    from psdi.mbo import SqlFormat
+    ms=None
+    try:
+        ms=MXServer.getMXServer().getMboSet("ITEM",inventory.getUserInfo())
+        if inventory.isNull("ITEMSETID"):
+            condition=SqlFormat("ITEMNUM=:1")
+            condition.setObject(1,"ITEM","ITEMNUM",inventory.getString("ITEMNUM"))
+        else:
+            condition=SqlFormat("ITEMNUM=:1 AND ITEMSETID=:2")
+            condition.setObject(1,"ITEM","ITEMNUM",inventory.getString("ITEMNUM"))
+            condition.setObject(2,"ITEM","ITEMSETID",inventory.getString("ITEMSETID"))
+        ms.setWhere(condition.format())
+        ms.reset()
+        item=ms.moveFirst()
+        if item is None:
+            return None
+        return bool(item.getBoolean("ROTATING"))
+    finally:
+        close_set(ms)
+
 def sync_invlifofifocost(inventory,rows,audit,script_service):
     from psdi.mbo import MboConstants
     flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
+    rotating=item_is_rotating(inventory)
+    if rotating is None:
+        msg="CORECTIE INVLIFOFIFOCOST: sarita (ITEM negasit; fara comasare)"
+        script_service.log_info("CXINVAUDIT "+msg)
+        return msg
+    if rotating:
+        msg="CORECTIE INVLIFOFIFOCOST: sarita (ROTATING=1; straturi qty=1 pe asset, fara comasare)"
+        script_service.log_info("CXINVAUDIT "+msg)
+        return msg
     desired=collapse_invlifo_desired(desired_fifo_layers(rows,audit))
     layers_qty=sum((layer["qty"] for layer in desired),ZERO)
     try:

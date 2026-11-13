@@ -11,14 +11,44 @@
 # de pe INVENTORY, unde getOwner()/getOwner().getOwner() pot fi None.
 # COSTDATE e read-only / cheie: se scrie doar la add sau daca e null.
 # Update-urile de QUANTITY din Check FIFO nu trebuie sa atinga COSTDATE.
+# ITEM.ROTATING=1: nu modifica INVLIFOFIFOCOST (strat qty=1 / assetnum propriu).
 #
 ################################################
 
-from psdi.mbo import MboConstants
+from psdi.mbo import MboConstants, SqlFormat
+from psdi.server import MXServer
 
 FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 
 service.log_info('*** Starting Script CXINVLIFOFIFO ***')
+
+def item_is_rotating():
+    ms = None
+    try:
+        if mbo.isNull("ITEMNUM"):
+            return False
+        ms = MXServer.getMXServer().getMboSet("ITEM", mbo.getUserInfo())
+        if mbo.isNull("ITEMSETID"):
+            sql = SqlFormat("ITEMNUM=:1")
+            sql.setObject(1, "ITEM", "ITEMNUM", mbo.getString("ITEMNUM"))
+        else:
+            sql = SqlFormat("ITEMNUM=:1 AND ITEMSETID=:2")
+            sql.setObject(1, "ITEM", "ITEMNUM", mbo.getString("ITEMNUM"))
+            sql.setObject(2, "ITEM", "ITEMSETID", mbo.getString("ITEMSETID"))
+        ms.setWhere(sql.format())
+        ms.reset()
+        item = ms.moveFirst()
+        return item is not None and item.getBoolean("ROTATING")
+    finally:
+        if ms is not None:
+            try:
+                ms.cleanup()
+            except Exception:
+                pass
+            try:
+                ms.close()
+            except Exception:
+                pass
 
 def lookup_ref(name, id_field, ref_id):
     ms = mbo.getMboSet("$CXINVLFIFO_" + name, name, id_field + " = " + str(ref_id))
@@ -44,7 +74,9 @@ def set_costdate(value):
         service.log_info('*** CXINVLIFOFIFO: COSTDATE nu poate fi scris (read-only/cheie) ***')
         return False
 
-if mbo.isNull("REFOBJECT") or mbo.isNull("REFOBJECTID"):
+if item_is_rotating():
+    service.log_info('*** CXINVLIFOFIFO: ROTATING=1; INVLIFOFIFOCOST neschimbat ***')
+elif mbo.isNull("REFOBJECT") or mbo.isNull("REFOBJECTID"):
     service.log_info('*** CXINVLIFOFIFO: fara REFOBJECT/REFOBJECTID; COSTDATE neschimbat ***')
 elif not mbo.toBeAdded() and not mbo.isNull("COSTDATE"):
     # Check FIFO (si alte update-uri pe cantitate): nu atinge Data costului.
