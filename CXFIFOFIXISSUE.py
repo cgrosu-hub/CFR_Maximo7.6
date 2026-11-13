@@ -1,11 +1,10 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.42-RECEIPT-SPLIT
-# MATUSETRANS ISSUE multi-pret: PAS 1 INVUSELINESPLIT / PAS 2 MATUSETRANS / PAS 3 CXSTOCURI.
-# MATRECTRANS RECEIPT|SHIPRECEIPT cu qty<0 multi-pret: split pe MATRECTRANS noi + CXSTOCURI
-# (echivalent line-split; INVUSELINESPLIT nu exista pe receptie).
-# SHIPTRANSFER/TRANSFER iesire: un singur pret (fara split). COMMODITYGROUP nu filtreaza.
-# Info: Salveaza. Necesita protectia CXADDTOCXSTOCURI. BigDecimal; fara decimal/json/re.
+# VERSIUNE: 3.43-RECEIPT-EXIT-REPLAY
+# RECEIPT/SHIPRECEIPT cu qty<0 = iesire FIFO in replay (ca in Check FIFO) si in handler.
+# MATUSETRANS ISSUE multi-pret: PAS 1/2/3. MATRECTRANS RECEIPT negativ multi-pret: split.
+# SHIPTRANSFER/TRANSFER iesire: un singur pret. Fara CURBAL pe MATUSETRANS.
+# Necesita protectia CXADDTOCXSTOCURI. BigDecimal; fara decimal/json/re.
 
 from java.math import BigDecimal, MathContext, RoundingMode
 from java.text import NumberFormat, ParsePosition
@@ -80,7 +79,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.42-RECEIPT-SPLIT"
+VERSION="3.43-RECEIPT-EXIT-REPLAY"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -96,7 +95,8 @@ EPS=ExactNumber("0.000001")
 PRICE_EPS=ExactNumber("0.0005")
 FLAGS=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 ENTRIES=("RECEIPT","SHIPRECEIPT","TRANSFER")
-EXITS=("ISSUE","SHIPTRANSFER","TRANSFER")
+# RECEIPT/SHIPRECEIPT apar si la iesiri (qty<0), ca in CXINVAUDIT.
+EXITS=("ISSUE","SHIPTRANSFER","TRANSFER","RECEIPT","SHIPRECEIPT")
 VOID_TYPES=("VOIDRECEIPT","SHIPRETURN")
 MATREC_TRANSFER_EXITS=("SHIPTRANSFER","TRANSFER")
 MATREC_RECEIPT_EXITS=("RECEIPT","SHIPRECEIPT")
@@ -389,7 +389,8 @@ def replay(prior,links=None):
                 if r["balance"] is not None and r["balance"]>=ZERO:
                     recovering=False
         else:
-            if kind not in EXITS:
+            # qty<0: ISSUE/TRANSFER iesire SAU RECEIPT/SHIPRECEIPT negativa (comanda).
+            if kind not in EXITS and kind not in ENTRIES:
                 fail("Iesire/retur anterior netratat: "+kind)
             if not initial and not started:
                 recovering=True
@@ -818,6 +819,7 @@ def check_matrectrans_exit_cost():
 
 def execute(context):
     check_matrectrans_exit_cost()
+    message=None
     if context is None or context.getName().upper()!="CXSTOCURI":
         fail("Butonul 2 trebuie sa transmita randul CXSTOCURI")
     if not context.getProfile().hasAppOption(APP,OPTION):
@@ -1947,6 +1949,8 @@ def execute(context):
                 close(ms)
             except Exception:
                 pass
+    if message is None:
+        fail("Intern: mesaj lipsa dupa executie")
     try:
         if not refresh_table(context):
             message+="\nRedeschide articolul pentru refresh."
@@ -1959,4 +1963,6 @@ if "mbo" in globals() and "service" in globals():
         result=execute(mbo)
     except FixError as exc:
         result="CXFIFOFIXISSUE: "+text(exc)
+    except Exception as exc:
+        result="CXFIFOFIXISSUE NPE/eroare: "+text(exc)
     service.error(MESSAGE_GROUP,MESSAGE_KEY,[result])
