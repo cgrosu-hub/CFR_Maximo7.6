@@ -1,7 +1,9 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.25-INFO-MSG
+# VERSIUNE: 5.26-INVLIFO-SUM
 # DIFERENTA: fara textul FIFO LOCAL si fara sectiunea diferenta.
+# INVLIFOFIFOCOST: pe acelasi pret suma cantitatilor; REFOBJECTID = cel mai vechi MATRECTRANS.
+# Afisarea SITUATIE STRATURI FIFO ramane pe straturi detaliate din CXSTOCURI.
 # Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
 # Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
 # anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
@@ -94,7 +96,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.25-INFO-MSG"
+VERSION = "5.26-INVLIFO-SUM"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -1129,6 +1131,44 @@ def desired_fifo_layers(rows,audit):
     layers.sort(key=lambda layer:(layer["priority"],layer.get("source") or 0))
     return layers
 
+def invlifo_age_key(layer):
+    # Cel mai vechi MATRECTRANSID first; altfel data/sursa.
+    ref_mbo=normalize_ref_mbo(layer.get("ref_mbo"))
+    ref_id=layer.get("ref_id")
+    if ref_mbo=="MATRECTRANS" and ref_id is not None:
+        return (0,long(ref_id),0)
+    return (1,txt(layer.get("date") or ""),layer.get("source") or 0)
+
+def collapse_invlifo_desired(layers):
+    # Pentru sync INVLIFOFIFOCOST: acelasi pret => o linie, suma cantitatilor,
+    # REFOBJECT/REFOBJECTID de la cel mai vechi MATRECTRANS.
+    grouped=[]
+    for layer in layers:
+        matched=None
+        for item in grouped:
+            if not far(item["cost"],layer["cost"],COST_TOLERANCE):
+                matched=item
+                break
+        if matched is None:
+            grouped.append({
+                "cost":layer["cost"],"qty":layer["qty"],
+                "ref_mbo":layer.get("ref_mbo"),"ref_id":layer.get("ref_id"),
+                "priority":layer.get("priority"),"source":layer.get("source"),
+                "date":layer.get("date"),"initial":bool(layer.get("initial")),
+            })
+            continue
+        matched["qty"]=matched["qty"]+layer["qty"]
+        if invlifo_age_key(layer)<invlifo_age_key(matched):
+            matched["ref_mbo"]=layer.get("ref_mbo")
+            matched["ref_id"]=layer.get("ref_id")
+            matched["priority"]=layer.get("priority")
+            matched["source"]=layer.get("source")
+            matched["date"]=layer.get("date")
+            matched["initial"]=bool(layer.get("initial"))
+            matched["cost"]=layer["cost"]
+    grouped.sort(key=lambda layer:(invlifo_age_key(layer),price_label(layer["cost"])))
+    return grouped
+
 def fifo_layers_situation(rows,audit,script_service):
     layers=desired_fifo_layers(rows,audit)
     title="SITUATIE STRATURI FIFO (CXSTOCURI)"
@@ -1298,7 +1338,7 @@ def put_invlifo_number(mbo,field,value):
 def sync_invlifofifocost(inventory,rows,audit,script_service):
     from psdi.mbo import MboConstants
     flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
-    desired=desired_fifo_layers(rows,audit)
+    desired=collapse_invlifo_desired(desired_fifo_layers(rows,audit))
     layers_qty=sum((layer["qty"] for layer in desired),ZERO)
     try:
         curbal=read_invbalances_curbal(inventory)
@@ -1550,6 +1590,33 @@ def check_layer_beats_negative_balance():
         raise ValueError("self-check: surplusul trebuia reutilizat, nu sters+create")
     if r_updates[0]["row"]["id"]!=10 or [r["id"] for r in r_deletes]!=[11]:
         raise ValueError("self-check: reutilizare/stergere surplus gresita")
+    same_price=[
+        {"cost":ExactNumber("200.000"),"qty":ExactNumber("3000"),"ref_mbo":"MATRECTRANS","ref_id":1337451940,
+         "priority":("G",1,0),"source":1,"date":"2026-07-07 00:00:00.000000000","initial":False},
+        {"cost":ExactNumber("261.900"),"qty":ExactNumber("1000"),"ref_mbo":"MATRECTRANS","ref_id":1337451934,
+         "priority":("G",2,0),"source":2,"date":"2026-07-07 00:01:00.000000000","initial":False},
+        {"cost":ExactNumber("261.900"),"qty":ExactNumber("1000"),"ref_mbo":"MATRECTRANS","ref_id":1337471973,
+         "priority":("G",3,0),"source":3,"date":"2026-08-27 00:00:00.000000000","initial":False},
+    ]
+    collapsed=collapse_invlifo_desired(same_price)
+    if len(collapsed)!=2:
+        raise ValueError("self-check: acelasi pret trebuie un strat INVLIFO")
+    by_cost=dict((price_label(layer["cost"]),layer) for layer in collapsed)
+    if price_label(ExactNumber("200.000")) not in by_cost or price_label(ExactNumber("261.900")) not in by_cost:
+        raise ValueError("self-check: preturi dupa colaps gresite")
+    if by_cost[price_label(ExactNumber("261.900"))]["qty"]!=ExactNumber("2000"):
+        raise ValueError("self-check: suma pe pret gresita")
+    if by_cost[price_label(ExactNumber("261.900"))]["ref_id"]!=1337451934:
+        raise ValueError("self-check: trebuie cel mai vechi MATRECTRANSID")
+    inv_current=[
+        {"id":21,"cost":ExactNumber("261.900"),"qty":ExactNumber("1000"),"ref_mbo":"MATRECTRANS","ref_id":1337451934},
+        {"id":22,"cost":ExactNumber("200.000"),"qty":ExactNumber("3000"),"ref_mbo":"MATRECTRANS","ref_id":1337451940},
+    ]
+    c_keeps,c_updates,c_deletes,c_creates=plan_invlifo_alignment(collapsed,inv_current)
+    if c_creates or c_deletes or len(c_keeps)!=1 or len(c_updates)!=1:
+        raise ValueError("self-check: colaps pe pret trebuia update fara create")
+    if c_updates[0]["layer"]["qty"]!=ExactNumber("2000") or c_updates[0]["row"]["id"]!=21:
+        raise ValueError("self-check: update INVLIFO pe pret gresit")
 
 def fetch_rows(inventory, name, where, spec):
     from psdi.server import MXServer
