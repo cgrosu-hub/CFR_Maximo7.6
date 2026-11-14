@@ -1,8 +1,8 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.45-SPLIT
+# VERSIUNE: 3.46-JOURNAL-SPLIT
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython 100000 caractere).
-# RECEIPT/SHIPRECEIPT qty<0 = iesire FIFO. Fara CURBAL pe MATUSETRANS.
+# RECEIPT multi-pret: split doar in CXSTOCURI. MATRECTRANS isi pastreaza cantitatea.
 # Necesita CXFIFOFIXEXEC si protectia CXADDTOCXSTOCURI.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -78,7 +78,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.45-SPLIT"
+VERSION="3.46-JOURNAL-SPLIT"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -456,6 +456,15 @@ def set_info(mbo,message):
     msg=audit_info(message)
     mbo.setValue("DESCRIPTION_LONGDESCRIPTION",msg,FLAGS)
     return msg
+
+def long_text(m,field="DESCRIPTION_LONGDESCRIPTION"):
+    try:
+        if m is None or m.isNull(field):
+            return ""
+        value=m.getString(field)
+    except:
+        return ""
+    return "" if value is None else value
 
 def layer_segments(allocations):
     segments=[]
@@ -838,20 +847,20 @@ def bind_execute(user):
     src=rows[0].getString("SOURCE")
     if src is None or "def execute(context):" not in src:
         fail("%s nu defineste execute(context)" % EXEC_SCRIPT)
-    glob=globals()
+    ns=bind_execute.func_globals
     try:
-        exec src in glob
-    except Exception as exc:
-        fail("%s nu se compileaza: %s" % (EXEC_SCRIPT, text(exc)))
-    if not callable(glob.get("execute")):
+        exec src in ns
+    except:
+        fail("%s nu se compileaza: %s" % (EXEC_SCRIPT, text(__import__("sys").exc_info()[1])))
+    if not callable(ns.get("execute")):
         fail("%s nu a definit execute" % EXEC_SCRIPT)
 
 if "mbo" in globals() and "service" in globals():
     try:
         bind_execute(mbo.getUserInfo())
-        result=execute(mbo)
+        result=bind_execute.func_globals["execute"](mbo)
     except FixError as exc:
         result="CXFIFOFIXISSUE: "+text(exc)
-    except Exception as exc:
-        result="CXFIFOFIXISSUE NPE/eroare: "+text(exc)
+    except:
+        result="CXFIFOFIXISSUE: "+text(__import__("sys").exc_info()[1])
     service.error(MESSAGE_GROUP,MESSAGE_KEY,[result])

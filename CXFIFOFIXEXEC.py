@@ -1,7 +1,8 @@
 # SCRIPT: CXFIFOFIXEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.45-SPLIT
+# VERSIUNE: 3.46-JOURNAL-SPLIT
 # Partea 2 a CXFIFOFIXISSUE. Fara launch point. Nu se ruleaza singur.
+# RECEIPT multi-pret: fara linii noi in MATRECTRANS; split doar in CXSTOCURI.
 # Jython: sub 100000 caractere, altfel BMXAA7836E Mark invalid.
 
 def execute(context):
@@ -32,7 +33,7 @@ def execute(context):
         fail("Selecteaza iesire MATUSETRANS/MATRECTRANS")
     if context.isNull("CXREFID"):
         fail("CXREFID lipsa")
-    if "MOTIV=ORDINE_DATE" in context.getString("DESCRIPTION_LONGDESCRIPTION"):
+    if "MOTIV=ORDINE_DATE" in long_text(context):
         fail("ORDINE_DATE: trateaza data separat, nu prin corectia de pret")
     user=context.getUserInfo()
     opened=[]
@@ -97,7 +98,8 @@ def execute(context):
                        if r["refmbo"]=="MATRECTRANS" and r["ref"]==rm.getLong("MATRECTRANSID")
                        and r["kind"]==kind and r["qty"] is not None and r["qty"]<ZERO]
             if len(positions)!=1:
-                fail("Iesirea %s nu are un singur rand negativ in jurnalul local" % rm.getLong("MATRECTRANSID"))
+                fail("MATRECTRANS %s are %s randuri negative in CXSTOCURI. Splitul de jurnal se face o singura data, de pe randul intreg." % (
+                    rm.getLong("MATRECTRANSID"),len(positions)))
             pos=positions[0]
             ij=journal[pos]
             if ij["id"]!=context.getLong("CXSTOCURIID") or text(ij["mbo"].getRowStamp())!=text(context.getRowStamp()):
@@ -131,7 +133,6 @@ def execute(context):
                 if not mbo.isNull("LINECOST2"):
                     plan_number(mbo,"LINECOST2",value)
                 return value
-            created_ids=[]
             if len(segments)==1:
                 cost=segments[0]["cost"]
                 if cost<ZERO or ExactNumber(cost.fixed(3))!=cost:
@@ -171,66 +172,52 @@ def execute(context):
                     message+="\nFara modificare receptie/destinatie."
                     message+="\nRuleaza Check FIFO."
             else:
-                from java.util import Date
+                # Split doar in CXSTOCURI. MATRECTRANS pastreaza cantitatea si pretul.
                 first=segments[0]
-                first_doc=-first["qty"]
-                if ExactNumber(first_doc.fixed(3))!=first_doc or first["qty"]<STEP:
+                first_qty=-first["qty"]
+                if ExactNumber(first_qty.fixed(3))!=first_qty or first["qty"]<STEP:
                     fail("Cantitate strat RECEIPT nereprezentabila")
-                plan_number(rm,"QUANTITY",first_doc)
-                first_value=plan_matrec_costs(rm,first_doc,first["cost"])
-                plan_number(ij["mbo"],"CXQTY",first_doc)
-                plan_number(ij["mbo"],"UNITCOST",first["cost"])
-                base_actual=rm.getDate("ACTUALDATE")
-                rmset.setFlag(MboConstants.NOSAVE,False)
+                slice_sum=first["qty"]
+                for seg in segments[1:]:
+                    if seg["qty"]<STEP or ExactNumber((-seg["qty"]).fixed(3))!=-seg["qty"] or ExactNumber(seg["cost"].fixed(3))!=seg["cost"] or seg["cost"]<ZERO:
+                        fail("Strat RECEIPT nereprezentabil")
+                    slice_sum+=seg["qty"]
+                if different(slice_sum,-qty_journal):
+                    fail("Suma straturilor difera de cantitatea din MATRECTRANS")
+                base_date=ij["mbo"].getDate("CXDOCUMENTDATE")
                 cxset.setFlag(MboConstants.NOSAVE,False)
                 extra_rows=[]
                 for idx,seg in enumerate(segments[1:]):
                     doc_qty=-seg["qty"]
-                    if ExactNumber(doc_qty.fixed(3))!=doc_qty or seg["qty"]<STEP or ExactNumber(seg["cost"].fixed(3))!=seg["cost"] or seg["cost"]<ZERO:
-                        fail("Strat RECEIPT nereprezentabil")
-                    nm=rmset.addAtEnd(FLAGS)
-                    for f in MATREC_COPY:
-                        copy_value(rm,nm,f)
-                    nm.setValue("ACTUALDATE",add_minutes(base_actual,idx+1),FLAGS)
-                    nm.setValue("TRANSDATE",Date(),FLAGS)
-                    put_number(nm,"QUANTITY",doc_qty)
-                    for f in ("UNITCOST","ACTUALCOST","CURRENCYUNITCOST"):
-                        put_number(nm,f,seg["cost"])
-                    seg_value=money(doc_qty*seg["cost"])
-                    for f in ("LINECOST","CURRENCYLINECOST"):
-                        put_number(nm,f,seg_value)
-                    if not rm.isNull("LINECOST2"):
-                        put_number(nm,"LINECOST2",seg_value)
-                    nid=nm.getLong("MATRECTRANSID")
-                    created_ids.append(nid)
                     jm=cxset.addAtEnd(FLAGS)
                     for f in ("ITEMNUM","LOCATION","ORGID","SITEID","COMMODITYGROUP","CURRENCYCODE",
                               "DESCRIPTION","GLCREDITACCT","GLDEBITACCT","ISSUETO","ROTASSETNUM"):
                         copy_value(ij["mbo"],jm,f)
                     put_number(jm,"CXQTY",doc_qty)
                     put_number(jm,"UNITCOST",seg["cost"])
-                    jm.setValue("CXDOCUMENTDATE",nm.getDate("ACTUALDATE"),FLAGS)
+                    jm.setValue("CXDOCUMENTDATE",add_minutes(base_date,idx+1),FLAGS)
                     jm.setValue("CXREF",kind,FLAGS)
                     jm.setValue("CXREFMBO","MATRECTRANS",FLAGS)
-                    jm.setValue("CXREFID",nid,FLAGS)
-                    set_info(jm,"CXFIFOFIX RECEIPT-SPLIT MATRECTRANS %s" % nid)
+                    jm.setValue("CXREFID",rm.getLong("MATRECTRANSID"),FLAGS)
+                    jm.setValue("HASLD",1,FLAGS)
+                    set_info(jm,"CORECTAT: CXFIFOFIX jurnal MATRECTRANS %s strat %s" % (rm.getLong("MATRECTRANSID"),idx+2))
                     extra_rows.append(journal_row(jm))
-                changes={ij["id"]:{"qty":first_doc,"cost":first["cost"]}}
+                changes={ij["id"]:{"qty":first_qty,"cost":first["cost"]}}
                 for er in extra_rows:
                     changes[er["id"]]={"qty":er["qty"],"cost":er["cost"]}
                 after=ledger(journal+extra_rows,changes)
+                plan_number(ij["mbo"],"CXQTY",first_qty)
+                plan_number(ij["mbo"],"UNITCOST",first["cost"])
                 for r in journal+extra_rows:
-                    if r["id"] in changes:
+                    if r["id"] in changes and r["id"]!=ij["id"]:
                         plan_number(r["mbo"],"UNITCOST",changes[r["id"]]["cost"])
                     plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
-                info=set_info(ij["mbo"],"CXFIFOFIX RECEIPT-SPLIT: %s + %s. Salveaza; Check FIFO." % (
-                    rm.getLong("MATRECTRANSID"),",".join(text(i) for i in created_ids)))
+                info=set_info(ij["mbo"],"CORECTAT: CXFIFOFIX jurnal split MATRECTRANS %s; cantitate document neschimbata" % rm.getLong("MATRECTRANSID"))
                 plans.append((ij["mbo"],"DESCRIPTION_LONGDESCRIPTION","TEXT",info,""))
                 tx=MXServer.getMXServer().createMXTransaction()
-                for ms in (rmset,cxset):
-                    ms.setFlag(MboConstants.NOSAVE,False)
-                    ms.setMXTransaction(tx)
-                    tx.add(ms)
+                cxset.setFlag(MboConstants.NOSAVE,False)
+                cxset.setMXTransaction(tx)
+                tx.add(cxset)
                 for m,f,k,value,old in plans:
                     writable(m)
                     if k=="TEXT":
@@ -241,9 +228,12 @@ def execute(context):
                 commit_started=True
                 tx.commit()
                 committed=True
-                message="RECEIPT-SPLIT SALVAT: %s qty %s@%s; noi %s. Ruleaza Check FIFO." % (
-                    rm.getLong("MATRECTRANSID"),fmt(first_doc),fmt(first["cost"]),
-                    ",".join(text(i) for i in created_ids))
+                parts=[fmt(first_qty)+"@"+fmt(first["cost"])]
+                for seg in segments[1:]:
+                    parts.append(fmt(-seg["qty"])+"@"+fmt(seg["cost"]))
+                message="JURNAL SPLIT MATRECTRANS %s. Cantitatea ramane %s. CXSTOCURI: %s." % (
+                    rm.getLong("MATRECTRANSID"),fmt(qty_doc),", ".join(parts))
+                message+="\nNu s-a creat niciun MATRECTRANS. Ruleaza Check FIFO."
             try:
                 if not refresh_table(context):
                     message+="\nRedeschide articolul pentru refresh."
