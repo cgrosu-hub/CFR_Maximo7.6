@@ -1,10 +1,12 @@
 # SCRIPT: CXUPDFIFOROW
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.13-RETURN-COVER
+# VERSIUNE: 3.14-AFTER-RECEIPT-REALIGN
 # Mutare data: soldul se scrie DOAR pe CXSTOCURI (CXDOCUMENTDATE + CXCURBAL).
 # ACTUALDATE pe MATUSETRANS/MATRECTRANS: SQL UPDATE (fara MboSet.save / BMXAA3496E).
 # AFTER_RECEIPT (acelasi UNITCOST): acoperire din RECEIPT/SHIPRECEIPT/TRANSFER
-# sau RETURN/SHIPRETURN ulterioare in jurnal (ex. ISSUE -15 apoi RETURN +15).
+# sau RETURN/SHIPRETURN ulterioare in jurnal (ex. SHIPTRANSFER apoi SHIPRECEIPT).
+# Daca jurnalul e deja desincronizat de ACTUALDATE, AFTER_RECEIPT/AFTER_ISSUE
+# realiniaza ambele pe noua data; DAYMAX tot cere date aliniate.
 # COMMODITYGROUP nu e cheie FIFO.
 
 from java.math import BigDecimal
@@ -22,7 +24,7 @@ MAX_ROWS = 10000
 SHIFT_MS = 60000
 ZERO = BigDecimal("0")
 TOL = BigDecimal("0.000001")
-VERSION = "3.13-RETURN-COVER"
+VERSION = "3.14-AFTER-RECEIPT-REALIGN"
 COVERING_RECEIPT = ("RECEIPT", "SHIPRECEIPT", "TRANSFER", "RETURN", "SHIPRETURN")
 DATE_FLAGS = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
 SUPPORTED = {
@@ -212,7 +214,7 @@ def ledger(rows, moved_ids=None, new_ms=None):
         result[r.getUniqueIDValue()] = running
     return result
 
-def validate_source(source, rows, table):
+def validate_source(source, rows, table, require_same_date=True):
     if source.isNull("ACTUALDATE"):
         fail("ACTUALDATE lipsa pe tranzactia-sursa")
     source_date = source.getDate("ACTUALDATE").getTime()
@@ -220,7 +222,7 @@ def validate_source(source, rows, table):
     for r in rows:
         if source.getString("ITEMNUM") != r.getString("ITEMNUM") or source.getString("ISSUETYPE") != r.getString("CXREF"):
             fail("Articol/tip diferit intre jurnal si sursa")
-        if stamp(r) != source_date:
+        if require_same_date and stamp(r) != source_date:
             fail("Data jurnalului difera deja de ACTUALDATE; analiza separata necesara")
         if different(number(r, "UNITCOST"), number(source, "UNITCOST")):
             fail("Pretul jurnalului difera de sursa")
@@ -238,6 +240,13 @@ def validate_source(source, rows, table):
                 fail("Cantitate absoluta diferita fata de MATRECTRANS")
         if "CXFIFO_FIX1|" in r.getString("DESCRIPTION_LONGDESCRIPTION"):
             fail("Exista istoric de corectie de pret pe un rand legat; data nu se schimba automat")
+    return source_date
+
+def dates_aligned(source_date, rows):
+    for r in rows:
+        if stamp(r) != source_date:
+            return False
+    return True
 
 def check_shipment_parent(source, new_ms):
     if source.getName() != "MATRECTRANS" or source.isNull("RECEIPTREF"):
@@ -463,7 +472,9 @@ def execute(context):
                 fail("Tranzactia-sursa nu este unica/accesibila")
             source = sources[0]
             source_rowstamp = str(source.getRowStamp())
-            validate_source(source, linked, table)
+            # Intai fara controlul de data: AFTER_RECEIPT poate realinia jurnalul cu ACTUALDATE.
+            source_date = validate_source(source, linked, table, require_same_date=False)
+            aligned = dates_aligned(source_date, linked)
             require_before = True
             # RETURN inainte de ISSUE: ancora pe ACTUALDATE consum + 1 minut
             if kind == "RETURN" and table == "MATUSETRANS":
@@ -498,8 +509,13 @@ def execute(context):
                             canonical(number(nxt, "CXQTY"))))
                 if not target.isNull("CXCURBAL") and number(target, "CXCURBAL").compareTo(ZERO) < 0:
                     require_before = False
+            if date_mode == "DAYMAX" and not aligned:
+                fail("Data jurnalului difera deja de ACTUALDATE; analiza separata necesara")
             if date_mode == "DAYMAX" and daymax_blocked:
                 fail("Maximul zilei + un minut depaseste ziua curenta; nimic modificat")
+            if date_mode in ("AFTER_RECEIPT", "AFTER_ISSUE") and not aligned:
+                service.log_info("CXUPDFIFOROW %s realiniere CXDOCUMENTDATE/ACTUALDATE pe CXSTOCURIID=%s" % (
+                    date_mode, target_id))
             check_shipment_parent(source, new_ms)
             child_sources = linked_shipment_children_to_bump(source, new_ms)
             child_ids = [c.getLong("MATRECTRANSID") for c in child_sources]
