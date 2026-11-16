@@ -1,6 +1,10 @@
 # SCRIPT: CXSTOCURIUPDATECURBAL
 # AUTOR: Fernando Prajitura; aliniat la ledger-ul FIFO de Cristian Grosu
-# VERSIUNE: 2026.11.04-FIFO-LEDGER
+# VERSIUNE: 2026.11.16-PU-RECEPTIE
+# ISSUE legat de MATRECTRANS: diferenta de pret de 0.001 si LINECOST egal cu
+# valoarea receptiei -> UNITCOST din jurnal devine pretul receptiei.
+# Urma: DESCRIPTION_LONGDESCRIPTION, linie "PU-RECEPTIE:". Apoi se recalculeaza
+# ambele partitii de pret, chiar daca CXCURBAL nu mai e null.
 # Completeaza CXCURBAL pe partitiile care inca il au null.
 # Partitia e cea din CXUPDFIFOROW / CXFIFOFIXISSUE:
 #   ITEMNUM, SITEID, LOCATION, COMMODITYGROUP, UNITCOST
@@ -30,6 +34,43 @@ SKIP_LOG_LIMIT = 50
 
 class Skip(Exception):
     pass
+
+
+def _milli(text):
+    # Identic in CXADDTOCXSTOCURI. Preturile sunt la 3 zecimale.
+    s = str(text).strip()
+    sign = -1 if s.startswith("-") else 1
+    if s[:1] in "-+":
+        s = s[1:]
+    if "." not in s:
+        s += ".000"
+    whole, frac = s.split(".", 1)
+    frac = (frac + "0000")[:4]
+    base = int(whole or "0") * 1000 + int(frac[:3])
+    if int(frac[3]) >= 5:
+        base += 1
+    return sign * base
+
+
+def plain_milli(value):
+    sign = "-" if value < 0 else ""
+    value = abs(int(value))
+    return "%s%d.%03d" % (sign, value // 1000, value % 1000)
+
+
+def snap_issue_cost(issue_cost, receipt_cost, qty, line_cost):
+    # Identic in CXADDTOCXSTOCURI. Doar rotunjirea Maximo de 0.001.
+    if issue_cost is None or receipt_cost is None or qty is None or line_cost is None:
+        return None
+    issue = _milli(issue_cost)
+    receipt = _milli(receipt_cost)
+    gap = abs(issue - receipt)
+    if gap == 0 or gap > 1:
+        return None
+    value = (abs(_milli(qty)) * abs(receipt) + 500) // 1000
+    if abs(_milli(line_cost)) != value:
+        return None
+    return plain_milli(receipt)
 
 
 def self_check():
@@ -82,6 +123,14 @@ def self_check():
     must_fail([
         row(1, "2026-01-01 00:00:00.000000000", None, "INITIAL", None, None),
     ])
+    if snap_issue_cost("43.281", "43.280", "-0.520", "-22.506") != "43.280":
+        raise ValueError("self-check snap 43.281")
+    if snap_issue_cost("43.281", "43.270", "-0.520", "-22.500") is not None:
+        raise ValueError("self-check snap diferenta mare")
+    if snap_issue_cost("24.589", "24.590", "-0.185", "-4.426") is not None:
+        raise ValueError("self-check snap linecost")
+    if snap_issue_cost("43.280", "43.280", "-0.520", "-22.506") is not None:
+        raise ValueError("self-check snap egal")
 
 
 def running_balances(rows):
@@ -307,6 +356,137 @@ def load_seeds(user, where):
             db.freeConnection(key)
 
 
+def plain_from_mbo(mbo, field):
+    if mbo is None or mbo.isNull(field):
+        return None
+    raw = mbo.getMboValue(field).getCurrentValue().asString().strip()
+    if raw == "":
+        return None
+    try:
+        return BigDecimal(raw).stripTrailingZeros().toPlainString()
+    except Exception:
+        parser = NumberFormat.getNumberInstance(mbo.getUserInfo().getLocale())
+        parser.setParseBigDecimal(True)
+        pos = ParsePosition(0)
+        value = parser.parse(raw, pos)
+        if value is None or pos.getIndex() != len(raw):
+            return None
+        return value.stripTrailingZeros().toPlainString()
+
+
+def remember_price(mbo, line):
+    old = ""
+    try:
+        if not mbo.isNull("DESCRIPTION_LONGDESCRIPTION"):
+            old = mbo.getString("DESCRIPTION_LONGDESCRIPTION") or ""
+    except Exception:
+        old = ""
+    if line in old:
+        return
+    text = line if not old.strip() else old.rstrip() + "\n" + line
+    mbo.setValue("DESCRIPTION_LONGDESCRIPTION", text, FLAGS)
+    try:
+        mbo.setValue("HASLD", 1, FLAGS)
+    except Exception:
+        pass
+
+
+def write_cost(mbo, value):
+    mv = mbo.getMboValue("UNITCOST")
+    typed = MaxType.createMaxType(Locale.US, TimeZone.getTimeZone("UTC"), mv.getType())
+    typed.setScale(mv.getScale())
+    typed.setValue(value)
+    written = BigDecimal(typed.asString())
+    if written.compareTo(BigDecimal(value)) != 0:
+        raise Skip("precizia UNITCOST nu pastreaza %s pe CXSTOCURIID=%s" % (
+            value, mbo.getUniqueIDValue()))
+    mbo.setValue("UNITCOST", typed, FLAGS)
+
+
+def field_text(mbo, field):
+    if mbo.isNull(field):
+        return None
+    return clean_text(mbo.getString(field))
+
+
+def load_snap_ids(user):
+    db = MXServer.getMXServer().getDBManager()
+    key = user.getConnectionKey()
+    con = None
+    stmt = None
+    rs = None
+    try:
+        con = db.getConnection(key)
+        stmt = con.createStatement()
+        rs = stmt.executeQuery(
+            "select c.cxstocuriid from cxstocuri c, matusetrans u, matrectrans r "
+            "where c.cxrefmbo='MATUSETRANS' and c.cxref='ISSUE' and c.cxrefid=u.matusetransid "
+            "and u.issuetype='ISSUE' and u.matrectransid is not null "
+            "and u.matrectransid=r.matrectransid "
+            "and abs(u.unitcost-r.unitcost)>0 and abs(u.unitcost-r.unitcost)<=0.001 "
+            "and abs(c.unitcost-u.unitcost)<=0.0000001"
+        )
+        ids = []
+        while rs.next():
+            ids.append(rs.getLong(1))
+        return ids
+    finally:
+        for resource in (rs, stmt):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+        if con is not None:
+            db.freeConnection(key)
+
+
+def snap_existing(user):
+    # Randurile deja mutate nu mai au UNITCOST = pretul din MATUSETRANS.
+    seeds = []
+    changed = 0
+    for row_id in load_snap_ids(user):
+        ms = None
+        try:
+            ms = MXServer.getMXServer().getMboSet("CXSTOCURI", user)
+            ms.setWhere("CXSTOCURIID=%s" % row_id)
+            ms.reset()
+            row = ms.moveFirst()
+            if row is None:
+                continue
+            issue = row.getMboSet("$CXPU_ISSUE", "MATUSETRANS", "MATUSETRANSID=:CXREFID").moveFirst()
+            receipt = None
+            if issue is not None and not issue.isNull("MATRECTRANSID"):
+                receipt = issue.getMboSet("$CXPU_REC", "MATRECTRANS", "MATRECTRANSID=:MATRECTRANSID").moveFirst()
+            issue_cost = plain_from_mbo(issue, "UNITCOST")
+            journal_cost = plain_from_mbo(row, "UNITCOST")
+            if issue_cost is None or _milli(journal_cost) != _milli(issue_cost):
+                continue
+            snapped = snap_issue_cost(
+                issue_cost, plain_from_mbo(receipt, "UNITCOST"),
+                plain_from_mbo(issue, "QUANTITY"), plain_from_mbo(issue, "LINECOST"))
+            if snapped is None:
+                continue
+            old_cost = clean_cost(journal_cost)
+            write_cost(row, snapped)
+            remember_price(row, "PU-RECEPTIE: %s -> %s MATRECTRANS %s" % (
+                plain_milli(_milli(issue_cost)), snapped, issue.getLong("MATRECTRANSID")))
+            ms.save()
+            base = (
+                field_text(row, "ITEMNUM"), field_text(row, "SITEID"),
+                field_text(row, "LOCATION"), field_text(row, "COMMODITYGROUP"))
+            seeds.append(base + (old_cost,))
+            seeds.append(base + (clean_cost(snapped),))
+            changed += 1
+            service.log_error("CXSTOCURIUPDATECURBAL pret CXSTOCURIID=%s %s -> %s" % (
+                row_id, old_cost, snapped))
+        except Exception as exc:
+            service.log_error("CXSTOCURIUPDATECURBAL pret CXSTOCURIID=%s neschimbat: %s" % (row_id, exc))
+        finally:
+            close_set(ms)
+    return seeds, changed
+
+
 def label_of(seed):
     item, site, location, group, cost = seed
     return "%s | %s | %s | %s | %s" % (item, site, location, group, cost)
@@ -324,7 +504,13 @@ def main():
     where = seed_where(full, days)
     service.log_error("CXSTOCURIUPDATECURBAL start mod=%s filtru=%s" % (
         "complet" if full else "null", where))
+    extra, snapped = snap_existing(user)
     seeds = load_seeds(user, where)
+    seen = set(seeds)
+    for seed in extra:
+        if seed not in seen:
+            seeds.append(seed)
+            seen.add(seed)
     written = 0
     skipped = 0
     failed = 0
@@ -343,8 +529,8 @@ def main():
                 service.log_error("CXSTOCURIUPDATECURBAL eroare %s: %s" % (label_of(seed), exc))
                 logged += 1
     service.log_error(
-        "CXSTOCURIUPDATECURBAL gata partitii=%s randuri=%s sarite=%s erori=%s" % (
-            len(seeds), written, skipped, failed))
+        "CXSTOCURIUPDATECURBAL gata partitii=%s randuri=%s sarite=%s erori=%s preturi=%s" % (
+            len(seeds), written, skipped, failed, snapped))
 
 
 if globals().get("service") is not None:

@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.46-JOURNAL-SPLIT
+# VERSIUNE: 3.47-PU-TRACE
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython 100000 caractere).
 # RECEIPT multi-pret: split doar in CXSTOCURI. MATRECTRANS isi pastreaza cantitatea.
 # Necesita CXFIFOFIXEXEC si protectia CXADDTOCXSTOCURI.
@@ -454,6 +454,15 @@ def audit_info(message):
 
 def set_info(mbo,message):
     msg=audit_info(message)
+    raw=long_text(mbo).replace("\r\n","\n").replace("\r","\n")
+    for separator in ("<br />","<br/>","<br>","<BR />","<BR/>","<BR>"):
+        raw=raw.replace(separator,"\n")
+    traces=[]
+    for line in raw.split("\n"):
+        if line.strip().startswith("PU-RECEPTIE:"):
+            traces.append(line.strip())
+    if traces:
+        msg=msg+"\n"+"\n".join(traces)
     mbo.setValue("DESCRIPTION_LONGDESCRIPTION",msg,FLAGS)
     return msg
 

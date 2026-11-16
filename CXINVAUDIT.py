@@ -1,6 +1,7 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.29-SKIP-ROTATING-INVLIFO
+# VERSIUNE: 5.30-PU-TRACE
+# Linia PU-RECEPTIE: din descriere este urma pretului si se pastreaza la rescriere.
 # DIFERENTA: fara textul FIFO LOCAL si fara sectiunea diferenta.
 # INVLIFOFIFOCOST: pe acelasi pret suma cantitatilor; REFOBJECTID = cel mai vechi MATRECTRANS.
 # Doar ITEM.ROTATING=0. La ROTATING=1 straturile raman qty=1 / assetnum, fara comasare.
@@ -699,6 +700,25 @@ def generated_compact_info(value):
         parts.remove("MOTIV=ORDINE_DATE")
         value = " | ".join(parts)
     return generated_compact_legacy(value)
+
+def peel_pu_trace(text):
+    traces = []
+    body = []
+    for line in txt(text).split("\n"):
+        if line.strip().startswith("PU-RECEPTIE:"):
+            traces.append(line.strip())
+        else:
+            body.append(line)
+    return "\n".join(body).strip(), traces
+
+def with_pu_trace(value, traces):
+    if not traces:
+        return value
+    combined = value + "\n" + "\n".join(traces)
+    if len(combined) > MAX_DESCRIPTION:
+        return value
+    return combined
+
 def description_visible(old, record, summary):
     kept = txt(old)
     for begin, end in ((BEGIN, END), ("CXFIFO_AUDIT_V1_BEGIN", "CXFIFO_AUDIT_V1_END")):
@@ -718,6 +738,7 @@ def description_visible(old, record, summary):
     if kept.startswith(HEADER):
         parts = kept.split("\n", 1)
         kept = parts[1].strip() if len(parts) > 1 else ""
+    kept, traces = peel_pu_trace(kept)
     previous = info_plaintext(kept).split("\n")
     states = ("OK", "BAD", "INITIAL", "COMPENSAT", "INTRARE", "ZERO", "NECONCLUDENT", "SURSA", "SOLD")
     if len(previous) == 3 and previous[1] in ("BADFIFO=Y", "BADFIFO=N", "BADFIFO=U", "BADFIFO=NA"):
@@ -742,17 +763,17 @@ def description_visible(old, record, summary):
         elif record["balance_bad"]:
             info+=" | ATENTIE SOLD: inregistrat %s; calculat %s | BADFIFO=Y" % (
                 fmt_ro(row.get("balance")),fmt_ro(record["balance_expected"]))
-        return info
+        return with_pu_trace(info, traces)
     if row.get("kind")=="INITIAL":
         if record["status"]!="INITIAL":
-            return "INITIAL: BAZA NECONCLUDENTA; vezi rezumatul auditului | BADFIFO=U"
+            return with_pu_trace("INITIAL: BAZA NECONCLUDENTA; vezi rezumatul auditului | BADFIFO=U", traces)
         info="INITIAL: FIFO LOCAL %s buc. la %s" % (fmt_ro(row.get("balance")),fmt_ro(row.get("cost")))
         if record.get("balance_missing"):
-            return info+" | ATENTIE SOLD: CXCURBAL lipsa | BADFIFO=Y"
+            return with_pu_trace(info+" | ATENTIE SOLD: CXCURBAL lipsa | BADFIFO=Y", traces)
         if record["balance_bad"]:
-            return info+" | ATENTIE SOLD: inregistrat %s; calculat %s | BADFIFO=Y" % (
-                fmt_ro(row.get("balance")),fmt_ro(record["balance_expected"]))
-        return info+" | BADFIFO=N"
+            return with_pu_trace(info+" | ATENTIE SOLD: inregistrat %s; calculat %s | BADFIFO=Y" % (
+                fmt_ro(row.get("balance")),fmt_ro(record["balance_expected"])), traces)
+        return with_pu_trace(info+" | BADFIFO=N", traces)
     status=record["status"]
     if status=="DATE_ORDER":
         info="OK: pret compatibil %s; intrare ulterioara cu RefID anterior; data iesirii de verificat (conventie)" % fmt_ro(record["expected"])
@@ -801,7 +822,7 @@ def description_visible(old, record, summary):
     value=" | ".join(parts)
     if len(value)>MAX_DESCRIPTION:
         raise ValueError("Descriere prea lunga; nimic salvat")
-    return value
+    return with_pu_trace(value, traces)
 
 def numeric_field(m,field):
     if m.isNull(field):

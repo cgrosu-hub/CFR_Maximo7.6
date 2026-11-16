@@ -6,7 +6,8 @@
 # LOGLEVEL:             ERROR
 # UPDATE:               21.09.2026 - Bug #1690 Corectie SHIPTRANSFER/SHIPCANCEL
 # UPDATE:               30.10.2026 - Cristian Grosu - protectie update MATUSETRANS
-# VERSION:              2026.10.30-MATUSETRANS-ADD-ONLY
+# UPDATE:               16.11.2026 - ISSUE: pretul receptiei daca diferenta e 0.001
+# VERSION:              2026.11.16-PU-RECEPTIE
 #-------------------------------------------------------------
 # Pentru magaziile sursa normale, CXSTOCURI foloseste COMMODITYGROUP din MATRECTRANS;
 # pentru gestiunile speciale se pastreaza codul secundar conform configuratiei LOCATIONS.
@@ -19,6 +20,8 @@ from psdi.security import UserInfo
 from psdi.mbo import SqlFormat
 from psdi.webclient.system.session import WebClientSession
 from java.io import FileOutputStream
+from java.math import BigDecimal
+from java.text import NumberFormat, ParsePosition
 
 service.log_info('*** Starting Script CXADDTOCXSTOCURI ***')
 
@@ -41,6 +44,91 @@ def getAppName():
         pass
     parent_app = mbo.getThisMboSet().getParentApp()
     return str(parent_app) if parent_app else 'None'
+
+def _milli(text):
+    # Identic in CXSTOCURIUPDATECURBAL. Preturile sunt la 3 zecimale.
+    s = str(text).strip()
+    sign = -1 if s.startswith("-") else 1
+    if s[:1] in "-+":
+        s = s[1:]
+    if "." not in s:
+        s += ".000"
+    whole, frac = s.split(".", 1)
+    frac = (frac + "0000")[:4]
+    base = int(whole or "0") * 1000 + int(frac[:3])
+    if int(frac[3]) >= 5:
+        base += 1
+    return sign * base
+
+def plain_milli(value):
+    sign = "-" if value < 0 else ""
+    value = abs(int(value))
+    return "%s%d.%03d" % (sign, value // 1000, value % 1000)
+
+def snap_issue_cost(issue_cost, receipt_cost, qty, line_cost):
+    # Identic in CXSTOCURIUPDATECURBAL. Doar rotunjirea Maximo de 0.001.
+    if issue_cost is None or receipt_cost is None or qty is None or line_cost is None:
+        return None
+    issue = _milli(issue_cost)
+    receipt = _milli(receipt_cost)
+    gap = abs(issue - receipt)
+    if gap == 0 or gap > 1:
+        return None
+    value = (abs(_milli(qty)) * abs(receipt) + 500) // 1000
+    if abs(_milli(line_cost)) != value:
+        return None
+    return plain_milli(receipt)
+
+def plain_from_mbo(mbo, field):
+    if mbo is None or mbo.isNull(field):
+        return None
+    raw = mbo.getMboValue(field).getCurrentValue().asString().strip()
+    if raw == "":
+        return None
+    try:
+        return BigDecimal(raw).stripTrailingZeros().toPlainString()
+    except Exception:
+        parser = NumberFormat.getNumberInstance(mbo.getUserInfo().getLocale())
+        parser.setParseBigDecimal(True)
+        pos = ParsePosition(0)
+        value = parser.parse(raw, pos)
+        if value is None or pos.getIndex() != len(raw):
+            return None
+        return value.stripTrailingZeros().toPlainString()
+
+def remember_price(mbo, line):
+    flags = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
+    old = ""
+    try:
+        if not mbo.isNull("DESCRIPTION_LONGDESCRIPTION"):
+            old = mbo.getString("DESCRIPTION_LONGDESCRIPTION") or ""
+    except Exception:
+        old = ""
+    if line in old:
+        return
+    text = line if not old.strip() else old.rstrip() + "\n" + line
+    mbo.setValue("DESCRIPTION_LONGDESCRIPTION", text, flags)
+    try:
+        mbo.setValue("HASLD", 1, flags)
+    except Exception:
+        pass
+
+def issue_receipt_snap(issue):
+    if issue.isNull("MATRECTRANSID"):
+        return None
+    ms = issue.getMboSet("$CXPU_REC", "MATRECTRANS", "MATRECTRANSID=:MATRECTRANSID")
+    ms.reset()
+    rec = ms.getMbo(0)
+    if rec is None:
+        return None
+    issue_cost = plain_from_mbo(issue, "UNITCOST")
+    snapped = snap_issue_cost(
+        issue_cost, plain_from_mbo(rec, "UNITCOST"),
+        plain_from_mbo(issue, "QUANTITY"), plain_from_mbo(issue, "LINECOST"))
+    if snapped is None:
+        return None
+    return snapped, "PU-RECEPTIE: %s -> %s MATRECTRANS %s" % (
+        plain_milli(_milli(issue_cost)), snapped, issue.getLong("MATRECTRANSID"))
 
 def shouldCreateMatUseJournal():
     # onadd/onupdate descriu operatia sursei, nu starea noului rand CXSTOCURI.
@@ -209,7 +297,15 @@ if launchPoint == 'CXNEWMATUSETRANS' and shouldCreateMatUseJournal():
             linieStocMbo.setValue("COMMODITYGROUP",mbo.getString("COMMODITYGROUP"))
         linieStocMbo.setValue("CXDOCUMENTDATE",mbo.getDate("ACTUALDATE"))
         linieStocMbo.setValue("CXQTY",mbo.getDouble("QUANTITY"))
-        linieStocMbo.setValue("UNITCOST",mbo.getDouble("UNITCOST"))
+        price_trace = issue_receipt_snap(mbo)
+        if price_trace is None:
+            linieStocMbo.setValue("UNITCOST",mbo.getDouble("UNITCOST"))
+        else:
+            linieStocMbo.setValue("UNITCOST",price_trace[0])
+            try:
+                remember_price(linieStocMbo, price_trace[1])
+            except Exception as exc:
+                service.log_info("CXADDTOCXSTOCURI urma pret indisponibila: " + str(exc))
         linieStocMbo.setValue("CXREF",mbo.getString("ISSUETYPE"))
         linieStocMbo.setValue("CXREFMBO","MATUSETRANS")
         linieStocMbo.setValue("CXREFID",mbo.getLong("MATUSETRANSID"))
