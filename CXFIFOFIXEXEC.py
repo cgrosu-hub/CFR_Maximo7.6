@@ -1,8 +1,9 @@
 # SCRIPT: CXFIFOFIXEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.46-JOURNAL-SPLIT
+# VERSIUNE: 3.48-TRANSFER-JOURNAL-SPLIT
 # Partea 2 a CXFIFOFIXISSUE. Fara launch point. Nu se ruleaza singur.
-# RECEIPT multi-pret: fara linii noi in MATRECTRANS; split doar in CXSTOCURI.
+# Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
+# MATRECTRANS isi pastreaza cantitatea si pretul. Fara linii noi de document.
 # Jython: sub 100000 caractere, altfel BMXAA7836E Mark invalid.
 
 def execute(context):
@@ -115,10 +116,8 @@ def execute(context):
             for a in allocation:
                 if not any(not different(a["cost"],c,PRICE_EPS) for c in costs):
                     costs.append(a["cost"])
-            if len(costs)>1 and not receipt_exit:
-                fail("Multi-pret pe TRANSFER/SHIPTRANSFER: split refuzat")
             if len(costs)>1 and len(segments)<2:
-                fail("RECEIPT multi-pret colapsat gresit")
+                fail("MATRECTRANS multi-pret colapsat gresit")
             plans=[]
             def plan_number(m,field,value):
                 old=number(m,field,True)
@@ -172,15 +171,16 @@ def execute(context):
                     message+="\nFara modificare receptie/destinatie."
                     message+="\nRuleaza Check FIFO."
             else:
-                # Split doar in CXSTOCURI. MATRECTRANS pastreaza cantitatea si pretul.
+                # Split doar in CXSTOCURI (RECEIPT negativ sau SHIPTRANSFER/TRANSFER).
+                # MATRECTRANS pastreaza cantitatea si pretul documentului.
                 first=segments[0]
                 first_qty=-first["qty"]
                 if ExactNumber(first_qty.fixed(3))!=first_qty or first["qty"]<STEP:
-                    fail("Cantitate strat RECEIPT nereprezentabila")
+                    fail("Cantitate strat MATRECTRANS nereprezentabila")
                 slice_sum=first["qty"]
                 for seg in segments[1:]:
                     if seg["qty"]<STEP or ExactNumber((-seg["qty"]).fixed(3))!=-seg["qty"] or ExactNumber(seg["cost"].fixed(3))!=seg["cost"] or seg["cost"]<ZERO:
-                        fail("Strat RECEIPT nereprezentabil")
+                        fail("Strat MATRECTRANS nereprezentabil")
                     slice_sum+=seg["qty"]
                 if different(slice_sum,-qty_journal):
                     fail("Suma straturilor difera de cantitatea din MATRECTRANS")

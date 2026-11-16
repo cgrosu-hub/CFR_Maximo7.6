@@ -1,9 +1,9 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.47-PU-TRACE
+# VERSIUNE: 3.48-TRANSFER-JOURNAL-SPLIT
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython 100000 caractere).
-# RECEIPT multi-pret: split doar in CXSTOCURI. MATRECTRANS isi pastreaza cantitatea.
-# Necesita CXFIFOFIXEXEC si protectia CXADDTOCXSTOCURI.
+# Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
+# MATRECTRANS isi pastreaza cantitatea. Necesita CXFIFOFIXEXEC + CXADDTOCXSTOCURI.
 
 from java.math import BigDecimal, MathContext, RoundingMode
 from java.text import NumberFormat, ParsePosition
@@ -78,7 +78,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.46-JOURNAL-SPLIT"
+VERSION="3.48-TRANSFER-JOURNAL-SPLIT"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -773,7 +773,7 @@ def single_fifo_cost(prior,exit_qty,links=None):
         fail("Stoc anterior insuficient")
     costs=set(a["cost"] for a in allocation)
     if len(costs)!=1:
-        fail("Multi-pret pe MATRECTRANS transfer: split refuzat")
+        fail("Pret FIFO neunic pe iesirea MATRECTRANS")
     cost=allocation[0]["cost"]
     if cost<ZERO or ExactNumber(cost.fixed(3))!=cost:
         fail("Pretul FIFO nu poate fi scris")
@@ -841,6 +841,21 @@ def check_matrectrans_exit_cost():
         raise ValueError("self-check: seg1")
     if different(allocation[1]["cost"],ExactNumber("2.960"),PRICE_EPS) or different(allocation[1]["qty"],ExactNumber("10")):
         raise ValueError("self-check: seg2")
+    # SHIPTRANSFER -20 din 2@0.200 + 18@0.120 => doua straturi de jurnal.
+    layers=replay([
+        row(1,"2026-04-29 00:00:00.000000000",1337408967,"SHIPRECEIPT","2","0.200","2"),
+        row(2,"2026-04-29 00:05:00.000000000",1337408966,"SHIPRECEIPT","18","0.120","20"),
+    ])
+    allocation,short=consume(layers,ExactNumber("20"))
+    if short>EPS:
+        raise ValueError("self-check: SHIPTRANSFER multi stoc")
+    segs=layer_segments(allocation)
+    if len(segs)!=2:
+        raise ValueError("self-check: SHIPTRANSFER multi segmente")
+    if different(segs[0]["qty"],ExactNumber("2")) or different(segs[0]["cost"],ExactNumber("0.200"),PRICE_EPS):
+        raise ValueError("self-check: SHIPTRANSFER multi strat1")
+    if different(segs[1]["qty"],ExactNumber("18")) or different(segs[1]["cost"],ExactNumber("0.120"),PRICE_EPS):
+        raise ValueError("self-check: SHIPTRANSFER multi strat2")
 
 
 EXEC_SCRIPT="CXFIFOFIXEXEC"
