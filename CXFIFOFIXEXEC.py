@@ -1,9 +1,10 @@
 # SCRIPT: CXFIFOFIXEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.48-TRANSFER-JOURNAL-SPLIT
+# VERSIUNE: 3.50-ROTATING-CXSTOCURI
 # Partea 2 a CXFIFOFIXISSUE. Fara launch point. Nu se ruleaza singur.
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
-# MATRECTRANS isi pastreaza cantitatea si pretul. Fara linii noi de document.
+# ISSUE: si articolele ROTATING=1 pot primi corectie UNITCOST/CXCURBAL in CXSTOCURI.
+# Conditie: NOLOT, fara condition code. MATRECTRANS nu se creaza la split multi-pret.
 # Jython: sub 100000 caractere, altfel BMXAA7836E Mark invalid.
 
 def execute(context):
@@ -520,8 +521,9 @@ def execute(context):
         sql.setObject(1,"ITEM","ITEMNUM",context.getString("ITEMNUM"))
         sql.setObject(2,"ITEM","ITEMSETID",itemset)
         it,items=query("ITEM",sql.format(),2)
-        if len(items)!=1 or items[0].getBoolean("ROTATING") or items[0].getBoolean("CONDITIONENABLED") or items[0].getString("LOTTYPE")!="NOLOT":
-            fail("Handler pentru articole non-rotating, NOLOT, fara condition code")
+        # ROTATING=1 e permis: corectia e pe CXSTOCURI (UNITCOST/CXCURBAL), nu pe merge INVLIFO.
+        if len(items)!=1 or items[0].getBoolean("CONDITIONENABLED") or items[0].getString("LOTTYPE")!="NOLOT":
+            fail("Handler pentru articole NOLOT, fara condition code")
         mwhere="INVUSEID=%s AND INVUSELINEID=%s" % (invuseid,lineid)
         mset,mts=query("MATUSETRANS",mwhere,MAX_SPLITS)
         if not mts:

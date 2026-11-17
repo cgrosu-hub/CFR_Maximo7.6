@@ -1,9 +1,10 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.49-SHIPRETURN-IN
+# VERSIUNE: 3.50-ROTATING-CXSTOCURI
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython 100000 caractere).
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # SHIPRETURN (+qty) in replay = intrare/restabilire, ca SHIPCANCEL.
+# ISSUE rotating=1: corectie sold/pret in CXSTOCURI permisa (NOLOT, fara condition).
 # MATRECTRANS isi pastreaza cantitatea. Necesita CXFIFOFIXEXEC + CXADDTOCXSTOCURI.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -79,7 +80,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.49-SHIPRETURN-IN"
+VERSION="3.50-ROTATING-CXSTOCURI"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
