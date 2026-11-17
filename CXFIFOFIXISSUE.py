@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.53-KIND-SCOPE
+# VERSIUNE: 3.54-LINESET-SCOPE
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython method/caractere).
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # SHIPRETURN (+qty) in replay = intrare/restabilire, ca SHIPCANCEL.
@@ -82,7 +82,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.53-KIND-SCOPE"
+VERSION="3.54-LINESET-SCOPE"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"

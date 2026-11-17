@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.53-KIND-SCOPE
+# VERSIUNE: 3.54-LINESET-SCOPE
 # Partea 2 a CXFIFOFIXISSUE. Fara launch point. Nu se ruleaza singur.
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # ISSUE rotating=1: corectie UNITCOST/CXCURBAL in CXSTOCURI (NOLOT, fara condition).
@@ -582,8 +582,8 @@ def fix_issue_standalone(context, query, state, first, itemset):
         message+="\nRefresh nereusit; redeschide articolul."
     return message
 
-def fix_issue_invuse(context, query, state, first, itemset, lines):
-    # ISSUE pe INVUSE/INVUSELINE.
+def fix_issue_invuse(context, query, state, first, itemset, lineset, lines):
+    # ISSUE pe INVUSE/INVUSELINE. lineset vine din fix_issue (watch INVUSELINE).
     user=state["user"]
     opened=state["opened"]
     if first.isNull("INVUSEID"):
@@ -1214,14 +1214,14 @@ def fix_issue(context, query, state):
         fail("Sursa fara ITEMSETID")
     itemset=first.getString("ITEMSETID")
     if first.isNull("INVUSELINEID"):
-        lines=[]
+        lineset,lines=None,[]
     else:
         lineset,lines=query("INVUSELINE","INVUSELINEID=%s" % first.getLong("INVUSELINEID"),2)
     if len(lines)>1:
         fail("Linie de utilizare neunica")
     if not lines:
         return fix_issue_standalone(context, query, state, first, itemset)
-    return fix_issue_invuse(context, query, state, first, itemset, lines)
+    return fix_issue_invuse(context, query, state, first, itemset, lineset, lines)
 
 def execute(context):
     check_matrectrans_exit_cost()
