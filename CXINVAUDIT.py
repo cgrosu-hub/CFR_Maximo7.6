@@ -1,37 +1,16 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.31-SHIPRETURN-IN
-# SHIPRETURN cu cantitate pozitiva = intrare (restabileste SHIPTRANSFER), BADFIFO=N.
-# SHIPRETURN cu cantitate negativa = anulare pe pret (ca VOIDRECEIPT).
-# Linia PU-RECEPTIE: din descriere este urma pretului si se pastreaza la rescriere.
-# DIFERENTA: fara textul FIFO LOCAL si fara sectiunea diferenta.
-# INVLIFOFIFOCOST: pe acelasi pret suma cantitatilor; REFOBJECTID = cel mai vechi MATRECTRANS.
-# Doar ITEM.ROTATING=0. La ROTATING=1 straturile raman qty=1 / assetnum, fara comasare.
-# Afisarea SITUATIE STRATURI FIFO ramane pe straturi detaliate din CXSTOCURI.
-# COMMODITYGROUP nu filtreaza FIFO: o singura carte pe articol/gestiune.
-# Audit FIFO local CXSTOCURI. Reia verificarea inclusiv pe iesirea cu sold >= 0.
-# Un CXCURBAL negativ este soldul pretului curent, nu lipsa de stoc: daca un strat
-# anterior acopera iesirea, se consuma FIFO si se raporteaza diferenta de pret.
-# CXCURBAL < 0 => BADFIFO=Y mereu (chiar daca pretul FIFO e OK).
-# RECEIPT/SHIPRECEIPT cu cantitate negativa = iesire FIFO (comenzi/receptii negative),
-# nu „tip neimplementat”; pret OK => BADFIFO=N (nu blocheaza restul grupei).
-# VOIDRECEIPT / SHIPRETURN (qty<0) anuleaza stoc pe acelasi pret (receptia recenta).
-# SHIPRETURN (qty>0) si SHIPCANCEL restabilesc un SHIPTRANSFER (RECEIPTREF sau
-# match pe cantitate/pret); pun inapoi stratul si marcheaza BADFIFO=N.
-# Tipurile ambigue NU blocheaza auditul pe randurile urmatoare din grupa.
-# Conventie: N + MOTIV=ORDINE_DATE daca deficitul poate fi asociat unor intrari
-# ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
-# ORDINE_DATE este o exceptie de afisare aprobata; nu certifica data reala.
-# BADFIFO=Y pe diferenta de pret SAU pe sold CXCURBAL gresit/lipsa.
-# INITIAL valid: BADFIFO=N; mai multe INITIAL pe aceeasi data cu preturi diferite = OK
-# (straturi de deschidere). Refuza doar INITIAL duplicat pe acelasi pret / dupa miscari.
-# Popup: SITUATIE STRATURI FIFO (CXSTOCURI) + TOTALURI vs INVLIFOFIFOCOST.
-# Split lipsa: se scrie pe Info FIFO al randurilor din aceeasi linie, nu in popup.
-# INVBALANCES.CURBAL = TOTAL SOLD straturi, doar daca nu exista BADFIFO=Y/U;
-# apoi aliniaza INVLIFOFIFOCOST (sum QUANTITY) la aceleasi straturi.
-# Scrierea INVLIFOFIFOCOST pe setul copil al INVENTORY; MaxType Locale.US.
-# Scrie DESCRIPTION_LONGDESCRIPTION; pe conditiile de mai sus INVBALANCES/INVLIFO.
-# Fara expresii regulate, fara restrictii de pilot, fara mod dry-run.
+# VERSIUNE: 5.32-ROTATING-INVLIFO-DB
+# SHIPRETURN +qty = intrare; -qty = anulare pe pret (ca VOIDRECEIPT).
+# PU-RECEPTIE pastrata la rescriere. DIFERENTA fara FIFO LOCAL.
+# INVLIFO ROTATING=0: comasare pe pret (MBO update/delete, fara create).
+# INVLIFO ROTATING=1: dupa fara BADFIFO=Y/U si CURBAL=CXSTOCURI, sync SQL
+# insert/update/delete 1:1 pe straturile ramase, QUANTITY=1 (fara MBO.save).
+# COMMODITYGROUP nu filtreaza FIFO. CXCURBAL<0 => BADFIFO=Y.
+# RECEIPT/SHIPRECEIPT -qty = iesire FIFO. VOIDRECEIPT/SHIPRETURN -qty anuleaza pe pret.
+# SHIPRETURN +qty / SHIPCANCEL restabilesc SHIPTRANSFER; BADFIFO=N.
+# ORDINE_DATE = exceptie afisare (RefID anterior, pret OK). INITIAL multi-pret OK.
+# Popup: straturi CXSTOCURI + CURBAL + INVLIFO + totaluri. Split lipsa pe Info FIFO.
 
 from java.math import BigDecimal, MathContext, RoundingMode
 try:
@@ -101,7 +80,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.31-SHIPRETURN-IN"
+VERSION = "5.32-ROTATING-INVLIFO-DB"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -111,6 +90,7 @@ BEGIN = "CXFIFO_AUDIT_V2_BEGIN"
 END = "CXFIFO_AUDIT_V2_END"
 HEADER = "FIFO V2 | "
 ZERO = ExactNumber("0")
+ONE = ExactNumber("1")
 COST_TOLERANCE = ExactNumber("0.0005")
 QTY_TOLERANCE = ExactNumber("0.000001")
 ENTRY_TYPES = ("RECEIPT", "SHIPRECEIPT", "TRANSFER")
@@ -204,7 +184,6 @@ def consume(layers, required):
     return allocations
 
 def consume_at_cost(layers, required, cost, newest_first=False):
-    # VOIDRECEIPT anuleaza pe pret; newest_first leaga de receptia recenta anulata.
     allocations = []
     indexes = range(len(layers) - 1, -1, -1) if newest_first else range(len(layers))
     for index in indexes:
@@ -274,13 +253,11 @@ def ordinary_entry(row):
     return row.get("kind") in ENTRY_TYPES and row.get("qty") is not None and row["qty"] > QTY_TOLERANCE
 
 def normalize_fifo_groups(rows):
-    # Nu folosim COMMODITYGROUP la identificare: tot jurnalul e o carte FIFO.
     for row in rows:
         row["group"]=""
     return rows
 
 def flag(record):
-    # Y = pret gresit SAU sold CXCURBAL gresit/lipsa/negativ. INITIAL valid = N.
     row=record["row"]
     bal=row.get("balance")
     neg_sold=bal is not None and bal < -QTY_TOLERANCE
@@ -397,7 +374,6 @@ def return_target(row,group_rows,records):
     return expected,issue.get("ref_id"),source_ref,priority,source
 
 def shipcancel_target(row,group_rows,records,label="SHIPCANCEL"):
-    # SHIPCANCEL / SHIPRETURN(+qty) restabileste un SHIPTRANSFER: RECEIPTREF sau match.
     receipt_ref=row.get("receipt_ref")
     matches=[]
     if receipt_ref is not None:
@@ -426,7 +402,6 @@ def shipcancel_target(row,group_rows,records,label="SHIPCANCEL"):
     return expected,ship.get("ref_id"),source_ref,priority,source
 
 def is_ship_restore(row):
-    # SHIPCANCEL sau SHIPRETURN cu cantitate pozitiva (intrare in gestiunea curenta).
     kind=row.get("kind")
     qty=row.get("qty")
     if kind=="SHIPCANCEL":
@@ -484,8 +459,6 @@ def audit_rows(rows):
                 rec["reason"]=structural
                 continue
             if kind=="INITIAL":
-                # Mai multe INITIAL in aceeasi data cu preturi diferite = straturi de deschidere OK.
-                # Ambiguu doar: dupa miscari, pret/sold invalid, sau acelasi pret duplicat.
                 if (movement or cost is None or cost<ZERO or balance is None or balance<ZERO or
                     cost in openings):
                     structural="INITIAL incomplet/negativ/duplicat/dupa miscari"
@@ -535,7 +508,6 @@ def audit_rows(rows):
                 expected,link_ref,source_ref,priority,source=shipcancel_target(
                     row,group_rows,records,label=kind)
                 if expected is None:
-                    # Fara SHIPTRANSFER unic: totusi e intrare pe pretul documentului.
                     expected=cost
                     link_ref=None
                     source_ref=row.get("ref_id")
@@ -580,7 +552,6 @@ def audit_rows(rows):
                 local_started=True
                 continue
             if kind in AMBIGUOUS_TYPES:
-                # Doar acest rand; nu infecteaza structural restul grupei.
                 rec["reason"]="Tip %s fara alocare verificabila in jurnal" % kind
                 continue
             if abs(qty)<=QTY_TOLERANCE:
@@ -606,12 +577,10 @@ def audit_rows(rows):
                                    "source_ref_id":row.get("ref_id"),"source_ref_mbo":row.get("ref_mbo"),
                                    "initial":False,"priority":order(row)})
                     layers.sort(key=lambda l:l["priority"])
-                    # Intrare cu sold >= 0 reface baza locala (ca in CXFIFOFIX replay).
                     if balance is not None and balance>=ZERO:
                         recovering=False
                 rec["status"]="INPUT"
                 continue
-            # qty < 0: iesire FIFO. Include RECEIPT/SHIPRECEIPT negative (comenzi/receptii).
             if kind not in EXIT_TYPES and kind not in ENTRY_TYPES:
                 structural="Tip de iesire neimplementat: "+txt(kind)
                 rec["reason"]=structural
@@ -625,7 +594,6 @@ def audit_rows(rows):
             available=sum((l["qty"] for l in layers),ZERO)
             gate=balance is not None and balance>=ZERO
             covered=available+QTY_TOLERANCE>=-qty
-            # CXCURBAL tine soldul acestui pret. Stratul de la alt pret poate acoperi iesirea.
             if recovering and not gate and not covered:
                 mark_shortage(rec,layers,-qty,"Reluare in asteptare: sold negativ sau lipsa")
                 continue
@@ -640,7 +608,6 @@ def audit_rows(rows):
             rec["allocations"]=allocations
             rec["expected"]=sum((a["qty"]*a["cost"] for a in allocations),ZERO)/(-qty)
             rec["status"]="BAD" if far(cost,rec["expected"],COST_TOLERANCE) else "OK"
-        # Exceptia nu reordoneaza replay-ul si nu scade din nou intrarile.
         if not structural:
             apply_date_order_policy(group_rows,records)
         ledger+=sum(book.values(),ZERO)
@@ -904,7 +871,6 @@ def open_scope(inventory,name,with_itemset=False):
         raise
 
 def open_invlifofifocost(inventory):
-    # Set copil pe INVENTORY: CXINVLFIFO asteapta mbo.getOwner(); setul MXServer e fara owner.
     ms=inventory.getMboSet("INVLIFOFIFOCOST")
     if ms is None:
         raise ValueError("Relatia INVENTORY.INVLIFOFIFOCOST lipseste")
@@ -1021,7 +987,6 @@ def enrich_shipcancels(inventory,rows,script_service):
             row["receipt_ref"]=links.get(row.get("ref_id"))
 
 def journal_fifo_complete(audit):
-    # True doar fara BADFIFO=Y/U pe pret/sold si fara ORDINE_DATE/neverificat.
     if audit.get("ledger_qty") is None:
         return False,"Sold CXSTOCURI nedeterminabil"
     for rec in audit["records"].values():
@@ -1191,7 +1156,6 @@ def desired_fifo_layers(rows,audit):
     return layers
 
 def invlifo_age_key(layer):
-    # Cel mai vechi MATRECTRANSID first; altfel data/sursa.
     ref_mbo=normalize_ref_mbo(layer.get("ref_mbo"))
     ref_id=layer.get("ref_id")
     if ref_mbo=="MATRECTRANS" and ref_id is not None:
@@ -1199,8 +1163,6 @@ def invlifo_age_key(layer):
     return (1,txt(layer.get("date") or ""),layer.get("source") or 0)
 
 def collapse_invlifo_desired(layers):
-    # Pentru sync INVLIFOFIFOCOST: acelasi pret => o linie, suma cantitatilor,
-    # REFOBJECT/REFOBJECTID de la cel mai vechi MATRECTRANS.
     grouped=[]
     for layer in layers:
         matched=None
@@ -1253,8 +1215,6 @@ def same_ref(left_mbo,left_id,right_mbo,right_id):
     return normalize_ref_mbo(left_mbo)==normalize_ref_mbo(right_mbo) and left_id==right_id
 
 def plan_invlifo_alignment(desired,current):
-    # 1) match pe pret+REFOBJECT+REFOBJECTID
-    # 2) pentru straturi fara match: reutilizeaza surplus (nu create); restul surplus = delete
     unused=list(current)
     updates,keeps,missing=[],[],[]
     for layer in desired:
@@ -1312,7 +1272,6 @@ def parse_layer_date(value):
     return f.parse(txt(value)[:19])
 
 def apply_invlifo_layer(mbo,layer,flags,script_service):
-    # Actualizeaza randul existent la stratul CXSTOCURI (fara insert).
     put_invlifo_number(mbo,"UNITCOST",layer["cost"])
     put_invlifo_number(mbo,"QUANTITY",layer["qty"])
     ref_mbo=normalize_ref_mbo(layer.get("ref_mbo"))
@@ -1373,7 +1332,6 @@ def read_invbalances_curbal(inventory):
         close_set(ms)
 
 def put_invlifo_number(mbo,field,value):
-    # String + locale RO: "30.745" poate deveni 30745. MaxType US pastreaza zecimalul.
     from psdi.mbo import MboConstants
     from psdi.util import MaxType
     from java.util import Locale, TimeZone
@@ -1395,7 +1353,6 @@ def put_invlifo_number(mbo,field,value):
     return True
 
 def item_is_rotating(inventory):
-    # True = ROTATING=1 (strat pe asset, qty 1). None = ITEM negasit.
     from psdi.server import MXServer
     from psdi.mbo import SqlFormat
     ms=None
@@ -1417,6 +1374,191 @@ def item_is_rotating(inventory):
     finally:
         close_set(ms)
 
+def rotating_layer_units(qty):
+    if qty is None or qty<=QTY_TOLERANCE:
+        return 0
+    whole=qty.value.setScale(0,RoundingMode.HALF_EVEN)
+    if far(ExactNumber(whole),qty,QTY_TOLERANCE):
+        raise ValueError("ROTATING: sold strat non-intreg %s" % fmt_ro(qty))
+    n=int(whole.longValue())
+    if n<0:
+        raise ValueError("ROTATING: sold strat negativ")
+    return n
+
+def expand_rotating_desired(layers):
+    units=[]
+    for layer in layers:
+        for _ in range(rotating_layer_units(layer["qty"])):
+            units.append({"cost":layer["cost"],"qty":ONE,"ref_mbo":layer.get("ref_mbo"),
+                          "ref_id":layer.get("ref_id"),"date":layer.get("date"),
+                          "source":layer.get("source"),"priority":layer.get("priority"),
+                          "initial":bool(layer.get("initial"))})
+    return units
+
+def _rotating_row_ok(row,layer):
+    return (not far(row["cost"],layer["cost"],COST_TOLERANCE)
+            and not far(row["qty"],ONE,QTY_TOLERANCE)
+            and same_ref(row.get("ref_mbo"),row.get("ref_id"),layer.get("ref_mbo"),layer.get("ref_id")))
+
+def plan_rotating_invlifo(desired,current):
+    unused=list(current)
+    updates,keeps,missing=[],[],[]
+    for layer in desired:
+        cands=[r for r in unused if same_ref(r.get("ref_mbo"),r.get("ref_id"),
+                                             layer.get("ref_mbo"),layer.get("ref_id"))]
+        if not cands:
+            missing.append(layer)
+            continue
+        cands.sort(key=lambda r:(0 if _rotating_row_ok(r,layer) else 1,r["id"]))
+        chosen=cands[0]
+        unused.remove(chosen)
+        if _rotating_row_ok(chosen,layer):
+            keeps.append(chosen)
+        else:
+            updates.append({"row":chosen,"layer":layer,"reuse":False})
+    unused.sort(key=lambda r:r["id"])
+    creates=[]
+    for layer in missing:
+        if unused:
+            updates.append({"row":unused.pop(0),"layer":layer,"reuse":True})
+        else:
+            creates.append(layer)
+    return keeps,updates,unused,creates
+
+def _sql_ts(value):
+    from java.sql import Timestamp
+    d=parse_layer_date(value)
+    return None if d is None else Timestamp(d.getTime())
+
+def _sql_set_nullish(ps,idx,value,sql_type,as_long=False):
+    from java.sql import Types
+    if value is None:
+        ps.setNull(idx,sql_type)
+    elif as_long:
+        ps.setLong(idx,long(value))
+    elif sql_type==Types.VARCHAR:
+        ps.setString(idx,value)
+    else:
+        ps.setTimestamp(idx,value)
+
+def apply_rotating_invlifo_sql(inventory,keeps,updates,deletes,creates,script_service):
+    from psdi.server import MXServer
+    from java.util import UUID
+    from java.sql import Types
+    if inventory.isNull("ORGID") or inventory.isNull("ITEMSETID"):
+        raise ValueError("ORGID/ITEMSETID lipsa pe INVENTORY")
+    orgid,itemnum,itemset=inventory.getString("ORGID"),inventory.getString("ITEMNUM"),inventory.getString("ITEMSETID")
+    siteid,location=inventory.getString("SITEID"),inventory.getString("LOCATION")
+    db=MXServer.getMXServer().getDBManager()
+    key=inventory.getUserInfo().getConnectionKey()
+    con=ps_upd=ps_del=ps_ins=None
+    try:
+        con=db.getConnection(key)
+        if updates:
+            ps_upd=con.prepareStatement(
+                "UPDATE INVLIFOFIFOCOST SET UNITCOST=?,QUANTITY=?,COSTDATE=?,"
+                "REFOBJECT=?,REFOBJECTID=?,CONDRATE=?,COSTTYPE=? WHERE INVLIFOFIFOCOSTID=?")
+            for item in updates:
+                layer,row=item["layer"],item["row"]
+                ps_upd.setBigDecimal(1,layer["cost"].value)
+                ps_upd.setBigDecimal(2,ONE.value)
+                _sql_set_nullish(ps_upd,3,_sql_ts(layer.get("date")),Types.TIMESTAMP)
+                _sql_set_nullish(ps_upd,4,normalize_ref_mbo(layer.get("ref_mbo")),Types.VARCHAR)
+                _sql_set_nullish(ps_upd,5,layer.get("ref_id"),Types.BIGINT,True)
+                ps_upd.setInt(6,100)
+                ps_upd.setString(7,"FIFO")
+                ps_upd.setLong(8,long(row["id"]))
+                if ps_upd.executeUpdate()!=1:
+                    raise ValueError("UPDATE INVLIFOFIFOCOSTID=%s esuat" % row["id"])
+        if deletes:
+            ps_del=con.prepareStatement("DELETE FROM INVLIFOFIFOCOST WHERE INVLIFOFIFOCOSTID=?")
+            for row in deletes:
+                ps_del.setLong(1,long(row["id"]))
+                if ps_del.executeUpdate()!=1:
+                    raise ValueError("DELETE INVLIFOFIFOCOSTID=%s esuat" % row["id"])
+        if creates:
+            ps_ins=con.prepareStatement(
+                "INSERT INTO INVLIFOFIFOCOST (ORGID,ITEMNUM,ITEMSETID,CONDITIONCODE,COSTTYPE,"
+                "COSTDATE,UNITCOST,QUANTITY,REFOBJECT,CONDRATE,SITEID,LOCATION,REFOBJECTID,"
+                "CONTENTUID,INVLIFOFIFOCOSTID) VALUES "
+                "(?,?,?,NULL,'FIFO',?,?,?,?,100,?,?,?,?,NEXT VALUE FOR INVUSELINESPLITSEQ)")
+            for layer in creates:
+                ps_ins.setString(1,orgid); ps_ins.setString(2,itemnum); ps_ins.setString(3,itemset)
+                _sql_set_nullish(ps_ins,4,_sql_ts(layer.get("date")),Types.TIMESTAMP)
+                ps_ins.setBigDecimal(5,layer["cost"].value)
+                ps_ins.setBigDecimal(6,ONE.value)
+                _sql_set_nullish(ps_ins,7,normalize_ref_mbo(layer.get("ref_mbo")),Types.VARCHAR)
+                ps_ins.setString(8,siteid); ps_ins.setString(9,location)
+                _sql_set_nullish(ps_ins,10,layer.get("ref_id"),Types.BIGINT,True)
+                ps_ins.setString(11,UUID.randomUUID().toString())
+                if ps_ins.executeUpdate()!=1:
+                    raise ValueError("INSERT INVLIFOFIFOCOST esuat")
+        con.commit()
+        script_service.log_info("CXINVAUDIT ROTATING INVLIFO SQL keep=%s upd=%s del=%s ins=%s" % (
+            len(keeps),len(updates),len(deletes),len(creates)))
+    except Exception:
+        if con is not None:
+            try: con.rollback()
+            except Exception: pass
+        raise
+    finally:
+        for ps in (ps_upd,ps_del,ps_ins):
+            if ps is not None:
+                try: ps.close()
+                except Exception: pass
+        if con is not None:
+            db.freeConnection(key)
+
+def sync_invlifofifocost_rotating(inventory,rows,audit,script_service):
+    ok,reason=journal_fifo_complete(audit)
+    if not ok:
+        msg="CORECTIE INVLIFOFIFOCOST ROTATING: sarita (%s)" % reason
+        script_service.log_info("CXINVAUDIT "+msg); return msg
+    try:
+        desired=expand_rotating_desired(desired_fifo_layers(rows,audit))
+        curbal=read_invbalances_curbal(inventory)
+    except Exception as exc:
+        msg="CORECTIE INVLIFOFIFOCOST ROTATING: sarita (%s)" % txt(exc)
+        script_service.log_info("CXINVAUDIT "+msg); return msg
+    layers_qty=sum((u["qty"] for u in desired),ZERO)
+    if far(curbal,layers_qty,QTY_TOLERANCE):
+        msg="CORECTIE INVLIFOFIFOCOST ROTATING: sarita (CURBAL %s != CXSTOCURI %s)" % (
+            fmt_ro(curbal),fmt_ro(layers_qty))
+        script_service.log_info("CXINVAUDIT "+msg); return msg
+    ms=None
+    try:
+        ms=open_scope(inventory,"INVLIFOFIFOCOST",True)
+        current=[]
+        m=ms.moveFirst()
+        while m is not None:
+            if len(current)>=MAX_ROWS:
+                raise ValueError("Limita INVLIFOFIFOCOST depasita")
+            price,qty=numeric_field(m,"UNITCOST"),numeric_field(m,"QUANTITY")
+            if price is None or qty is None:
+                raise ValueError("INVLIFOFIFOCOST fara pret/cantitate")
+            current.append({"id":m.getLong("INVLIFOFIFOCOSTID"),"cost":price,"qty":qty,
+                "ref_mbo":None if m.isNull("REFOBJECT") else m.getString("REFOBJECT"),
+                "ref_id":None if m.isNull("REFOBJECTID") else m.getLong("REFOBJECTID")})
+            m=ms.moveNext()
+        keeps,updates,deletes,creates=plan_rotating_invlifo(desired,current)
+        if not updates and not deletes and not creates:
+            msg="CORECTIE INVLIFOFIFOCOST ROTATING: deja aliniat (%s x qty=1)" % len(keeps)
+            script_service.log_info("CXINVAUDIT "+msg); return msg
+        apply_rotating_invlifo_sql(inventory,keeps,updates,deletes,creates,script_service)
+        reused=sum(1 for i in updates if i.get("reuse"))
+        msg="\n".join([
+            "CORECTIE INVLIFOFIFOCOST ROTATING (SQL)",
+            "  Conditie: fara BADFIFO=Y/U; CURBAL=CXSTOCURI=%s" % fmt_ro(curbal),
+            "  Tinta: %s x QUANTITY=1" % len(desired),
+            "  Pastrate: %s | Update: %s (reuse %s) | Delete: %s | Insert: %s" % (
+                len(keeps),len(updates),reused,len(deletes),len(creates))])
+        script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | ")); return msg
+    except Exception as exc:
+        msg="CORECTIE INVLIFOFIFOCOST ROTATING ESUATA: %s" % txt(exc)
+        script_service.log_info("CXINVAUDIT "+msg); return msg
+    finally:
+        close_set(ms)
+
 def sync_invlifofifocost(inventory,rows,audit,script_service):
     from psdi.mbo import MboConstants
     flags=MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
@@ -1426,9 +1568,7 @@ def sync_invlifofifocost(inventory,rows,audit,script_service):
         script_service.log_info("CXINVAUDIT "+msg)
         return msg
     if rotating:
-        msg="CORECTIE INVLIFOFIFOCOST: sarita (ROTATING=1; straturi qty=1 pe asset, fara comasare)"
-        script_service.log_info("CXINVAUDIT "+msg)
-        return msg
+        return sync_invlifofifocost_rotating(inventory,rows,audit,script_service)
     desired=collapse_invlifo_desired(desired_fifo_layers(rows,audit))
     layers_qty=sum((layer["qty"] for layer in desired),ZERO)
     try:
@@ -1442,7 +1582,6 @@ def sync_invlifofifocost(inventory,rows,audit,script_service):
             fmt_ro(curbal),fmt_ro(layers_qty))
         script_service.log_info("CXINVAUDIT "+msg)
         return msg
-    # Nu inchide setul copil al INVENTORY (UI).
     try:
         ms=open_invlifofifocost(inventory)
         current=[]
@@ -1498,7 +1637,6 @@ def sync_invlifofifocost(inventory,rows,audit,script_service):
         return msg
 
 def invlifo_totals(inventory,rows,script_service):
-    # TOTALURI ca in reconcilierea veche: cantitate/valoare CXSTOCURI vs INVLIFOFIFOCOST.
     ms=None
     try:
         journal=recorded_balances_by_cost(rows)
@@ -1554,7 +1692,6 @@ def check_layer_beats_negative_balance():
     ])
     if blocked["records"][2]["status"]!="UNVERIFIED":
         raise ValueError("self-check: iesirea fara stoc nu trebuie certificata")
-    # COMMODITYGROUP diferit nu trebuie sa separe SHIPRECEIPT de SHIPTRANSFER.
     cross=audit_rows([
         dict(row(1,"2026-08-07 00:00:00.000000000",1337476211,"SHIPRECEIPT","1","1","1"),group="A"),
         dict(row(2,"2026-09-25 00:00:00.000000000",1337483496,"SHIPTRANSFER","-1","1","-1"),group="B"),
@@ -1604,7 +1741,6 @@ def check_layer_beats_negative_balance():
     sr_complete,sr_reason=journal_fifo_complete(shipret)
     if not sr_complete:
         raise ValueError("self-check: jurnalul SHIPRETURN trebuia complet OK: "+sr_reason)
-    # SHIPRETURN +qty = intrare: restabileste SHIPTRANSFER anterior (cazul gestiunii curente).
     shipret_in=audit_rows([
         row(1,"2026-01-01 00:00:00.000000000",1,"INITIAL","210","86","210"),
         row(2,"2026-03-10 00:00:00.000000000",20,"SHIPTRANSFER","-7","86","203"),
@@ -1650,8 +1786,6 @@ def check_layer_beats_negative_balance():
     sold_rec["row"]["balance"]=ExactNumber("-40")
     if flag(sold_rec)!="Y":
         raise ValueError("self-check: sold negativ trebuie BADFIFO=Y chiar daca pretul e OK")
-    # Receptii/comenzi cu cantitate negativa = iesiri FIFO; nu blocheaza grupa.
-    # Soldurile urmeaza cartea pe pret (12-6-2+4+10-2-6-2 => 8).
     neg_receipt=audit_rows([
         row(1,"2026-04-23 00:00:00.000000000",10,"RECEIPT","12","12.000","12"),
         row(2,"2026-04-24 00:51:00.000000000",20,"RECEIPT","-6","12.000","6"),
@@ -1694,6 +1828,23 @@ def check_layer_beats_negative_balance():
         [row for row in current if row["id"] in (1,3,5)])
     if len(missing_plan[3])!=1 or missing_plan[3][0]["cost"]!=ExactNumber("99.000"):
         raise ValueError("self-check: lipsa INVLIFOFIFOCOST trebuie semnalata fara create")
+    rot_units=expand_rotating_desired([
+        {"cost":ExactNumber("67.800"),"qty":ExactNumber("2"),"ref_mbo":"MATRECTRANS","ref_id":100,
+         "date":"2026-10-06 00:00:00.000000000","source":1,"priority":("G",1,0),"initial":False},
+        {"cost":ExactNumber("67.800"),"qty":ONE,"ref_mbo":"MATRECTRANS","ref_id":101,
+         "date":"2026-10-06 00:00:00.000000000","source":2,"priority":("G",2,0),"initial":False}])
+    if [u["ref_id"] for u in rot_units]!=[100,100,101] or any(far(u["qty"],ONE,QTY_TOLERANCE) for u in rot_units):
+        raise ValueError("self-check: ROTATING expand qty=1 / REFOBJECTID")
+    rot_cur=[{"id":1,"cost":ExactNumber("67.800"),"qty":ExactNumber("77"),"ref_mbo":"MATRECTRANS","ref_id":100},
+             {"id":2,"cost":ExactNumber("10.000"),"qty":ONE,"ref_mbo":"MATRECTRANS","ref_id":999}]
+    rk,ru,rd,rc=plan_rotating_invlifo(rot_units,rot_cur)
+    if rk or rd or len(ru)!=2 or len(rc)!=1 or rc[0]["ref_id"]!=101 or sorted(u["row"]["id"] for u in ru)!=[1,2]:
+        raise ValueError("self-check: ROTATING update/reuse/insert")
+    rk2,ru2,rd2,rc2=plan_rotating_invlifo(
+        [{"cost":ExactNumber("67.800"),"qty":ONE,"ref_mbo":"MATRECTRANS","ref_id":100}],
+        rot_cur+[{"id":3,"cost":ONE,"qty":ONE,"ref_mbo":"MATRECTRANS","ref_id":888}])
+    if rc2 or sorted(r["id"] for r in rd2)!=[2,3] or len(ru2)!=1 or ru2[0]["row"]["id"]!=1:
+        raise ValueError("self-check: ROTATING delete surplus")
     reuse_desired=[{"cost":ExactNumber("14.590"),"qty":ExactNumber("1"),
                     "ref_mbo":"MATRECTRANS","ref_id":1337422726}]
     reuse_current=[
@@ -1766,7 +1917,6 @@ def in_chunks(ids, size=300):
         start+=size
 
 def split_gap_by_matusetrans(inventory, rows, script_service):
-    # Pe fiecare linie cu split incomplet: nota scurta pentru randurile CXSTOCURI ale liniei.
     from psdi.mbo import SqlFormat
     try:
         have=set()
