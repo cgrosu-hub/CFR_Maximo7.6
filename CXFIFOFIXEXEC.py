@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.52-METHOD-SPLIT
+# VERSIUNE: 3.53-KIND-SCOPE
 # Partea 2 a CXFIFOFIXISSUE. Fara launch point. Nu se ruleaza singur.
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # ISSUE rotating=1: corectie UNITCOST/CXCURBAL in CXSTOCURI (NOLOT, fara condition).
@@ -147,6 +147,7 @@ def fix_shipcancel(context, query, state):
 
 def fix_matrectrans_exit(context, query, state):
     # Iesire MATRECTRANS multi/single pret.
+    kind=context.getString("CXREF")
     receipt_exit=kind in MATREC_RECEIPT_EXITS
     rmset,receipts=query("MATRECTRANS","MATRECTRANSID=%s" % context.getLong("CXREFID"),2)
     if len(receipts)!=1:
