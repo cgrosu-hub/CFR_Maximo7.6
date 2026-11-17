@@ -1,8 +1,9 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.48-TRANSFER-JOURNAL-SPLIT
+# VERSIUNE: 3.49-SHIPRETURN-IN
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython 100000 caractere).
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
+# SHIPRETURN (+qty) in replay = intrare/restabilire, ca SHIPCANCEL.
 # MATRECTRANS isi pastreaza cantitatea. Necesita CXFIFOFIXEXEC + CXADDTOCXSTOCURI.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -78,7 +79,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION="3.48-TRANSFER-JOURNAL-SPLIT"
+VERSION="3.49-SHIPRETURN-IN"
 APP="INVENTOR"
 OPTION="CXFIFOFIXISSUE"
 TABLE_ID="1792055730066"
@@ -346,9 +347,9 @@ def replay(prior,links=None):
             restore_return(layers,qty,matches[0],issue_allocs.get(issue_id) or [],restore_cost,prior)
             started=True
             continue
-        if kind=="SHIPCANCEL":
+        if kind=="SHIPCANCEL" or (kind=="SHIPRETURN" and qty>ZERO):
             if qty<=ZERO:
-                fail("SHIPCANCEL anterior fara cantitate pozitiva RefID=%s" % r["ref"])
+                fail("%s anterior fara cantitate pozitiva RefID=%s" % (kind,r["ref"]))
             matches=[p for p in prior if p.get("kind")=="SHIPTRANSFER" and order(p)<order(r)
                      and p.get("qty") is not None and not different(-p["qty"],qty)
                      and p.get("cost") is not None and not different(p["cost"],cost,PRICE_EPS)]
@@ -856,6 +857,15 @@ def check_matrectrans_exit_cost():
         raise ValueError("self-check: SHIPTRANSFER multi strat1")
     if different(segs[1]["qty"],ExactNumber("18")) or different(segs[1]["cost"],ExactNumber("0.120"),PRICE_EPS):
         raise ValueError("self-check: SHIPTRANSFER multi strat2")
+    # SHIPRETURN +qty restabileste SHIPTRANSFER in replay (intrare).
+    layers=replay([
+        row(1,"2026-01-01 00:00:00.000000000",1,"INITIAL","210","86","210","CXSTOCURI"),
+        row(2,"2026-03-10 00:00:00.000000000",20,"SHIPTRANSFER","-7","86","203"),
+        row(3,"2026-03-10 00:00:00.000000000",30,"SHIPRETURN","7","86","210"),
+    ])
+    available=sum((l["qty"] for l in layers),ZERO)
+    if different(available,ExactNumber("210")):
+        raise ValueError("self-check: SHIPRETURN pozitiv trebuie sa restabileasca stocul")
 
 
 EXEC_SCRIPT="CXFIFOFIXEXEC"

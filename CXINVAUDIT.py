@@ -1,6 +1,8 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.30-PU-TRACE
+# VERSIUNE: 5.31-SHIPRETURN-IN
+# SHIPRETURN cu cantitate pozitiva = intrare (restabileste SHIPTRANSFER), BADFIFO=N.
+# SHIPRETURN cu cantitate negativa = anulare pe pret (ca VOIDRECEIPT).
 # Linia PU-RECEPTIE: din descriere este urma pretului si se pastreaza la rescriere.
 # DIFERENTA: fara textul FIFO LOCAL si fara sectiunea diferenta.
 # INVLIFOFIFOCOST: pe acelasi pret suma cantitatilor; REFOBJECTID = cel mai vechi MATRECTRANS.
@@ -13,9 +15,9 @@
 # CXCURBAL < 0 => BADFIFO=Y mereu (chiar daca pretul FIFO e OK).
 # RECEIPT/SHIPRECEIPT cu cantitate negativa = iesire FIFO (comenzi/receptii negative),
 # nu „tip neimplementat”; pret OK => BADFIFO=N (nu blocheaza restul grupei).
-# VOIDRECEIPT/SHIPRETURN anuleaza stoc pe acelasi pret (receptia cea mai recenta).
-# SHIPCANCEL (qty>0) restabileste stocul anularii unui SHIPTRANSFER (RECEIPTREF sau
-# match pe cantitate/pret); pune inapoi stratul si marcheaza BADFIFO=N.
+# VOIDRECEIPT / SHIPRETURN (qty<0) anuleaza stoc pe acelasi pret (receptia recenta).
+# SHIPRETURN (qty>0) si SHIPCANCEL restabilesc un SHIPTRANSFER (RECEIPTREF sau
+# match pe cantitate/pret); pun inapoi stratul si marcheaza BADFIFO=N.
 # Tipurile ambigue NU blocheaza auditul pe randurile urmatoare din grupa.
 # Conventie: N + MOTIV=ORDINE_DATE daca deficitul poate fi asociat unor intrari
 # ulterioare, acelasi CXREFMBO, RefID mai mic, pret compatibil si cantitate suficienta.
@@ -99,7 +101,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.29-SKIP-ROTATING-INVLIFO"
+VERSION = "5.31-SHIPRETURN-IN"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
@@ -394,8 +396,8 @@ def return_target(row,group_rows,records):
         source,source_ref,priority=issue["id"],issue.get("ref_id"),order(issue)
     return expected,issue.get("ref_id"),source_ref,priority,source
 
-def shipcancel_target(row,group_rows,records):
-    # SHIPCANCEL restabileste un SHIPTRANSFER: RECEIPTREF sau match cantitate/pret.
+def shipcancel_target(row,group_rows,records,label="SHIPCANCEL"):
+    # SHIPCANCEL / SHIPRETURN(+qty) restabileste un SHIPTRANSFER: RECEIPTREF sau match.
     receipt_ref=row.get("receipt_ref")
     matches=[]
     if receipt_ref is not None:
@@ -407,7 +409,7 @@ def shipcancel_target(row,group_rows,records):
                  and r.get("qty") is not None and qty is not None and not far(-r["qty"],qty,QTY_TOLERANCE)
                  and r.get("cost") is not None and cost is not None and not far(r["cost"],cost,COST_TOLERANCE)]
     if len(matches)!=1:
-        return None,"SHIPCANCEL fara SHIPTRANSFER unic anterior (RECEIPTREF/cantitate/pret)",None,None,None
+        return None,"%s fara SHIPTRANSFER unic anterior (RECEIPTREF/cantitate/pret)" % label,None,None,None
     ship=matches[0]
     rec=records[ship["id"]]
     if rec["status"] in ("OK","BAD","DATE_ORDER") and rec["expected"] is not None:
@@ -422,6 +424,14 @@ def shipcancel_target(row,group_rows,records):
     else:
         source,source_ref,priority=ship["id"],ship.get("ref_id"),order(ship)
     return expected,ship.get("ref_id"),source_ref,priority,source
+
+def is_ship_restore(row):
+    # SHIPCANCEL sau SHIPRETURN cu cantitate pozitiva (intrare in gestiunea curenta).
+    kind=row.get("kind")
+    qty=row.get("qty")
+    if kind=="SHIPCANCEL":
+        return True
+    return kind=="SHIPRETURN" and qty is not None and qty>QTY_TOLERANCE
 
 def audit_rows(rows):
     records=dict((r["id"],new_local_record(r)) for r in rows)
@@ -518,13 +528,27 @@ def audit_rows(rows):
                 local_prices.add(expected)
                 local_started=True
                 continue
-            if kind=="SHIPCANCEL":
+            if kind=="SHIPCANCEL" or (kind=="SHIPRETURN" and qty>QTY_TOLERANCE):
                 if qty<=QTY_TOLERANCE:
-                    rec["reason"]="SHIPCANCEL fara cantitate pozitiva"
+                    rec["reason"]="%s fara cantitate pozitiva" % kind
                     continue
-                expected,link_ref,source_ref,priority,source=shipcancel_target(row,group_rows,records)
+                expected,link_ref,source_ref,priority,source=shipcancel_target(
+                    row,group_rows,records,label=kind)
                 if expected is None:
-                    rec["reason"]=link_ref
+                    # Fara SHIPTRANSFER unic: totusi e intrare pe pretul documentului.
+                    expected=cost
+                    link_ref=None
+                    source_ref=row.get("ref_id")
+                    priority=order(row)
+                    source=row["id"]
+                    source_mbo=row.get("ref_mbo")
+                    rec["expected"]=expected
+                    rec["status"]="OK"
+                    rec["allocations"]=[{"qty":qty,"cost":expected,"source":source,"source_ref_id":source_ref,
+                                         "initial":False,"priority":priority}]
+                    put_back(layers,qty,expected,priority,source,source_ref,source_mbo)
+                    local_prices.add(expected)
+                    local_started=True
                     continue
                 rec["expected"]=expected
                 rec["link_ref"]=link_ref
@@ -777,15 +801,15 @@ def description_visible(old, record, summary):
     status=record["status"]
     if status=="DATE_ORDER":
         info="OK: pret compatibil %s; intrare ulterioara cu RefID anterior; data iesirii de verificat (conventie)" % fmt_ro(record["expected"])
-    elif status=="OK" and row.get("kind") in VOID_TYPES:
+    elif status=="OK" and row.get("kind") in VOID_TYPES and row.get("qty") is not None and row["qty"]<-QTY_TOLERANCE:
         info="OK: %s anuleaza %s buc. la %s" % (row.get("kind"),fmt_ro(-row["qty"]),fmt_ro(record["expected"]))
-    elif status=="OK" and row.get("kind")=="SHIPCANCEL":
-        info="OK: SHIPCANCEL restabileste %s buc. la %s" % (fmt_ro(row["qty"]),fmt_ro(record["expected"]))
+    elif status=="OK" and is_ship_restore(row):
+        info="OK: %s restabileste %s buc. la %s" % (row.get("kind"),fmt_ro(row["qty"]),fmt_ro(record["expected"]))
     elif status=="OK":
         info="OK: FIFO LOCAL asteptat %s" % fmt_ro(record["expected"])
-    elif status=="BAD" and row.get("kind")=="SHIPCANCEL":
-        info="DIFERENTA: SHIPCANCEL pret %s; asteptat %s" % (
-            fmt_ro(row["cost"]),fmt_ro(record["expected"]))
+    elif status=="BAD" and is_ship_restore(row):
+        info="DIFERENTA: %s pret %s; asteptat %s" % (
+            row.get("kind"),fmt_ro(row["cost"]),fmt_ro(record["expected"]))
     elif status=="BAD":
         info="DIFERENTA: pret %s; asteptat %s" % (
             fmt_ro(row["cost"]),fmt_ro(record["expected"]))
@@ -794,7 +818,7 @@ def description_visible(old, record, summary):
     else:
         info="NEVERIFICAT: "+record["reason"]
     if record.get("link_ref") is not None and status in ("OK","BAD"):
-        if row.get("kind")=="SHIPCANCEL":
+        if is_ship_restore(row):
             info+="; expediere %s" % record["link_ref"]
         else:
             info+="; consum %s" % record["link_ref"]
@@ -974,7 +998,9 @@ def enrich_returns(inventory,rows,script_service):
 
 def enrich_shipcancels(inventory,rows,script_service):
     from psdi.server import MXServer
-    pending=sorted(set(r["ref_id"] for r in rows if r.get("kind")=="SHIPCANCEL" and r.get("ref_mbo")=="MATRECTRANS" and r.get("ref_id") is not None))
+    pending=sorted(set(r["ref_id"] for r in rows
+                       if r.get("kind") in ("SHIPCANCEL","SHIPRETURN") and r.get("ref_mbo")=="MATRECTRANS"
+                       and r.get("ref_id") is not None))
     links={}
     for start in range(0,len(pending),500):
         ms=None
@@ -987,11 +1013,11 @@ def enrich_shipcancels(inventory,rows,script_service):
                 links[m.getLong("MATRECTRANSID")]=None if m.isNull("RECEIPTREF") else m.getLong("RECEIPTREF")
                 m=ms.moveNext()
         except Exception as exc:
-            script_service.log_info("CXINVAUDIT legatura SHIPCANCEL indisponibila: "+txt(exc))
+            script_service.log_info("CXINVAUDIT legatura SHIPCANCEL/SHIPRETURN indisponibila: "+txt(exc))
         finally:
             close_set(ms)
     for row in rows:
-        if row.get("kind")=="SHIPCANCEL" and row.get("ref_mbo")=="MATRECTRANS":
+        if row.get("kind") in ("SHIPCANCEL","SHIPRETURN") and row.get("ref_mbo")=="MATRECTRANS":
             row["receipt_ref"]=links.get(row.get("ref_id"))
 
 def journal_fifo_complete(audit):
@@ -1006,7 +1032,7 @@ def journal_fifo_complete(audit):
         f=flag(rec)
         if f=="Y":
             return False,"Exista BADFIFO=Y (pret sau sold CXCURBAL gresit)"
-        if f=="U" and (is_outgoing(row) or row.get("kind") in ("RETURN","SHIPCANCEL")):
+        if f=="U" and (is_outgoing(row) or row.get("kind") in ("RETURN","SHIPCANCEL") or is_ship_restore(row)):
             return False,"Exista iesiri/retururi/anulari neverificate"
         if row.get("kind")!="INITIAL" and not row.get("date"):
             return False,"Exista tranzactii fara data in CXSTOCURI"
@@ -1578,6 +1604,21 @@ def check_layer_beats_negative_balance():
     sr_complete,sr_reason=journal_fifo_complete(shipret)
     if not sr_complete:
         raise ValueError("self-check: jurnalul SHIPRETURN trebuia complet OK: "+sr_reason)
+    # SHIPRETURN +qty = intrare: restabileste SHIPTRANSFER anterior (cazul gestiunii curente).
+    shipret_in=audit_rows([
+        row(1,"2026-01-01 00:00:00.000000000",1,"INITIAL","210","86","210"),
+        row(2,"2026-03-10 00:00:00.000000000",20,"SHIPTRANSFER","-7","86","203"),
+        row(3,"2026-03-10 00:00:00.000000000",30,"SHIPRETURN","7","86","210"),
+        row(4,"2026-03-30 00:00:00.000000000",40,"SHIPTRANSFER","-10","86","200"),
+    ])
+    if shipret_in["records"][3]["status"]!="OK":
+        raise ValueError("self-check: SHIPRETURN pozitiv trebuie OK")
+    if flag(shipret_in["records"][3])!="N":
+        raise ValueError("self-check: SHIPRETURN pozitiv trebuie BADFIFO=N")
+    if shipret_in["records"][3].get("link_ref")!=20:
+        raise ValueError("self-check: SHIPRETURN pozitiv trebuie legat de SHIPTRANSFER")
+    if shipret_in["records"][4]["status"]!="OK" or flag(shipret_in["records"][4])!="N":
+        raise ValueError("self-check: SHIPTRANSFER dupa SHIPRETURN pozitiv trebuie OK/N")
     shipcancel=audit_rows([
         row(1,"2026-02-01 00:00:00.000000000",10,"SHIPRECEIPT","500","11.340","500"),
         row(2,"2026-02-02 00:00:00.000000000",20,"SHIPTRANSFER","-54","11.340","446"),
