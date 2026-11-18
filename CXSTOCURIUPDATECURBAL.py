@@ -1,20 +1,20 @@
 # SCRIPT: CXSTOCURIUPDATECURBAL
 # AUTOR: Fernando Prajitura; aliniat la ledger-ul FIFO de Cristian Grosu
-# VERSIUNE: 2026.11.18-SAME-DAY
+# VERSIUNE: 2026.11.18-SAME-DAY-ON
 # ISSUE legat de MATRECTRANS: diferenta de pret de 0.001 si LINECOST egal cu
 # valoarea receptiei -> UNITCOST din jurnal devine pretul receptiei.
 # Urma: DESCRIPTION_LONGDESCRIPTION, linie "PU-RECEPTIE:". Apoi se recalculeaza
 # ambele partitii de pret, chiar daca CXCURBAL nu mai e null.
 # Completeaza CXCURBAL pe partitiile care inca il au null.
-# Same-day (opt-in): iesiri inaintea intrarilor din aceeasi zi => SQL
-# CXDOCUMENTDATE/ACTUALDATE la max(intrari)+1..N min, apoi CXCURBAL.
-# Partitia: ITEMNUM, SITEID, LOCATION, COMMODITYGROUP, UNITCOST
+# Same-day (implicit ON, validat pe Check FIFO): iesiri inaintea intrarilor
+# din aceeasi zi => SQL CXDOCUMENTDATE/ACTUALDATE la max(intrari)+1..N min,
+# apoi CXCURBAL. Partitia: ITEMNUM, SITEID, LOCATION, COMMODITYGROUP, UNITCOST
 # Ordine ledger: CXDOCUMENTDATE, CXREFID (null=0), CXSTOCURIID.
 #
 # cfr.inventory.updateAllCxStocuri = true  -> toate partitiile
 # altfel -> doar partitiile cu cel putin un CXCURBAL null
 # cfr.inventory.numHistoryDaysToUpdate = N -> in modul null, ultimele N zile
-# cfr.inventory.sameDayReorder = true -> activeaza reordonarea same-day
+# cfr.inventory.sameDayReorder = false -> opreste reordonarea same-day
 # cfr.inventory.sameDayReorderMax = N -> plafon mutari / rulare (default 500)
 
 from java.math import BigDecimal
@@ -500,8 +500,16 @@ def label_of(seed):
     return "%s | %s | %s | %s | %s" % (item, site, location, group, cost)
 
 
-def prop_true(server, name):
-    return str(server.getProperty(name)).strip().lower() in ("true", "1", "yes")
+def prop_true(server, name, default=False):
+    raw = server.getProperty(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    text = str(raw).strip().lower()
+    if text in ("false", "0", "no"):
+        return False
+    if text in ("true", "1", "yes"):
+        return True
+    return default
 
 
 def prop_positive(server, name, default):
@@ -770,7 +778,8 @@ def main():
     full = prop_true(server, "cfr.inventory.updateAllCxStocuri")
     days = None if full else positive_days(server.getProperty("cfr.inventory.numHistoryDaysToUpdate"))
     where = seed_where(full, days)
-    same_day = prop_true(server, "cfr.inventory.sameDayReorder")
+    # Same-day implicit ON (validat pe Check FIFO); false/0/no il opreste.
+    same_day = prop_true(server, "cfr.inventory.sameDayReorder", default=True)
     same_day_max = prop_positive(server, "cfr.inventory.sameDayReorderMax", DEFAULT_SAME_DAY_MAX)
     service.log_error("CXSTOCURIUPDATECURBAL start mod=%s filtru=%s sameDay=%s max=%s" % (
         "complet" if full else "null", where, same_day, same_day_max))
