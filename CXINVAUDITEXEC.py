@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDITEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.33-SAMESEC-SPLIT
+# VERSIUNE: 5.34-SELFCHECK-SCOPE
 # Partea 2 a CXINVAUDIT. Fara launch point. Nu se ruleaza singur.
 # Same-second reorder + audit + CURBAL/INVLIFO sync. Sub 100000 caractere.
 
@@ -1250,6 +1250,9 @@ def check_layer_fifo_basics():
     ])
     if blocked["records"][2]["status"]!="UNVERIFIED":
         raise ValueError("self-check: iesirea fara stoc nu trebuie certificata")
+    bad_complete,bad_reason=journal_fifo_complete(blocked)
+    if bad_complete:
+        raise ValueError("self-check: jurnalul insuficient nu trebuie sa autorizeze CURBAL")
     cross=audit_rows([
         dict(_audit_self_row(1,"2026-08-07 00:00:00.000000000",1337476211,"SHIPRECEIPT","1","1","1"),group="A"),
         dict(_audit_self_row(2,"2026-09-25 00:00:00.000000000",1337483496,"SHIPTRANSFER","-1","1","-1"),group="B"),
@@ -1282,6 +1285,17 @@ def check_layer_void_ship():
     ok_complete,ok_reason=journal_fifo_complete(voided)
     if not ok_complete:
         raise ValueError("self-check: jurnalul VOIDRECEIPT trebuia considerat complet OK: "+ok_reason)
+    sold_rec=voided["records"][4]
+    sold_rec["balance_bad"]=True
+    if flag(sold_rec)!="Y":
+        raise ValueError("self-check: sold gresit trebuie BADFIFO=Y")
+    sold_rec["balance_bad"]=False
+    if flag(sold_rec)!="N":
+        raise ValueError("self-check: ISSUE OK fara sold gresit trebuie BADFIFO=N")
+    sold_rec["row"]=dict(sold_rec["row"])
+    sold_rec["row"]["balance"]=ExactNumber("-40")
+    if flag(sold_rec)!="Y":
+        raise ValueError("self-check: sold negativ trebuie BADFIFO=Y chiar daca pretul e OK")
 
 def check_layer_shipreturn_cancel():
     shipret=audit_rows([
@@ -1334,20 +1348,6 @@ def check_layer_shipreturn_cancel():
     sc_complete,sc_reason=journal_fifo_complete(shipcancel)
     if not sc_complete:
         raise ValueError("self-check: jurnalul SHIPCANCEL trebuia complet OK: "+sc_reason)
-    bad_complete,bad_reason=journal_fifo_complete(blocked)
-    if bad_complete:
-        raise ValueError("self-check: jurnalul insuficient nu trebuie sa autorizeze CURBAL")
-    sold_rec=voided["records"][4]
-    sold_rec["balance_bad"]=True
-    if flag(sold_rec)!="Y":
-        raise ValueError("self-check: sold gresit trebuie BADFIFO=Y")
-    sold_rec["balance_bad"]=False
-    if flag(sold_rec)!="N":
-        raise ValueError("self-check: ISSUE OK fara sold gresit trebuie BADFIFO=N")
-    sold_rec["row"]=dict(sold_rec["row"])
-    sold_rec["row"]["balance"]=ExactNumber("-40")
-    if flag(sold_rec)!="Y":
-        raise ValueError("self-check: sold negativ trebuie BADFIFO=Y chiar daca pretul e OK")
     neg_receipt=audit_rows([
         _audit_self_row(1,"2026-04-23 00:00:00.000000000",10,"RECEIPT","12","12.000","12"),
         _audit_self_row(2,"2026-04-24 00:51:00.000000000",20,"RECEIPT","-6","12.000","6"),
