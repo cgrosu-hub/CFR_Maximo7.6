@@ -1,10 +1,11 @@
 # SCRIPT: CXFIFOFIXEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.54-LINESET-SCOPE
+# VERSIUNE: 3.55-SHIPRETURN-VOID
 # Partea 2 a CXFIFOFIXISSUE. Fara launch point. Nu se ruleaza singur.
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # ISSUE rotating=1: corectie UNITCOST/CXCURBAL in CXSTOCURI (NOLOT, fara condition).
 # SHIPCANCEL (+qty): intrare; pretul FIFO din SHIPTRANSFER legat (si pe rotating=1).
+# SHIPRETURN (qty<0): anulare pe pret (ca VOIDRECEIPT); pret + CXCURBAL.
 # execute() dispatcher; handlere separate (limita JVM ~64KB bytecode / metoda).
 # Jython: sub 100000 caractere, altfel BMXAA7836E Mark invalid.
 
@@ -137,6 +138,138 @@ def fix_shipcancel(context, query, state):
         state["committed"]=True
         message="SALVAT SHIPCANCEL %s la %s, pretul FIFO al expedierii %s." % (
             rm.getLong("MATRECTRANSID"),fmt(cost),ship.get("ref"))
+        message+="\nRuleaza Check FIFO."
+    try:
+        if not refresh_table(context):
+            message+="\nRedeschide articolul pentru refresh."
+    except Exception:
+        message+="\nRefresh nereusit; redeschide articolul."
+    return message
+
+def fix_shipreturn_void(context, query, state):
+    # SHIPRETURN qty<0: anulare pe pret (ca VOIDRECEIPT); rescrie pret daca e nevoie + CXCURBAL.
+    rmset,receipts=query("MATRECTRANS","MATRECTRANSID=%s" % context.getLong("CXREFID"),2)
+    if len(receipts)!=1:
+        fail("MATRECTRANS tinta lipsa/neunic")
+    rm=receipts[0]
+    if rm.getString("ISSUETYPE")!="SHIPRETURN":
+        fail("ISSUETYPE pe MATRECTRANS difera de CXREF")
+    qty_doc=number(rm,"QUANTITY")
+    qty_ctx=number(context,"CXQTY")
+    if qty_ctx>=ZERO:
+        fail("Selecteaza SHIPRETURN cu cantitate negativa (anulare receptie)")
+    if qty_doc>ZERO:
+        qty_journal=-qty_doc
+    elif qty_doc<ZERO:
+        qty_journal=qty_doc
+    else:
+        fail("SHIPRETURN fara cantitate")
+    if different(qty_journal,qty_ctx):
+        fail("Cantitate jurnal != MATRECTRANS")
+    if number(rm,"CONVERSION")!=ONE or number(rm,"EXCHANGERATE")!=ONE:
+        fail("Conversie unitati/valuta diferita de 1")
+    rate2=number(rm,"EXCHANGERATE2",True)
+    if (rate2 is not None and rate2!=ONE) or (not rm.isNull("LINECOST2") and rate2!=ONE):
+        fail("Conversie moneda secundara netratata")
+    if rm.isNull("ACTUALDATE") or rm.isNull("TRANSDATE"):
+        fail("Data sursa lipsa")
+    if rm.getString("ITEMNUM")!=context.getString("ITEMNUM"):
+        fail("Articol diferit fata de randul apasat")
+    site=context.getString("SITEID")
+    if rm.getString("SITEID")!=site:
+        fail("Site receptie neconform")
+    cxwhere=scope_where(context,"CXSTOCURI")
+    cxset,raw=query("CXSTOCURI",cxwhere)
+    all_journal=[journal_row(m) for m in raw]
+    bind_screen_journal(context,all_journal)
+    if any(m.getString("CURRENCYCODE")!=rm.getString("CURRENCYCODE") for m in raw if not m.isNull("CURRENCYCODE")):
+        fail("Monede diferite intre jurnal si MATRECTRANS")
+    journal=sorted(all_journal,key=order)
+    positions=[i for i,r in enumerate(journal)
+               if r["refmbo"]=="MATRECTRANS" and r["ref"]==rm.getLong("MATRECTRANSID")
+               and r["kind"]=="SHIPRETURN" and r["qty"] is not None and r["qty"]<ZERO]
+    if len(positions)!=1:
+        fail("SHIPRETURN %s are %s randuri negative in CXSTOCURI" % (
+            rm.getLong("MATRECTRANSID"),len(positions)))
+    pos=positions[0]
+    ij=journal[pos]
+    if ij["id"]!=context.getLong("CXSTOCURIID") or text(ij["mbo"].getRowStamp())!=text(context.getRowStamp()):
+        fail("Rand apasat schimbat; refresh necesar")
+    if ij["date"]!=datekey(rm.getDate("ACTUALDATE")) or different(ij["qty"],qty_journal):
+        fail("Cantitate/data jurnal != MATRECTRANS")
+    # Pret asteptat: RECEIPTREF (SHIPRECEIPT/RECEIPT), altfel receptie unica pe cantitate, altfel pret jurnal.
+    receipt_id=None if rm.isNull("RECEIPTREF") else rm.getLong("RECEIPTREF")
+    sources=[]
+    if receipt_id is not None:
+        sources=[r for r in journal if r["refmbo"]=="MATRECTRANS" and r["ref"]==receipt_id
+                 and r["kind"] in ("SHIPRECEIPT","RECEIPT") and order(r)<order(ij)
+                 and r.get("qty") is not None and r["qty"]>ZERO]
+    if len(sources)!=1:
+        candidates=[r for r in journal if r["kind"] in ("SHIPRECEIPT","RECEIPT") and order(r)<order(ij)
+                    and r.get("qty") is not None and not different(r["qty"],-qty_journal)
+                    and r.get("cost") is not None]
+        if len(candidates)==1:
+            sources=candidates
+        elif ij.get("cost") is not None:
+            sources=[]
+        else:
+            fail("SHIPRETURN fara receptie sursa unica (RECEIPTREF/cantitate)")
+    if len(sources)==1 and sources[0].get("cost") is not None:
+        cost=sources[0]["cost"]
+        source_ref=sources[0].get("ref")
+    else:
+        cost=ij["cost"]
+        source_ref=None
+    if cost is None or cost<ZERO or ExactNumber(cost.fixed(3))!=cost:
+        fail("Pretul de anulare SHIPRETURN nu poate fi scris")
+    layers=replay(journal[:pos],issue_of_returns(journal[:pos],query))
+    allocation,short=consume_at_cost(layers,-qty_journal,cost,newest_first=True)
+    if short>EPS or not allocation:
+        fail("Stoc pe pret insuficient pentru anulare SHIPRETURN")
+    plans=[]
+    def plan_number(m,field,value):
+        old=number(m,field,True)
+        if old is None or old!=value:
+            plans.append((m,field,"NUMBER",value,text(old)))
+    value=money(qty_doc*cost)
+    for f in ("UNITCOST","ACTUALCOST","CURRENCYUNITCOST"):
+        plan_number(rm,f,cost)
+    for f in ("LINECOST","CURRENCYLINECOST"):
+        plan_number(rm,f,value)
+    if not rm.isNull("LINECOST2"):
+        plan_number(rm,"LINECOST2",value)
+    changes={ij["id"]:{"qty":qty_journal,"cost":cost}}
+    after=ledger(journal,changes)
+    plan_number(ij["mbo"],"UNITCOST",cost)
+    for r in journal:
+        plan_number(r["mbo"],"CXCURBAL",after[r["id"]])
+    if not plans:
+        message="SHIPRETURN %s este deja la pretul de anulare %s; nimic modificat." % (
+            rm.getLong("MATRECTRANSID"),fmt(cost))
+    else:
+        planned_tables=set(m.getName().upper() for m,f,k,v,old in plans)
+        select_write_sets(planned_tables,{"MATRECTRANS":rmset,"CXSTOCURI":cxset})
+        write_sets=owns(plans)
+        state["tx"]=MXServer.getMXServer().createMXTransaction()
+        for name,ms in write_sets:
+            ms.setFlag(MboConstants.NOSAVE,False)
+            ms.setMXTransaction(state["tx"])
+            state["tx"].add(ms)
+        for m,f,k,value,old in plans:
+            writable(m)
+            put_number(m,f,value)
+        state["tx"].save()
+        for m,f,k,value,old in plans:
+            if different(number(m,f),value):
+                fail("Logica de salvare a suprascris planul pe %s.%s; rollback" % (m.getName(),f))
+        state["commit_started"]=True
+        state["tx"].commit()
+        state["committed"]=True
+        message="SALVAT SHIPRETURN %s anulare la %s, valoare %s" % (
+            rm.getLong("MATRECTRANSID"),fmt(cost),fmt(value))
+        if source_ref is not None:
+            message+="; sursa %s" % source_ref
+        message+="."
         message+="\nRuleaza Check FIFO."
     try:
         if not refresh_table(context):
@@ -1246,12 +1379,15 @@ def execute(context):
         if kind=="SHIPCANCEL":
             if number(context,"CXQTY")<=ZERO:
                 fail("Selecteaza SHIPCANCEL cu cantitate pozitiva (intrare)")
+        elif kind=="SHIPRETURN":
+            if number(context,"CXQTY")>=ZERO:
+                fail("Selecteaza SHIPRETURN cu cantitate negativa (anulare receptie)")
         elif kind not in MATREC_EXITS:
-            fail("MATRECTRANS: SHIPTRANSFER/TRANSFER, RECEIPT/SHIPRECEIPT (qty<0) sau SHIPCANCEL (qty>0)")
+            fail("MATRECTRANS: SHIPTRANSFER/TRANSFER, RECEIPT/SHIPRECEIPT (qty<0), SHIPRETURN (qty<0) sau SHIPCANCEL (qty>0)")
         elif number(context,"CXQTY")>=ZERO:
             fail("Selecteaza randul de iesire (cantitate negativa) din jurnal")
     else:
-        fail("Selecteaza iesire/retur MATUSETRANS sau iesire/SHIPCANCEL MATRECTRANS")
+        fail("Selecteaza iesire/retur MATUSETRANS sau iesire/SHIPCANCEL/SHIPRETURN MATRECTRANS")
     if context.isNull("CXREFID"):
         fail("CXREFID lipsa")
     if "MOTIV=ORDINE_DATE" in long_text(context):
@@ -1272,6 +1408,8 @@ def execute(context):
             fail("Instaleaza protectia CXADDTOCXSTOCURI")
         if refmbo=="MATRECTRANS" and kind=="SHIPCANCEL":
             message=fix_shipcancel(context, query, state)
+        elif refmbo=="MATRECTRANS" and kind=="SHIPRETURN":
+            message=fix_shipreturn_void(context, query, state)
         elif refmbo=="MATRECTRANS":
             message=fix_matrectrans_exit(context, query, state)
         elif kind=="RETURN":

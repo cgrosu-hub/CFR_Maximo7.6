@@ -1,9 +1,10 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.54-LINESET-SCOPE
+# VERSIUNE: 3.55-SHIPRETURN-VOID
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython method/caractere).
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # SHIPRETURN (+qty) in replay = intrare/restabilire, ca SHIPCANCEL.
+# SHIPRETURN (qty<0) = anulare pe pret (VOID_TYPES); buton 2 in EXEC.
 # ISSUE rotating=1: corectie sold/pret in CXSTOCURI (NOLOT, fara condition).
 # SHIPCANCEL (+qty): corectie pret la FIFO al SHIPTRANSFER legat (si rotating=1).
 # CXFIFOFIXEXEC: handlere separate (evita BMXAA7836E too large method).
@@ -869,6 +870,14 @@ def check_matrectrans_exit_cost():
     available=sum((l["qty"] for l in layers),ZERO)
     if different(available,ExactNumber("210")):
         raise ValueError("self-check: SHIPRETURN pozitiv trebuie sa restabileasca stocul")
+    # SHIPRETURN -qty anuleaza pe pret (VOID_TYPES), ca VOIDRECEIPT.
+    cost,allocation=single_fifo_cost([
+        row(1,"2026-01-01 00:00:00.000000000",10,"SHIPRECEIPT","7","86","7"),
+        row(2,"2026-01-02 00:00:00.000000000",20,"SHIPRETURN","-7","86","0"),
+        row(3,"2026-01-03 00:00:00.000000000",30,"SHIPRECEIPT","5","90","5"),
+    ],ExactNumber("-1"))
+    if different(cost,ExactNumber("90"),PRICE_EPS) or not allocation or allocation[0].get("ref")!=30:
+        raise ValueError("self-check: SHIPRETURN negativ anuleaza pe pret")
 
 
 EXEC_SCRIPT="CXFIFOFIXEXEC"
