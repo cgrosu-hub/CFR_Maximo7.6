@@ -1,10 +1,10 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.34-SELFCHECK-SCOPE
+# VERSIUNE: 5.35-SAME-DAY
 # Partea 1 (launch). def run_local este in CXINVAUDITEXEC (BMXAA7836E Mark invalid).
 # INVLIFO ROTATING=0: MBO update/delete. ROTATING=1: SQL dupa BADFIFO curat + CURBAL.
-# Same-second: iesiri coincidente cu intrari => SQL +1/+2.. min dupa max(intrari),
-# apoi rescriere CXCURBAL pe noua cronologie (inainte de Info FIFO).
+# Same-day: iesiri inaintea intrarilor din aceeasi zi (inclusiv same-second) =>
+# SQL +1/+2.. min dupa max(intrari), apoi CXCURBAL (inainte de Info FIFO).
 # Necesita CXINVAUDITEXEC.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -75,7 +75,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.34-SELFCHECK-SCOPE"
+VERSION = "5.35-SAME-DAY"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000
