@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDITEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.36-RETURN-AFTER-ISSUE
+# VERSIUNE: 5.37-RETURN-AFTER-ISSUE-MIN
 # Partea 2 a CXINVAUDIT. Fara launch point. Nu se ruleaza singur.
 # Same-day reorder + audit + CURBAL/INVLIFO sync. Sub 100000 caractere.
 
@@ -1055,9 +1055,13 @@ def day_bucket(row):
         return None
     return txt(d)[:10]
 
+def minute_floor_ms(ms):
+    ms=long(ms)
+    return ms-(ms%60000)
+
 def plan_same_day_shifts(rows):
     # Pe aceeasi zi: iesiri inaintea intrarilor (fara RETURN ca ancora) =>
-    # max(intrari)+1..N min. RETURN legat de ISSUE mutat merge dupa ISSUE.
+    # max(intrari)+1..N min. RETURN e tratat separat (dupa ISSUE la min).
     by_day={}
     for r in rows:
         day=day_bucket(r)
@@ -1072,35 +1076,56 @@ def plan_same_day_shifts(rows):
             continue
         base_ms=max(r["date_ms"] for r in entries)
         entry_secs=set(second_bucket(r) for r in entries if second_bucket(r))
-        to_move=[]
-        for r in exits:
-            if r["date_ms"]<=base_ms or second_bucket(r) in entry_secs:
-                to_move.append(r)
+        to_move=[r for r in exits
+                 if r["date_ms"]<=base_ms or second_bucket(r) in entry_secs]
         if not to_move:
             continue
         to_move.sort(key=lambda r:(r["date_ms"],r.get("ref_id") or 0,r["id"]))
-        issue_new={}
         for i,r in enumerate(to_move):
             new_ms=long(base_ms)+(i+1)*60000
             if r["date_ms"]!=new_ms:
                 shifts.append({"row":r,"new_ms":new_ms,"day":day,"step":i+1})
-            if r.get("kind")=="ISSUE" and r.get("ref_id") is not None:
-                issue_new[r["ref_id"]]=new_ms
-        returns=[r for r in group if r.get("kind")=="RETURN" and r.get("ref_mbo")=="MATUSETRANS"
-                 and r.get("issue_id") is not None and r["issue_id"] in issue_new]
-        returns.sort(key=lambda r:(r["date_ms"],r.get("ref_id") or 0,r["id"]))
-        used={}
-        for r in returns:
-            iid=r["issue_id"]
-            used[iid]=used.get(iid,0)+1
-            new_ms=long(issue_new[iid])+used[iid]*60000
-            if r["date_ms"]!=new_ms:
-                shifts.append({"row":r,"new_ms":new_ms,"day":day,"step":"R%s" % used[iid]})
     return shifts
 
+def plan_return_after_issue_shifts(rows,prior_shifts=None):
+    # RETURN aferent consumului: strict dupa zi/ora/minut a ISSUE (ISSUEID).
+    prior_shifts=prior_shifts or []
+    effective={}
+    for r in rows:
+        if r.get("date_ms") is not None:
+            effective[r["id"]]=long(r["date_ms"])
+    for s in prior_shifts:
+        effective[s["row"]["id"]]=long(s["new_ms"])
+    issues_by_ref={}
+    for r in rows:
+        if r.get("kind")=="ISSUE" and r.get("ref_mbo")=="MATUSETRANS" and r.get("ref_id") is not None:
+            issues_by_ref[r["ref_id"]]=r
+    shifts=[]
+    used={}
+    returns=[r for r in rows if r.get("kind")=="RETURN" and r.get("ref_mbo")=="MATUSETRANS"
+             and r.get("issue_id") is not None and r.get("date_ms") is not None]
+    returns.sort(key=lambda r:(r.get("date") or "",r.get("ref_id") or 0,r["id"]))
+    for r in returns:
+        issue=issues_by_ref.get(r["issue_id"])
+        if issue is None or issue["id"] not in effective:
+            continue
+        issue_min=minute_floor_ms(effective[issue["id"]])
+        ret_ms=effective.get(r["id"],long(r["date_ms"]))
+        if minute_floor_ms(ret_ms)>issue_min:
+            continue
+        used[r["issue_id"]]=used.get(r["issue_id"],0)+1
+        new_ms=issue_min+used[r["issue_id"]]*60000
+        if new_ms!=ret_ms:
+            shifts.append({"row":r,"new_ms":new_ms,"day":day_bucket(r),"step":"RAI%s" % used[r["issue_id"]]})
+            effective[r["id"]]=new_ms
+    return shifts
+
+def plan_chrono_shifts(rows):
+    same=plan_same_day_shifts(rows)
+    return same+plan_return_after_issue_shifts(rows,same)
+
 def plan_same_second_shifts(rows):
-    # Compat: same-day acopera si same-second.
-    return plan_same_day_shifts(rows)
+    return plan_chrono_shifts(rows)
 
 def sql_update_timestamp(user,table,pk_field,pk_value,field,new_ms):
     from psdi.server import MXServer
@@ -1184,12 +1209,12 @@ def running_cxcurbal(rows):
     return expected
 
 def apply_same_day_reorder(inventory,rows,script_service):
-    # SQL: CXDOCUMENTDATE + ACTUALDATE sursa; apoi CXCURBAL pe noua cronologie.
+    # SQL: CXDOCUMENTDATE + ACTUALDATE; RETURN dupa ISSUE (zi/ora/min); CXCURBAL.
     from java.text import SimpleDateFormat
     from java.util import TimeZone,Date
-    shifts=plan_same_day_shifts(rows)
+    shifts=plan_chrono_shifts(rows)
     if not shifts:
-        return "REORDONARE SAME-DAY: nicio iesire inaintea intrarilor din aceeasi zi"
+        return "REORDONARE CRONO: nicio mutare same-day / RETURN-dupa-ISSUE"
     user=inventory.getUserInfo()
     fmt=SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
     fmt.setTimeZone(TimeZone.getTimeZone("UTC"))
@@ -1214,15 +1239,17 @@ def apply_same_day_reorder(inventory,rows,script_service):
             sql_update_cxcurbal(user,r["id"],new_bal)
             r["balance"]=new_bal
             bal_changed+=1
+    n_exit=sum(1 for s in shifts if s["row"].get("kind")!="RETURN")
+    n_ret=sum(1 for s in shifts if s["row"].get("kind")=="RETURN")
     msg="\n".join([
-        "REORDONARE SAME-DAY",
-        "  Iesiri mutate: %s (max(intrari din zi)+1..N min)" % len(shifts),
+        "REORDONARE CRONO",
+        "  Same-day iesiri: %s | RETURN dupa ISSUE: %s" % (n_exit,n_ret),
         "  CXCURBAL rescrise: %s" % bal_changed,
     ])
     for item in shifts[:MAX_LAYER_LINES]:
         r=item["row"]
-        msg+="\n  CXSTOCURIID=%s %s RefID=%s zi=%s -> +%s min" % (
-            r["id"],r.get("kind"),r.get("ref_id"),item.get("day"),item["step"])
+        msg+="\n  CXSTOCURIID=%s %s RefID=%s -> step %s" % (
+            r["id"],r.get("kind"),r.get("ref_id"),item["step"])
     if len(shifts)>MAX_LAYER_LINES:
         msg+="\n  ... +%s mutari in log" % (len(shifts)-MAX_LAYER_LINES)
     script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | "))
@@ -1287,26 +1314,35 @@ def check_same_day_plan():
            "balance":ExactNumber("4")}]
     if plan_same_day_shifts(late):
         raise ValueError("self-check: iesirea de dupa receptii nu trebuie mutata")
-    # RETURN dupa ISSUE: nu ancora; daca ISSUE e mutat, RETURN il urmeaza.
+    # RETURN dupa ISSUE la zi/ora/min: nu ancora; urmeaza ISSUE daca e mutat / prea devreme.
     pair=[
         {"id":1,"kind":"ISSUE","qty":ExactNumber("-1790"),"ref_mbo":"MATUSETRANS","ref_id":50,
          "date":"2026-02-06 15:12:00.000000000","date_ms":1000,"cost":ExactNumber("24")},
         {"id":2,"kind":"RETURN","qty":ExactNumber("1790"),"ref_mbo":"MATUSETRANS","ref_id":51,
          "issue_id":50,"date":"2026-02-06 15:13:00.000000000","date_ms":1000+60000,"cost":ExactNumber("24")},
     ]
-    if plan_same_day_shifts(pair):
-        raise ValueError("self-check: doar ISSUE+RETURN nu trebuie same-day")
+    if plan_chrono_shifts(pair):
+        raise ValueError("self-check: ISSUE+RETURN deja OK nu trebuie mutat")
+    early_ret=[
+        {"id":1,"kind":"ISSUE","qty":ExactNumber("-1"),"ref_mbo":"MATUSETRANS","ref_id":50,
+         "date":"2026-02-06 15:12:00.000000000","date_ms":15*3600*1000+12*60000,"cost":ExactNumber("24")},
+        {"id":2,"kind":"RETURN","qty":ExactNumber("1"),"ref_mbo":"MATUSETRANS","ref_id":51,
+         "issue_id":50,"date":"2026-02-06 15:12:00.000000000","date_ms":15*3600*1000+12*60000,"cost":ExactNumber("24")},
+    ]
+    er=plan_return_after_issue_shifts(early_ret)
+    if len(er)!=1 or minute_floor_ms(er[0]["new_ms"])<=minute_floor_ms(early_ret[0]["date_ms"]):
+        raise ValueError("self-check: RETURN pe acelasi minut ca ISSUE trebuie +1 min")
     pair2=list(pair)+[
         {"id":3,"kind":"RECEIPT","qty":ExactNumber("10"),"ref_mbo":"MATRECTRANS","ref_id":90,
          "date":"2026-02-06 18:00:00.000000000","date_ms":1000+3*3600000,"cost":ExactNumber("24")},
     ]
-    p2=plan_same_day_shifts(pair2)
+    p2=plan_chrono_shifts(pair2)
     issue_s=[s for s in p2 if s["row"]["id"]==1]
     ret_s=[s for s in p2 if s["row"]["id"]==2]
     if len(issue_s)!=1 or len(ret_s)!=1:
         raise ValueError("self-check: ISSUE+RETURN cu receptie trebuie mutate ambele")
-    if ret_s[0]["new_ms"]<=issue_s[0]["new_ms"]:
-        raise ValueError("self-check: RETURN trebuie dupa ISSUE dupa same-day")
+    if minute_floor_ms(ret_s[0]["new_ms"])<=minute_floor_ms(issue_s[0]["new_ms"]):
+        raise ValueError("self-check: RETURN trebuie dupa minutul ISSUE")
 
 def check_same_second_plan():
     check_same_day_plan()
@@ -1617,7 +1653,7 @@ def run_local(inventory,script_service):
         # ISSUEID pe RETURN inainte de same-day (returul ramane dupa ISSUE).
         enrich_returns(inventory,rows,script_service)
         reorder_msg=apply_same_day_reorder(inventory,rows,script_service)
-        if "Iesiri mutate:" in reorder_msg:
+        if "CXCURBAL rescrise:" in reorder_msg or "RETURN dupa ISSUE:" in reorder_msg:
             close_set(root)
             root=open_scope(inventory,"CXSTOCURI")
             rows,mbos=read_journal(root)

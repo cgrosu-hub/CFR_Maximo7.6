@@ -1,6 +1,6 @@
 # SCRIPT: CXSTOCURIUPDATECURBAL
 # AUTOR: Fernando Prajitura; aliniat la ledger-ul FIFO de Cristian Grosu
-# VERSIUNE: 2026.11.18-RETURN-AFTER-ISSUE
+# VERSIUNE: 2026.11.18-RETURN-AFTER-ISSUE-MIN
 # ISSUE legat de MATRECTRANS: diferenta de pret de 0.001 si LINECOST egal cu
 # valoarea receptiei -> UNITCOST din jurnal devine pretul receptiei.
 # Urma: DESCRIPTION_LONGDESCRIPTION, linie "PU-RECEPTIE:". Apoi se recalculeaza
@@ -556,6 +556,11 @@ def day_bucket(row):
     return None if not d else str(d)[:10]
 
 
+def minute_floor_ms(ms):
+    ms = long(ms)
+    return ms - (ms % 60000)
+
+
 def attach_return_issue_ids(user, rows):
     pending = sorted(set(
         r.get("ref_id") for r in rows
@@ -603,24 +608,51 @@ def plan_same_day_shifts(rows):
         if not to_move:
             continue
         to_move.sort(key=lambda r: (r["date_ms"], r.get("ref_id") or 0, r["id"]))
-        issue_new = {}
         for i, r in enumerate(to_move):
             new_ms = long(base_ms) + (i + 1) * 60000
             if r["date_ms"] != new_ms:
                 shifts.append({"row": r, "new_ms": new_ms, "day": day, "step": i + 1})
-            if r.get("kind") == "ISSUE" and r.get("ref_id") is not None:
-                issue_new[r["ref_id"]] = new_ms
-        returns = [r for r in group if r.get("kind") == "RETURN" and r.get("ref_mbo") == "MATUSETRANS"
-                   and r.get("issue_id") is not None and r["issue_id"] in issue_new]
-        returns.sort(key=lambda r: (r["date_ms"], r.get("ref_id") or 0, r["id"]))
-        used = {}
-        for r in returns:
-            iid = r["issue_id"]
-            used[iid] = used.get(iid, 0) + 1
-            new_ms = long(issue_new[iid]) + used[iid] * 60000
-            if r["date_ms"] != new_ms:
-                shifts.append({"row": r, "new_ms": new_ms, "day": day, "step": "R%s" % used[iid]})
     return shifts
+
+
+def plan_return_after_issue_shifts(rows, prior_shifts=None):
+    # RETURN aferent consumului: strict dupa zi/ora/minut a ISSUE (ISSUEID).
+    prior_shifts = prior_shifts or []
+    effective = {}
+    for r in rows:
+        if r.get("date_ms") is not None:
+            effective[r["id"]] = long(r["date_ms"])
+    for s in prior_shifts:
+        effective[s["row"]["id"]] = long(s["new_ms"])
+    issues_by_ref = {}
+    for r in rows:
+        if r.get("kind") == "ISSUE" and r.get("ref_mbo") == "MATUSETRANS" and r.get("ref_id") is not None:
+            issues_by_ref[r["ref_id"]] = r
+    shifts = []
+    used = {}
+    returns = [r for r in rows if r.get("kind") == "RETURN" and r.get("ref_mbo") == "MATUSETRANS"
+               and r.get("issue_id") is not None and r.get("date_ms") is not None]
+    returns.sort(key=lambda r: (r.get("date") or "", r.get("ref_id") or 0, r["id"]))
+    for r in returns:
+        issue = issues_by_ref.get(r["issue_id"])
+        if issue is None or issue["id"] not in effective:
+            continue
+        issue_min = minute_floor_ms(effective[issue["id"]])
+        ret_ms = effective.get(r["id"], long(r["date_ms"]))
+        if minute_floor_ms(ret_ms) > issue_min:
+            continue
+        used[r["issue_id"]] = used.get(r["issue_id"], 0) + 1
+        new_ms = issue_min + used[r["issue_id"]] * 60000
+        if new_ms != ret_ms:
+            shifts.append({"row": r, "new_ms": new_ms, "day": day_bucket(r),
+                           "step": "RAI%s" % used[r["issue_id"]]})
+            effective[r["id"]] = new_ms
+    return shifts
+
+
+def plan_chrono_shifts(rows):
+    same = plan_same_day_shifts(rows)
+    return same + plan_return_after_issue_shifts(rows, same)
 
 
 def sql_update_timestamp(user, table, pk_field, pk_value, field, new_ms):
@@ -749,7 +781,7 @@ def apply_same_day_scope(user, item, site, location, budget):
     try:
         rows = read_rows(ms)
         attach_return_issue_ids(user, rows)
-        shifts = plan_same_day_shifts(rows)
+        shifts = plan_chrono_shifts(rows)
         if not shifts:
             return [], 0, 0, budget
         if len(shifts) > budget:
@@ -814,17 +846,29 @@ def same_day_self_check():
          "issue_id": 50, "date": "2026-02-06 15:13:00.000000000", "date_ms": 1000 + 60000,
          "cost": BigDecimal("24")},
     ]
-    if plan_same_day_shifts(pair):
-        raise ValueError("self-check same-day: doar ISSUE+RETURN nu trebuie mutat")
+    if plan_chrono_shifts(pair):
+        raise ValueError("self-check same-day: ISSUE+RETURN deja OK nu trebuie mutat")
+    early = [
+        {"id": 1, "kind": "ISSUE", "qty": BigDecimal("-1"), "ref_mbo": "MATUSETRANS", "ref_id": 50,
+         "date": "2026-02-06 15:12:00.000000000", "date_ms": 15 * 3600 * 1000 + 12 * 60000,
+         "cost": BigDecimal("24")},
+        {"id": 2, "kind": "RETURN", "qty": BigDecimal("1"), "ref_mbo": "MATUSETRANS", "ref_id": 51,
+         "issue_id": 50, "date": "2026-02-06 15:12:00.000000000",
+         "date_ms": 15 * 3600 * 1000 + 12 * 60000, "cost": BigDecimal("24")},
+    ]
+    er = plan_return_after_issue_shifts(early)
+    if len(er) != 1 or minute_floor_ms(er[0]["new_ms"]) <= minute_floor_ms(early[0]["date_ms"]):
+        raise ValueError("self-check: RETURN pe acelasi minut ca ISSUE trebuie +1 min")
     pair2 = list(pair) + [
         {"id": 3, "kind": "RECEIPT", "qty": BigDecimal("10"), "ref_mbo": "MATRECTRANS", "ref_id": 90,
          "date": "2026-02-06 18:00:00.000000000", "date_ms": 1000 + 3 * 3600000, "cost": BigDecimal("24")},
     ]
-    p2 = plan_same_day_shifts(pair2)
+    p2 = plan_chrono_shifts(pair2)
     issue_s = [s for s in p2 if s["row"]["id"] == 1]
     ret_s = [s for s in p2 if s["row"]["id"] == 2]
-    if len(issue_s) != 1 or len(ret_s) != 1 or ret_s[0]["new_ms"] <= issue_s[0]["new_ms"]:
-        raise ValueError("self-check same-day: RETURN trebuie dupa ISSUE mutat")
+    if (len(issue_s) != 1 or len(ret_s) != 1 or
+            minute_floor_ms(ret_s[0]["new_ms"]) <= minute_floor_ms(issue_s[0]["new_ms"])):
+        raise ValueError("self-check same-day: RETURN trebuie dupa minutul ISSUE")
 
 
 def main():
