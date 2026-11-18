@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDITEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.35-SAME-DAY
+# VERSIUNE: 5.36-RETURN-AFTER-ISSUE
 # Partea 2 a CXINVAUDIT. Fara launch point. Nu se ruleaza singur.
 # Same-day reorder + audit + CURBAL/INVLIFO sync. Sub 100000 caractere.
 
@@ -1035,9 +1035,10 @@ def chrono_exit(row):
     return kind in ("TRANSFER","RECEIPT","SHIPRECEIPT")
 
 def chrono_entry(row):
+    # RETURN nu e ancora: returul aferent ISSUE trebuie sa ramana dupa ISSUE.
     if chrono_exit(row):
         return False
-    if row.get("kind")=="INITIAL":
+    if row.get("kind") in ("INITIAL","RETURN"):
         return False
     qty=row.get("qty")
     return qty is not None and qty>QTY_TOLERANCE
@@ -1055,8 +1056,8 @@ def day_bucket(row):
     return txt(d)[:10]
 
 def plan_same_day_shifts(rows):
-    # Pe aceeasi zi calendaristica: iesiri inaintea (sau pe aceeasi secunda cu)
-    # intrarile => max(intrari din zi)+1,+2.. min. Include si cazul same-second.
+    # Pe aceeasi zi: iesiri inaintea intrarilor (fara RETURN ca ancora) =>
+    # max(intrari)+1..N min. RETURN legat de ISSUE mutat merge dupa ISSUE.
     by_day={}
     for r in rows:
         day=day_bucket(r)
@@ -1078,10 +1079,23 @@ def plan_same_day_shifts(rows):
         if not to_move:
             continue
         to_move.sort(key=lambda r:(r["date_ms"],r.get("ref_id") or 0,r["id"]))
+        issue_new={}
         for i,r in enumerate(to_move):
             new_ms=long(base_ms)+(i+1)*60000
             if r["date_ms"]!=new_ms:
                 shifts.append({"row":r,"new_ms":new_ms,"day":day,"step":i+1})
+            if r.get("kind")=="ISSUE" and r.get("ref_id") is not None:
+                issue_new[r["ref_id"]]=new_ms
+        returns=[r for r in group if r.get("kind")=="RETURN" and r.get("ref_mbo")=="MATUSETRANS"
+                 and r.get("issue_id") is not None and r["issue_id"] in issue_new]
+        returns.sort(key=lambda r:(r["date_ms"],r.get("ref_id") or 0,r["id"]))
+        used={}
+        for r in returns:
+            iid=r["issue_id"]
+            used[iid]=used.get(iid,0)+1
+            new_ms=long(issue_new[iid])+used[iid]*60000
+            if r["date_ms"]!=new_ms:
+                shifts.append({"row":r,"new_ms":new_ms,"day":day,"step":"R%s" % used[iid]})
     return shifts
 
 def plan_same_second_shifts(rows):
@@ -1273,6 +1287,26 @@ def check_same_day_plan():
            "balance":ExactNumber("4")}]
     if plan_same_day_shifts(late):
         raise ValueError("self-check: iesirea de dupa receptii nu trebuie mutata")
+    # RETURN dupa ISSUE: nu ancora; daca ISSUE e mutat, RETURN il urmeaza.
+    pair=[
+        {"id":1,"kind":"ISSUE","qty":ExactNumber("-1790"),"ref_mbo":"MATUSETRANS","ref_id":50,
+         "date":"2026-02-06 15:12:00.000000000","date_ms":1000,"cost":ExactNumber("24")},
+        {"id":2,"kind":"RETURN","qty":ExactNumber("1790"),"ref_mbo":"MATUSETRANS","ref_id":51,
+         "issue_id":50,"date":"2026-02-06 15:13:00.000000000","date_ms":1000+60000,"cost":ExactNumber("24")},
+    ]
+    if plan_same_day_shifts(pair):
+        raise ValueError("self-check: doar ISSUE+RETURN nu trebuie same-day")
+    pair2=list(pair)+[
+        {"id":3,"kind":"RECEIPT","qty":ExactNumber("10"),"ref_mbo":"MATRECTRANS","ref_id":90,
+         "date":"2026-02-06 18:00:00.000000000","date_ms":1000+3*3600000,"cost":ExactNumber("24")},
+    ]
+    p2=plan_same_day_shifts(pair2)
+    issue_s=[s for s in p2 if s["row"]["id"]==1]
+    ret_s=[s for s in p2 if s["row"]["id"]==2]
+    if len(issue_s)!=1 or len(ret_s)!=1:
+        raise ValueError("self-check: ISSUE+RETURN cu receptie trebuie mutate ambele")
+    if ret_s[0]["new_ms"]<=issue_s[0]["new_ms"]:
+        raise ValueError("self-check: RETURN trebuie dupa ISSUE dupa same-day")
 
 def check_same_second_plan():
     check_same_day_plan()
@@ -1580,16 +1614,18 @@ def run_local(inventory,script_service):
         rows,mbos=read_journal(root)
         if not rows:
             raise ValueError("Nu exista randuri CXSTOCURI")
-        reorder_msg=apply_same_second_reorder(inventory,rows,script_service)
+        # ISSUEID pe RETURN inainte de same-day (returul ramane dupa ISSUE).
+        enrich_returns(inventory,rows,script_service)
+        reorder_msg=apply_same_day_reorder(inventory,rows,script_service)
         if "Iesiri mutate:" in reorder_msg:
             close_set(root)
             root=open_scope(inventory,"CXSTOCURI")
             rows,mbos=read_journal(root)
             if not rows:
-                raise ValueError("Nu exista randuri CXSTOCURI dupa same-second")
+                raise ValueError("Nu exista randuri CXSTOCURI dupa same-day")
+            enrich_returns(inventory,rows,script_service)
         original=snapshot(rows)
         unknown=enrich_origins(inventory,rows,script_service)
-        enrich_returns(inventory,rows,script_service)
         enrich_shipcancels(inventory,rows,script_service)
         audit=audit_rows(rows)
         gap_notes=split_gap_by_matusetrans(inventory,rows,script_service)

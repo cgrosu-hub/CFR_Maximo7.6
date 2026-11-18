@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.35-SAME-DAY
+# VERSIUNE: 5.36-RETURN-AFTER-ISSUE
 # Partea 1 (launch). def run_local este in CXINVAUDITEXEC (BMXAA7836E Mark invalid).
 # INVLIFO ROTATING=0: MBO update/delete. ROTATING=1: SQL dupa BADFIFO curat + CURBAL.
 # Same-day: iesiri inaintea intrarilor din aceeasi zi (inclusiv same-second) =>
@@ -75,7 +75,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.35-SAME-DAY"
+VERSION = "5.36-RETURN-AFTER-ISSUE"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000

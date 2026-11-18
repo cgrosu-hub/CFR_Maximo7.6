@@ -1,6 +1,6 @@
 # SCRIPT: CXSTOCURIUPDATECURBAL
 # AUTOR: Fernando Prajitura; aliniat la ledger-ul FIFO de Cristian Grosu
-# VERSIUNE: 2026.11.18-SAME-DAY-ON
+# VERSIUNE: 2026.11.18-RETURN-AFTER-ISSUE
 # ISSUE legat de MATRECTRANS: diferenta de pret de 0.001 si LINECOST egal cu
 # valoarea receptiei -> UNITCOST din jurnal devine pretul receptiei.
 # Urma: DESCRIPTION_LONGDESCRIPTION, linie "PU-RECEPTIE:". Apoi se recalculeaza
@@ -537,9 +537,10 @@ def chrono_exit(row):
 
 
 def chrono_entry(row):
+    # RETURN nu e ancora: returul aferent ISSUE trebuie sa ramana dupa ISSUE.
     if chrono_exit(row):
         return False
-    if row.get("kind") == "INITIAL":
+    if row.get("kind") in ("INITIAL", "RETURN"):
         return False
     qty = row.get("qty")
     return qty is not None and qty.compareTo(ZERO) > 0
@@ -553,6 +554,33 @@ def second_bucket(row):
 def day_bucket(row):
     d = row.get("date")
     return None if not d else str(d)[:10]
+
+
+def attach_return_issue_ids(user, rows):
+    pending = sorted(set(
+        r.get("ref_id") for r in rows
+        if r.get("kind") == "RETURN" and r.get("ref_mbo") == "MATUSETRANS" and r.get("ref_id") is not None
+    ))
+    if not pending:
+        return
+    links = {}
+    for start in range(0, len(pending), 300):
+        chunk = pending[start:start + 300]
+        ms = None
+        try:
+            ms = MXServer.getMXServer().getMboSet("MATUSETRANS", user)
+            ms.setWhere("MATUSETRANSID in (%s)" % ",".join(str(i) for i in chunk))
+            ms.reset()
+            m = ms.moveFirst()
+            while m is not None:
+                links[m.getLong("MATUSETRANSID")] = (
+                    None if m.isNull("ISSUEID") else m.getLong("ISSUEID"))
+                m = ms.moveNext()
+        finally:
+            close_set(ms)
+    for r in rows:
+        if r.get("kind") == "RETURN" and r.get("ref_mbo") == "MATUSETRANS":
+            r["issue_id"] = links.get(r.get("ref_id"))
 
 
 def plan_same_day_shifts(rows):
@@ -575,10 +603,23 @@ def plan_same_day_shifts(rows):
         if not to_move:
             continue
         to_move.sort(key=lambda r: (r["date_ms"], r.get("ref_id") or 0, r["id"]))
+        issue_new = {}
         for i, r in enumerate(to_move):
             new_ms = long(base_ms) + (i + 1) * 60000
             if r["date_ms"] != new_ms:
                 shifts.append({"row": r, "new_ms": new_ms, "day": day, "step": i + 1})
+            if r.get("kind") == "ISSUE" and r.get("ref_id") is not None:
+                issue_new[r["ref_id"]] = new_ms
+        returns = [r for r in group if r.get("kind") == "RETURN" and r.get("ref_mbo") == "MATUSETRANS"
+                   and r.get("issue_id") is not None and r["issue_id"] in issue_new]
+        returns.sort(key=lambda r: (r["date_ms"], r.get("ref_id") or 0, r["id"]))
+        used = {}
+        for r in returns:
+            iid = r["issue_id"]
+            used[iid] = used.get(iid, 0) + 1
+            new_ms = long(issue_new[iid]) + used[iid] * 60000
+            if r["date_ms"] != new_ms:
+                shifts.append({"row": r, "new_ms": new_ms, "day": day, "step": "R%s" % used[iid]})
     return shifts
 
 
@@ -707,6 +748,7 @@ def apply_same_day_scope(user, item, site, location, budget):
     ms = open_scope_journal(user, item, site, location)
     try:
         rows = read_rows(ms)
+        attach_return_issue_ids(user, rows)
         shifts = plan_same_day_shifts(rows)
         if not shifts:
             return [], 0, 0, budget
@@ -765,6 +807,24 @@ def same_day_self_check():
     shifts = plan_same_day_shifts(rows)
     if len(shifts) != 2 or shifts[0]["new_ms"] != 50000 + 60000:
         raise ValueError("self-check same-day: iesirile dimineata trebuie dupa receptie")
+    pair = [
+        {"id": 1, "kind": "ISSUE", "qty": BigDecimal("-1790"), "ref_mbo": "MATUSETRANS", "ref_id": 50,
+         "date": "2026-02-06 15:12:00.000000000", "date_ms": 1000, "cost": BigDecimal("24")},
+        {"id": 2, "kind": "RETURN", "qty": BigDecimal("1790"), "ref_mbo": "MATUSETRANS", "ref_id": 51,
+         "issue_id": 50, "date": "2026-02-06 15:13:00.000000000", "date_ms": 1000 + 60000,
+         "cost": BigDecimal("24")},
+    ]
+    if plan_same_day_shifts(pair):
+        raise ValueError("self-check same-day: doar ISSUE+RETURN nu trebuie mutat")
+    pair2 = list(pair) + [
+        {"id": 3, "kind": "RECEIPT", "qty": BigDecimal("10"), "ref_mbo": "MATRECTRANS", "ref_id": 90,
+         "date": "2026-02-06 18:00:00.000000000", "date_ms": 1000 + 3 * 3600000, "cost": BigDecimal("24")},
+    ]
+    p2 = plan_same_day_shifts(pair2)
+    issue_s = [s for s in p2 if s["row"]["id"] == 1]
+    ret_s = [s for s in p2 if s["row"]["id"] == 2]
+    if len(issue_s) != 1 or len(ret_s) != 1 or ret_s[0]["new_ms"] <= issue_s[0]["new_ms"]:
+        raise ValueError("self-check same-day: RETURN trebuie dupa ISSUE mutat")
 
 
 def main():
