@@ -1,10 +1,10 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.37-RETURN-AFTER-ISSUE-MIN
+# VERSIUNE: 5.38-MATREC-REFID-DAY
 # Partea 1 (launch). def run_local este in CXINVAUDITEXEC (BMXAA7836E Mark invalid).
 # INVLIFO ROTATING=0: MBO update/delete. ROTATING=1: SQL dupa BADFIFO curat + CURBAL.
-# Same-day: iesiri inaintea intrarilor din aceeasi zi (inclusiv same-second) =>
-# SQL +1/+2.. min dupa max(intrari), apoi CXCURBAL (inainte de Info FIFO).
+# Same-day MATRECTRANS: ordine dupa CXREFID; ISSUE MATUSETRANS dupa max(intrari);
+# RETURN dupa ISSUE (min). Apoi CXCURBAL (inainte de Info FIFO).
 # Necesita CXINVAUDITEXEC.
 
 from java.math import BigDecimal, MathContext, RoundingMode
