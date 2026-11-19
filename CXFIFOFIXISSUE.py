@@ -1,10 +1,11 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.55-SHIPRETURN-VOID
+# VERSIUNE: 3.56-RETURN-BEFORE-ISSUE
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython method/caractere).
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # SHIPRETURN (+qty) in replay = intrare/restabilire, ca SHIPCANCEL.
 # SHIPRETURN (qty<0) = anulare pe pret (VOID_TYPES); buton 2 in EXEC.
+# RETURN inaintea ISSUE in replay: put_back, nu opreste corectia curenta.
 # ISSUE rotating=1: corectie sold/pret in CXSTOCURI (NOLOT, fara condition).
 # SHIPCANCEL (+qty): corectie pret la FIFO al SHIPTRANSFER legat (si rotating=1).
 # CXFIFOFIXEXEC: handlere separate (evita BMXAA7836E too large method).
@@ -344,11 +345,27 @@ def replay(prior,links=None):
             issue_id=None if links is None else links.get(r["ref"])
             if issue_id is None:
                 fail("Retur anterior %s fara ISSUEID" % r["ref"])
-            matches=[p for p in prior if p.get("kind")=="ISSUE" and p.get("ref")==issue_id and order(p)<order(r)]
-            if len(matches)!=1:
-                fail("Retur anterior %s fara consum unic anterior" % r["ref"])
-            restore_cost=cost if cost is not None else matches[0]["cost"]
-            restore_return(layers,qty,matches[0],issue_allocs.get(issue_id) or [],restore_cost,prior)
+            prior_matches=[p for p in prior if p.get("kind")=="ISSUE" and p.get("ref")==issue_id and order(p)<order(r)]
+            if len(prior_matches)==1:
+                restore_cost=cost if cost is not None else prior_matches[0]["cost"]
+                restore_return(layers,qty,prior_matches[0],issue_allocs.get(issue_id) or [],restore_cost,prior)
+            elif len(prior_matches)>1:
+                fail("Retur anterior %s cu mai multe ISSUE anterioare" % r["ref"])
+            else:
+                # RETURN inaintea ISSUE: nu opreste corectia; repune stocul pe pret.
+                candidates=[p for p in prior if p.get("kind")=="ISSUE" and p.get("ref")==issue_id]
+                if len(candidates)>1:
+                    fail("Retur anterior %s: ISSUEID ambiguu in jurnal" % r["ref"])
+                if len(candidates)==1:
+                    issue=candidates[0]
+                    restore_cost=cost if cost is not None else issue.get("cost")
+                    if restore_cost is None:
+                        fail("Retur anterior %s fara pret de restabilire" % r["ref"])
+                    restore_return(layers,qty,issue,[],restore_cost,prior)
+                else:
+                    if cost is None:
+                        fail("Retur anterior %s fara pret (ISSUE inca absent)" % r["ref"])
+                    put_back(layers,qty,cost,order(r),r.get("ref"),r.get("refmbo"),r.get("id"),False)
             started=True
             continue
         if kind=="SHIPCANCEL" or (kind=="SHIPRETURN" and qty>ZERO):
@@ -878,6 +895,23 @@ def check_matrectrans_exit_cost():
     ],ExactNumber("-1"))
     if different(cost,ExactNumber("90"),PRICE_EPS) or not allocation or allocation[0].get("ref")!=30:
         raise ValueError("self-check: SHIPRETURN negativ anuleaza pe pret")
+    # RETURN inaintea ISSUE legat: replay nu crapa; stocul e repus.
+    layers=replay([
+        row(1,"2026-03-01 00:00:00.000000000",10,"SHIPRECEIPT","3","10.950","3"),
+        row(2,"2026-03-31 00:27:00.000000000",164580,"RETURN","32","10.950","35","MATUSETRANS"),
+        row(3,"2026-03-31 00:28:00.000000000",163459,"ISSUE","-32","10.950","3","MATUSETRANS"),
+    ],{164580:163459})
+    available=sum((l["qty"] for l in layers),ZERO)
+    if different(available,ExactNumber("3")):
+        raise ValueError("self-check: RETURN inaintea ISSUE trebuie sa lase stocul 3")
+    cost,allocation=single_fifo_cost([
+        row(1,"2026-03-01 00:00:00.000000000",10,"SHIPRECEIPT","3","10.950","3"),
+        row(2,"2026-03-31 00:27:00.000000000",164580,"RETURN","32","10.950","35","MATUSETRANS"),
+        row(3,"2026-03-31 00:28:00.000000000",163459,"ISSUE","-32","10.950","3","MATUSETRANS"),
+        row(4,"2026-06-01 00:00:00.000000000",20,"SHIPRECEIPT","1","10.950","4"),
+    ],ExactNumber("-1"),{164580:163459})
+    if different(cost,ExactNumber("10.950"),PRICE_EPS):
+        raise ValueError("self-check: dupa RETURN-before-ISSUE FIFO pe iesire ulterioara")
 
 
 EXEC_SCRIPT="CXFIFOFIXEXEC"

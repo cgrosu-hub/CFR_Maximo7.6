@@ -1,11 +1,12 @@
 # SCRIPT: CXFIFOFIXEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.55-SHIPRETURN-VOID
+# VERSIUNE: 3.56-RETURN-BEFORE-ISSUE
 # Partea 2 a CXFIFOFIXISSUE. Fara launch point. Nu se ruleaza singur.
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # ISSUE rotating=1: corectie UNITCOST/CXCURBAL in CXSTOCURI (NOLOT, fara condition).
 # SHIPCANCEL (+qty): intrare; pretul FIFO din SHIPTRANSFER legat (si pe rotating=1).
 # SHIPRETURN (qty<0): anulare pe pret (ca VOIDRECEIPT); pret + CXCURBAL.
+# RETURN inaintea ISSUE: tolerat in replay (ISSUE); nu blocheaza butonul 2.
 # execute() dispatcher; handlere separate (limita JVM ~64KB bytecode / metoda).
 # Jython: sub 100000 caractere, altfel BMXAA7836E Mark invalid.
 
