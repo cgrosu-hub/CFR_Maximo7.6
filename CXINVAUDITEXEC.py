@@ -1,9 +1,9 @@
 # SCRIPT: CXINVAUDITEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.39-NO-CHRONO-REORDER
+# VERSIUNE: 5.40-RETURN-BEFORE-ISSUE
 # Partea 2 a CXINVAUDIT. Fara launch point. Nu se ruleaza singur.
 # CHRONO_REORDER_ENABLED=False: nu muta CXDOCUMENTDATE/ACTUALDATE/CXCURBAL.
-# Planurile same-day raman in cod (self-check), dar apply e no-op.
+# RETURN inaintea ISSUE (ISSUEID): OK + put_back daca pret/cantitate aliniate.
 # CURBAL/INVLIFO sync dupa audit. Sub 100000 caractere.
 
 CHRONO_REORDER_ENABLED=False
@@ -67,12 +67,32 @@ def put_back(layers,qty,cost,priority,source,source_ref,source_ref_mbo=None):
     layers.sort(key=lambda layer: layer["priority"])
 
 def return_target(row,group_rows,records):
+    # Returneaza (expected, link_ref, source_ref, priority, source, before_issue).
+    # before_issue=True: ISSUE e dupa RETURN in jurnal; OK doar daca qty+pret aliniate.
     issue_id=row.get("issue_id")
     if issue_id is None:
-        return None,"Retur fara ISSUEID",None,None,None
-    matches=[r for r in group_rows if r.get("ref_mbo")=="MATUSETRANS" and r.get("ref_id")==issue_id and r.get("kind")=="ISSUE" and order(r)<order(row)]
-    if len(matches)!=1:
-        return None,"Consumul ISSUEID=%s nu este unic in jurnal, inaintea returului" % issue_id,None,None,None
+        return None,"Retur fara ISSUEID",None,None,None,False
+    prior=[r for r in group_rows if r.get("ref_mbo")=="MATUSETRANS" and r.get("ref_id")==issue_id
+           and r.get("kind")=="ISSUE" and order(r)<order(row)]
+    before_issue=False
+    if len(prior)==1:
+        matches=prior
+    elif len(prior)>1:
+        return None,"Consumul ISSUEID=%s nu este unic in jurnal, inaintea returului" % issue_id,None,None,None,False
+    else:
+        candidates=[r for r in group_rows if r.get("ref_mbo")=="MATUSETRANS" and r.get("ref_id")==issue_id
+                    and r.get("kind")=="ISSUE"]
+        if len(candidates)!=1:
+            return None,"Consumul ISSUEID=%s nu este unic in jurnal" % issue_id,None,None,None,False
+        issue=candidates[0]
+        qty,cost=row.get("qty"),row.get("cost")
+        iq,ic=issue.get("qty"),issue.get("cost")
+        if qty is None or iq is None or cost is None or ic is None:
+            return None,"RETURN inaintea ISSUEID=%s: pret/cantitate lipsa" % issue_id,None,None,None,False
+        if iq>=-QTY_TOLERANCE or far(qty,-iq,QTY_TOLERANCE) or far(cost,ic,COST_TOLERANCE):
+            return None,"RETURN inaintea ISSUEID=%s: pret/cantitate nealiniate" % issue_id,None,None,None,False
+        matches=[issue]
+        before_issue=True
     issue=matches[0]
     rec=records[issue["id"]]
     if rec["status"] in ("OK","BAD","DATE_ORDER") and rec["expected"] is not None:
@@ -80,13 +100,13 @@ def return_target(row,group_rows,records):
     elif issue.get("cost") is not None:
         expected=issue["cost"]
     else:
-        return None,"Consumul %s nu are pret verificabil" % issue_id,None,None,None
+        return None,"Consumul %s nu are pret verificabil" % issue_id,None,None,None,False
     allocs=rec.get("allocations") or []
     if allocs:
         source,source_ref,priority=allocs[0].get("source"),allocs[0].get("source_ref_id"),allocs[0].get("priority") or order(issue)
     else:
         source,source_ref,priority=issue["id"],issue.get("ref_id"),order(issue)
-    return expected,issue.get("ref_id"),source_ref,priority,source
+    return expected,issue.get("ref_id"),source_ref,priority,source,before_issue
 
 def shipcancel_target(row,group_rows,records,label="SHIPCANCEL"):
     receipt_ref=row.get("receipt_ref")
@@ -201,12 +221,14 @@ def audit_rows(rows):
                 if qty<=QTY_TOLERANCE:
                     rec["reason"]="Retur fara cantitate pozitiva"
                     continue
-                expected,link_ref,source_ref,priority,source=return_target(row,group_rows,records)
+                expected,link_ref,source_ref,priority,source,before_issue=return_target(
+                    row,group_rows,records)
                 if expected is None:
                     rec["reason"]=link_ref
                     continue
                 rec["expected"]=expected
                 rec["link_ref"]=link_ref
+                rec["return_before_issue"]=bool(before_issue)
                 rec["status"]="BAD" if far(cost,expected,COST_TOLERANCE) else "OK"
                 rec["allocations"]=[{"qty":qty,"cost":expected,"source":source,"source_ref_id":source_ref,
                                      "initial":False,"priority":priority}]
@@ -1485,7 +1507,38 @@ def check_layer_void_ship():
     if flag(sold_rec)!="Y":
         raise ValueError("self-check: sold negativ trebuie BADFIFO=Y chiar daca pretul e OK")
 
+def check_return_before_issue():
+    # RETURN inaintea ISSUE legat: pret+cantitate aliniate => OK + put_back (nu blocheaza U).
+    rows=[
+        _audit_self_row(1,"2026-03-01 00:00:00.000000000",10,"SHIPRECEIPT","3","10.950","3"),
+        dict(_audit_self_row(2,"2026-03-31 00:27:00.000000000",164580,"RETURN","32","10.950","35","MATUSETRANS"),
+             issue_id=163459),
+        _audit_self_row(3,"2026-03-31 00:28:00.000000000",163459,"ISSUE","-32","10.950","3","MATUSETRANS"),
+        _audit_self_row(4,"2026-04-12 00:00:00.000000000",200,"ISSUE","-1","10.950","2","MATUSETRANS"),
+    ]
+    audit=audit_rows(rows)
+    ret,iss,later=audit["records"][2],audit["records"][3],audit["records"][4]
+    if ret["status"]!="OK" or not ret.get("return_before_issue"):
+        raise ValueError("self-check: RETURN inaintea ISSUE trebuie OK (before_issue)")
+    if flag(ret)!="N":
+        raise ValueError("self-check: RETURN inaintea ISSUE trebuie BADFIFO=N")
+    if ret.get("link_ref")!=163459:
+        raise ValueError("self-check: RETURN trebuie legat de ISSUE 163459")
+    if iss["status"]!="OK" or flag(iss)!="N":
+        raise ValueError("self-check: ISSUE dupa RETURN aliniat trebuie OK/N")
+    if later["status"]!="OK" or flag(later)!="N":
+        raise ValueError("self-check: ISSUE ulterior nu trebuie blocat de U")
+    bad=audit_rows([
+        _audit_self_row(1,"2026-03-01 00:00:00.000000000",10,"SHIPRECEIPT","3","10.950","3"),
+        dict(_audit_self_row(2,"2026-03-31 00:27:00.000000000",164580,"RETURN","32","10.950","35","MATUSETRANS"),
+             issue_id=163459),
+        _audit_self_row(3,"2026-03-31 00:28:00.000000000",163459,"ISSUE","-30","10.950","5","MATUSETRANS"),
+    ])
+    if bad["records"][2]["status"]!="UNVERIFIED":
+        raise ValueError("self-check: RETURN inaintea ISSUE cu qty nealiniata trebuie U")
+
 def check_layer_shipreturn_cancel():
+    check_return_before_issue()
     shipret=audit_rows([
         _audit_self_row(1,"2026-01-13 00:00:00.000000000",11,"SHIPRECEIPT","400","0.440","400"),
         _audit_self_row(2,"2026-01-13 10:42:00.000000000",12,"ISSUE","-400","0.440","0","MATUSETRANS"),

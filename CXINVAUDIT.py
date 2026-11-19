@@ -1,10 +1,10 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.39-NO-CHRONO-REORDER
+# VERSIUNE: 5.40-RETURN-BEFORE-ISSUE
 # Partea 1 (launch). def run_local este in CXINVAUDITEXEC (BMXAA7836E Mark invalid).
 # INVLIFO ROTATING=0: MBO update/delete. ROTATING=1: SQL dupa BADFIFO curat + CURBAL.
 # Reordonarea cronologica (date + CXCURBAL din reorder) este OPRITA.
-# Check FIFO: doar Info FIFO / BADFIFO pe datele existente.
+# RETURN inaintea ISSUE legat: OK daca pret+cantitate aliniate (nu blocheaza U).
 # Necesita CXINVAUDITEXEC.
 
 from java.math import BigDecimal, MathContext, RoundingMode
@@ -438,6 +438,8 @@ def description_visible(old, record, summary):
         info="OK: %s anuleaza %s buc. la %s" % (row.get("kind"),fmt_ro(-row["qty"]),fmt_ro(record["expected"]))
     elif status=="OK" and is_ship_restore(row):
         info="OK: %s restabileste %s buc. la %s" % (row.get("kind"),fmt_ro(row["qty"]),fmt_ro(record["expected"]))
+    elif status=="OK" and row.get("kind")=="RETURN" and record.get("return_before_issue"):
+        info="OK: RETURN inaintea ISSUE; pret/cantitate aliniate %s" % fmt_ro(record["expected"])
     elif status=="OK":
         info="OK: FIFO LOCAL asteptat %s" % fmt_ro(record["expected"])
     elif status=="BAD" and is_ship_restore(row):
