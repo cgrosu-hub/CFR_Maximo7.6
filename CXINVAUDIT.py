@@ -1,10 +1,10 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.38-MATREC-REFID-DAY
+# VERSIUNE: 5.39-NO-CHRONO-REORDER
 # Partea 1 (launch). def run_local este in CXINVAUDITEXEC (BMXAA7836E Mark invalid).
 # INVLIFO ROTATING=0: MBO update/delete. ROTATING=1: SQL dupa BADFIFO curat + CURBAL.
-# Same-day MATRECTRANS: ordine dupa CXREFID; ISSUE MATUSETRANS dupa max(intrari);
-# RETURN dupa ISSUE (min). Apoi CXCURBAL (inainte de Info FIFO).
+# Reordonarea cronologica (date + CXCURBAL din reorder) este OPRITA.
+# Check FIFO: doar Info FIFO / BADFIFO pe datele existente.
 # Necesita CXINVAUDITEXEC.
 
 from java.math import BigDecimal, MathContext, RoundingMode

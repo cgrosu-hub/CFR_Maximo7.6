@@ -1,21 +1,19 @@
 # SCRIPT: CXSTOCURIUPDATECURBAL
 # AUTOR: Fernando Prajitura; aliniat la ledger-ul FIFO de Cristian Grosu
-# VERSIUNE: 2026.11.18-MATREC-REFID-DAY
+# VERSIUNE: 2026.11.19-NO-CHRONO-REORDER
 # ISSUE legat de MATRECTRANS: diferenta de pret de 0.001 si LINECOST egal cu
 # valoarea receptiei -> UNITCOST din jurnal devine pretul receptiei.
 # Urma: DESCRIPTION_LONGDESCRIPTION, linie "PU-RECEPTIE:". Apoi se recalculeaza
 # ambele partitii de pret, chiar daca CXCURBAL nu mai e null.
 # Completeaza CXCURBAL pe partitiile care inca il au null.
-# Same-day (implicit ON): MATRECTRANS pe CXREFID; ISSUE MATUSETRANS dupa
-# max(intrari); RETURN dupa ISSUE (min); apoi CXCURBAL.
+# Reordonarea cronologica (same-day / CXREFID / RETURN-dupa-ISSUE) este OPRITA.
 # Partitia: ITEMNUM, SITEID, LOCATION, COMMODITYGROUP, UNITCOST
 # Ordine ledger: CXDOCUMENTDATE, CXREFID (null=0), CXSTOCURIID.
 #
 # cfr.inventory.updateAllCxStocuri = true  -> toate partitiile
 # altfel -> doar partitiile cu cel putin un CXCURBAL null
 # cfr.inventory.numHistoryDaysToUpdate = N -> in modul null, ultimele N zile
-# cfr.inventory.sameDayReorder = false -> opreste reordonarea same-day
-# cfr.inventory.sameDayReorderMax = N -> plafon mutari / rulare (default 500)
+# cfr.inventory.sameDayReorder / sameDayReorderMax: ignorate (reorder off)
 
 from java.math import BigDecimal
 from java.text import NumberFormat, ParsePosition, SimpleDateFormat
@@ -942,30 +940,14 @@ def main():
     full = prop_true(server, "cfr.inventory.updateAllCxStocuri")
     days = None if full else positive_days(server.getProperty("cfr.inventory.numHistoryDaysToUpdate"))
     where = seed_where(full, days)
-    # Same-day implicit ON (validat pe Check FIFO); false/0/no il opreste.
-    same_day = prop_true(server, "cfr.inventory.sameDayReorder", default=True)
+    # Reordonare cronologica oprita (aliniat la CXINVAUDIT CHRONO_REORDER_ENABLED=False).
+    same_day = False
     same_day_max = prop_positive(server, "cfr.inventory.sameDayReorderMax", DEFAULT_SAME_DAY_MAX)
     service.log_error("CXSTOCURIUPDATECURBAL start mod=%s filtru=%s sameDay=%s max=%s" % (
         "complet" if full else "null", where, same_day, same_day_max))
     extra, snapped = snap_existing(user)
     moved = 0
     bal_fixed = 0
-    if same_day:
-        budget = same_day_max
-        for item, site, location in load_sameday_scopes(user, full, days):
-            if budget <= 0:
-                break
-            try:
-                seeds_extra, n_move, n_bal, budget = apply_same_day_scope(
-                    user, item, site, location, budget)
-                moved += n_move
-                bal_fixed += n_bal
-                for seed in seeds_extra:
-                    if seed not in extra:
-                        extra.append(seed)
-            except Exception as exc:
-                service.log_error("CXSTOCURIUPDATECURBAL same-day %s|%s|%s: %s" % (
-                    item, site, location, exc))
     seeds = load_seeds(user, where)
     seen = set(seeds)
     for seed in extra:

@@ -1,9 +1,12 @@
 # SCRIPT: CXINVAUDITEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.38-MATREC-REFID-DAY
+# VERSIUNE: 5.39-NO-CHRONO-REORDER
 # Partea 2 a CXINVAUDIT. Fara launch point. Nu se ruleaza singur.
-# Same-day: MATRECTRANS pe CXREFID; ISSUE dupa intrari; RETURN dupa ISSUE.
-# CURBAL/INVLIFO sync. Sub 100000 caractere.
+# CHRONO_REORDER_ENABLED=False: nu muta CXDOCUMENTDATE/ACTUALDATE/CXCURBAL.
+# Planurile same-day raman in cod (self-check), dar apply e no-op.
+# CURBAL/INVLIFO sync dupa audit. Sub 100000 caractere.
+
+CHRONO_REORDER_ENABLED=False
 
 def apply_date_order_policy(group_rows,records):
     reserved={}
@@ -1251,6 +1254,11 @@ def running_cxcurbal(rows):
 
 def apply_same_day_reorder(inventory,rows,script_service):
     # SQL: CXDOCUMENTDATE + ACTUALDATE; MATRECTRANS pe CXREFID; RETURN dupa ISSUE; CXCURBAL.
+    # Oprit: nu rearanjeaza tranzactii/solduri din Check FIFO.
+    if not CHRONO_REORDER_ENABLED:
+        msg="REORDONARE CRONO: dezactivata (CHRONO_REORDER_ENABLED=False)"
+        script_service.log_info("CXINVAUDIT "+msg)
+        return msg
     from java.text import SimpleDateFormat
     from java.util import TimeZone,Date
     shifts=plan_chrono_shifts(rows)
