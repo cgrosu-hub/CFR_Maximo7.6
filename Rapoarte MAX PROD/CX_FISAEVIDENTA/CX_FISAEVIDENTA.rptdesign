@@ -117,7 +117,7 @@ mxReportScriptContext = MXReportScriptContext.initialize(reportContext);
         </scalar-parameter>
         <scalar-parameter name="data" id="5368">
             <property name="valueType">static</property>
-            <property name="dataType">date</property>
+            <property name="dataType">dateTime</property>
             <property name="distinct">true</property>
             <simple-property-list name="defaultValue">
                 <value type="constant">Apr 29, 2025</value>
@@ -379,48 +379,34 @@ if (params["personid"].value) {
     );
 }
 
+// ponytail: ca în DBeaver — TIMESTAMP('yyyy-MM-dd 23:59:59.999') pe ziua selectată (DB2)
+var dataLimitSql = null;
 if (params["data"].value) {
+  var calLimit = new java.util.GregorianCalendar();
+  calLimit.setTime(params["data"].value);
+  calLimit.set(java.util.Calendar.HOUR_OF_DAY, 23);
+  calLimit.set(java.util.Calendar.MINUTE, 59);
+  calLimit.set(java.util.Calendar.SECOND, 59);
+  calLimit.set(java.util.Calendar.MILLISECOND, 999);
+  var sdfLimit = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+  dataLimitSql = "TIMESTAMP('" + sdfLimit.format(calLimit.getTime()) + "')";
 
-  //  if (params["istoric"].value == 'N') {
-
-           
-     //      where += " AND cxf.cxfromdate <= "
-     //         + MXReportSqlFormat.getStartDayTimestampFunction(params["data"]);
-
-     //   where += " AND NOT EXISTS ( "
-     //         + "  SELECT 1 "
- ///    + " FROM cxfolosinta ccas "
- //  + "   WHERE ccas.ROTASSETNUM = cxf.ROTASSETNUM "
-  //   + "   AND RTRIM(ccas.location) LIKE '%CASARE' and ccas.cxfromdate <= "
-    //          + MXReportSqlFormat.getStartDayTimestampFunction(params["data"])
-    //          + " )";
-
-    //    where += " AND RTRIM(cxf.location) NOT LIKE '%CASARE'";
-
-   //      where += " AND ( cxf.CXLADATA >"
-    //          + MXReportSqlFormat.getStartDayTimestampFunction(params["data"]) +
-    //      " OR cxf.CXLADATA IS NULL ) "
-        
-   // }
    if (params["istoric"].value == 'N') {
 
-    where += " AND cxf.cxfromdate <= "
-          + MXReportSqlFormat.getStartDayTimestampFunction(params["data"]);
+    where += " AND cxf.cxfromdate <= " + dataLimitSql;
 
     where += " AND NOT EXISTS ( "
           + " SELECT 1 "
           + " FROM cxfolosinta ccas "
           + " WHERE ccas.ROTASSETNUM = cxf.ROTASSETNUM "
           + "   AND RTRIM(ccas.location) LIKE '%CASARE' "
-          + "   AND ccas.cxfromdate <= "
-          + MXReportSqlFormat.getStartDayTimestampFunction(params["data"])
+          + "   AND ccas.cxfromdate <= " + dataLimitSql
           + " ) ";
 
     where += " AND RTRIM(cxf.location) NOT LIKE '%CASARE' ";
 
     where += " AND ( "
-          + " cxf.CXLADATA > "
-          + MXReportSqlFormat.getStartDayTimestampFunction(params["data"])
+          + " cxf.CXLADATA > " + dataLimitSql
           + " OR cxf.CXLADATA IS NULL "
           + " ) ";
 
@@ -429,17 +415,15 @@ if (params["data"].value) {
           + " FROM cxfolosinta cxnext "
           + " WHERE cxnext.ROTASSETNUM = cxf.ROTASSETNUM "
           + "   AND cxnext.CXFROMDATE > cxf.CXFROMDATE "
-          + "   AND cxnext.CXFROMDATE <= "
-          + MXReportSqlFormat.getStartDayTimestampFunction(params["data"])
+          + "   AND cxnext.CXFROMDATE <= " + dataLimitSql
           + "   AND cxnext.PERSONID <> cxf.PERSONID "
           + " ) ";
 
 }
    
     else {
-        // istoric până la data
-        where += " AND cxf.cxfromdate <= "
-              + MXReportSqlFormat.getStartDayTimestampFunction(params["data"]);
+        // istoric până la TIMESTAMP sfârșit zi (ex. 30.06.2026 23:59:59.999)
+        where += " AND cxf.cxfromdate <= " + dataLimitSql;
     }
 }
 
@@ -447,11 +431,24 @@ if (params["data"].value) {
 
 var sqlText = new String();
 
+// Restituiri: MATRECTRANS sau cxf2, doar dacă data restituirii <= La data (sfârșit zi)
+var ladataExpr = "CASE WHEN cxf.CXREFMBOTO = 'MATRECTRANS' THEN m.actualdate ELSE cxf2.cxfromdate END";
+var nrdocExpr = "CASE WHEN cxf.CXREFMBOTO = 'MATRECTRANS' THEN ii.CXBONCONSUM ELSE cxf2.cxnrdoc END";
+var cantExpr = "CASE WHEN cxf.CXREFMBOTO = 'MATRECTRANS' THEN ABS(m.quantity) ELSE cxf2.quantity END";
+if (dataLimitSql != null) {
+  ladataExpr = "CASE WHEN (" + ladataExpr + ") <= " + dataLimitSql + " THEN (" + ladataExpr + ") END";
+  nrdocExpr = "CASE WHEN (" + "CASE WHEN cxf.CXREFMBOTO = 'MATRECTRANS' THEN m.actualdate ELSE cxf2.cxfromdate END" + ") <= " + dataLimitSql + " THEN (" + nrdocExpr + ") END";
+  cantExpr = "CASE WHEN (" + "CASE WHEN cxf.CXREFMBOTO = 'MATRECTRANS' THEN m.actualdate ELSE cxf2.cxfromdate END" + ") <= " + dataLimitSql + " THEN (" + cantExpr + ") END";
+}
+
 sqlText = "SELECT m.quantity as mqty, m.issueto,m.actualdate, ii.CXBONCONSUM as bon, cxf.PERSONID, p.DISPLAYNAME, cxf.ROTASSETNUM as assetnum, a1.CXNRINVENTAR AS CXNRINVENTAR, cxf.itemnum, i.description, "
 +"           cxf.unitcost, i.orderunit as receivedunit, cxf.cxnrdoc as cxbonconsum, cxf.cxfromdate AS cxdatabon, cxf.quantity AS quantity, cxf.location, "
-+"           cxf2.cxfromdate as ladata, cxf2.cxnrdoc as nrdoc, cxf2.quantity as cantpredat "
++"           " + ladataExpr + " as ladata, "
++"           " + nrdocExpr + " as nrdoc, "
++"           " + cantExpr + " as cantpredat "
 +"	FROM cxfolosinta cxf "
 +" LEFT JOIN cxfolosinta cxf2 ON cxf.CXREFIDTO = cxf2.CXFOLOSINTAID "
++"   AND (cxf.CXREFMBOTO IS NULL OR cxf.CXREFMBOTO <> 'MATRECTRANS') "
 +" 	LEFT JOIN person p "
 +"	ON cxf.personid = p.personid "
 +"	LEFT JOIN asset a1 ON cxf.rotassetnum = a1.assetnum "
@@ -460,7 +457,6 @@ sqlText = "SELECT m.quantity as mqty, m.issueto,m.actualdate, ii.CXBONCONSUM as 
 +"	LEFT JOIN INVUSE ii ON ii.invuseid=m.INVUSEID "
 +"	WHERE " + where 
 +"  AND cxf.location NOT LIKE '%CASARE' and cxf.rotassetnum is not null "
-//+" AND NOT exists ( SELECT ccc.cxfromdate FROM CXFOLOSINTA ccc WHERE ccc.ROTASSETNUM=cxf.ROTASSETNUM AND ccc.CXFROMDATE > cxf.CXFROMDATE) "
 +" ORDER BY cxdatabon, itemnum, cxnrinventar "
 
 
@@ -645,69 +641,21 @@ return (true);]]></method>
                 <structure>
                     <property name="name">ladata</property>
                     <text-property name="displayName">ladata</text-property>
-                    <expression name="expression" type="javascript">if ( dataSetRow["ladata"]!= null )&#13;
-	{&#13;
-		if (dataSetRow["ladata"].getTime() > params["data"].value.getTime())&#13;
-			{null}&#13;
-		else&#13;
-		{dataSetRow["ladata"]}&#13;
-	}&#13;
-&#13;
-else if (dataSetRow["actualdate"]!= null )&#13;
-	{&#13;
-		if (dataSetRow["actualdate"].getTime() > params["data"].value.getTime() )&#13;
-			{null}&#13;
-		else &#13;
-			{dataSetRow["actualdate"]}&#13;
-	}&#13;
-&#13;
-else{null}</expression>
+                    <expression name="expression" type="javascript">dataSetRow["ladata"]</expression>
                     <property name="dataType">date</property>
                     <property name="allowExport">true</property>
                 </structure>
                 <structure>
                     <property name="name">nrdoc</property>
                     <text-property name="displayName">nrdoc</text-property>
-                    <expression name="expression" type="javascript">if ( dataSetRow["ladata"]!= null )&#13;
-	{&#13;
-		if (dataSetRow["ladata"].getTime() > params["data"].value.getTime())&#13;
-			{null}&#13;
-		else&#13;
-		{dataSetRow["nrdoc"]}&#13;
-	}&#13;
-&#13;
-else if (dataSetRow["actualdate"]!= null )&#13;
-	{&#13;
-		if (dataSetRow["actualdate"].getTime() > params["data"].value.getTime() )&#13;
-			{null}&#13;
-		else &#13;
-			{dataSetRow["nrdoc"]}&#13;
-	}&#13;
-&#13;
-else{null}</expression>
+                    <expression name="expression" type="javascript">dataSetRow["nrdoc"]</expression>
                     <property name="dataType">string</property>
                     <property name="allowExport">true</property>
                 </structure>
                 <structure>
                     <property name="name">cantpredat</property>
                     <text-property name="displayName">cantpredat</text-property>
-                    <expression name="expression" type="javascript">if ( dataSetRow["ladata"]!= null )&#13;
-	{&#13;
-		if (dataSetRow["ladata"].getTime() > params["data"].value.getTime())&#13;
-			{null}&#13;
-		else&#13;
-		{dataSetRow["cantpredat"]}&#13;
-	}&#13;
-&#13;
-else if (dataSetRow["actualdate"]!= null )&#13;
-	{&#13;
-		if (dataSetRow["actualdate"].getTime() > params["data"].value.getTime() )&#13;
-			{null}&#13;
-		else &#13;
-			{dataSetRow["mqty"]}&#13;
-	}&#13;
-&#13;
-else{null}</expression>
+                    <expression name="expression" type="javascript">dataSetRow["cantpredat"]</expression>
                     <property name="dataType">decimal</property>
                     <property name="allowExport">true</property>
                 </structure>
@@ -1590,7 +1538,7 @@ else{null}</expression>
                             <list-property name="visibility">
                                 <structure>
                                     <property name="format">all</property>
-                                    <expression name="valueExpr" type="javascript">if (dataSetRow["ladata"].getTime() > params["data"].value.getTime()) {true} else {false}</expression>
+                                    <expression name="valueExpr" type="javascript">dataSetRow["nrdoc"] == null</expression>
                                 </structure>
                             </list-property>
                             <property name="resultSetColumn">nrdoc</property>
@@ -1619,7 +1567,7 @@ else{null}</expression>
                             <list-property name="visibility">
                                 <structure>
                                     <property name="format">all</property>
-                                    <expression name="valueExpr" type="javascript">if (dataSetRow["ladata"].getTime() > params["data"].value.getTime()) {true} else {false}</expression>
+                                    <expression name="valueExpr" type="javascript">dataSetRow["cantpredat"] == null</expression>
                                 </structure>
                             </list-property>
                             <property name="resultSetColumn">cantpredat</property>
