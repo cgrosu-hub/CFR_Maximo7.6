@@ -2,7 +2,7 @@
 #
 #   CXCANBC script - INVUSE
 #   Author: Cristian Grosu / Irina Prodan
-#   Version: 17.1 DRAFT - rotating SQL rules + mesaj eroare relevant
+#   Version: 17.2 DRAFT - rotating: fara blocare pe provenienta FIFO
 #   Launchpoint: Buton CXCANBC de pe Bon Consum (INVUSE)
 #   Anulare Bon Consum / Transfer CFR
 #   v13.6: fix postcheck pentru mai multe linii cu acelasi ITEMNUM
@@ -12,7 +12,8 @@
 #   v17 rotating=1:
 #     - sterge INVUSELINESPLIT; pastreaza INVUSELINE
 #     - FARA UPDATE CXSTOCURI.CXCURBAL / INVBALANCES (CHECK FIFO manual)
-#     - INVLIFOFIFOCOST: UPDATE LOCATION->FROMSTORELOC (fara DELETE, fara INSERT)
+#     - INVLIFOFIFOCOST: UPDATE LOCATION->FROMSTORELOC (fara DELETE, fara INSERT;
+#       fara verificare provenienta origine — nu blocheaza anularea)
 #     - INSERT doar INVUSESTATUS
 #     - DELETE: ASSETTRANS, CXFOLOSINTA(dest), CXSTOCURI x2, MATRECTRANS
 #     - CXFOLOSINTA (reguli CXADDTOCXFOLOSINTA):
@@ -224,20 +225,8 @@ try:
                     if dest_fifo_qty != 1.0: raise Exception( "FIFO rotating destinatie trebuie sa aiba QUANTITY=1. MATRECTRANSID=%s QTY=%s" % (str(matrectransid), str(dest_fifo_qty)) )
                     if abs(dest_fifo_cost - transfer_unitcost) > 0.000001:
                         raise Exception( "FIFO destinatie are cost diferit de MATRECTRANSID=%s" % str(matrectransid) )
-                    # Refacem stratul exact al activului, nu un strat nou fara provenienta.
-                    # Daca exista mai multe intrari posibile sau data stratului nu poate fi sustinuta, blocam bonul in PRECHECK.
-                    originSql = ( "SELECT MATRECTRANSID, ISSUETYPE, ACTUALDATE FROM MATRECTRANS " "WHERE ROTASSETNUM='%s' AND ITEMNUM='%s' AND SITEID='%s' AND TOSTORELOC='%s' " "AND QUANTITY=1 AND ABS(UNITCOST-%s)<0.000001 AND MATRECTRANSID<>%s " "AND TRANSDATE<(SELECT TRANSDATE FROM MATRECTRANS WHERE MATRECTRANSID=%s) " "ORDER BY TRANSDATE DESC, MATRECTRANSID DESC" % (mat_rotasset.replace("'", "''"), itemnum.replace("'", "''"), siteid.replace("'", "''"), fromstoreloc.replace("'", "''"), str(transfer_unitcost), str(matrectransid), str(matrectransid)) ); rsOrigin = s.executeQuery(originSql); origins = []
-                    while rsOrigin.next(): origins.append((rsOrigin.getLong(1), rsOrigin.getString(2), rsOrigin.getTimestamp(3)))
-                    rsOrigin.close()
-                    if len(origins) != 1 or origins[0][2] is None: raise Exception("FIFO: provenienta sursa neidentificata unic pentru activul %s" % mat_rotasset)
-                    origin_id, origin_issuetype, origin_actualdate = origins[0]
-                    originExistingSql = ("SELECT COUNT(*) FROM INVLIFOFIFOCOST WHERE ITEMNUM='%s' AND SITEID='%s' AND LOCATION='%s' AND REFOBJECT='MATRECTRANS' AND REFOBJECTID=%s" % (itemnum.replace("'", "''"), siteid.replace("'", "''"), fromstoreloc.replace("'", "''"), str(origin_id)))
-                    rsOriginExisting = s.executeQuery(originExistingSql); rsOriginExisting.next(); origin_existing = rsOriginExisting.getInt(1); rsOriginExisting.close()
-                    if origin_existing != 0: raise Exception("FIFO: stratul original %s exista deja in sursa" % str(origin_id))
-                    # Scriptul CXINVLIFOFIFO seteaza COSTDATE din MATRECTRANS.ACTUALDATE,
-                    # cu exceptia ISSUETYPE=ISSUE; folosim aceeasi regula la restaurare.
-                    if origin_issuetype == 'ISSUE' or origin_actualdate is None: raise Exception("FIFO: MATRECTRANS origine nu poate furniza COSTDATE pentru activul %s" % mat_rotasset)
-                    origin_costdate = origin_actualdate
+                    # v17.2: nu mai validam provenienta origine FIFO — UPDATE muta doar LOCATION
+                    # pe FROMSTORELOC; CHECK FIFO manual dupa anulare.
                     # CXSTOCURI exact -1 sursa / +1 destinatie.
                     cxSql = ( "SELECT ITEMNUM, SITEID, LOCATION, CXREF, CXQTY, UNITCOST, COMMODITYGROUP, CXSTOCURIID FROM CXSTOCURI " "WHERE CXREFMBO='MATRECTRANS' AND CXREFID=%s ORDER BY CXSTOCURIID" % str(matrectransid) ); rsCx = s.executeQuery(cxSql); cx_rows = []
                     while rsCx.next():
@@ -317,7 +306,7 @@ try:
                             src_fol_id = source_fol_ids[0]
                             if src_fol_id in validated_cxfolosinta_reopen_ids: raise Exception("CXFOLOSINTA reopen ID duplicat=%s" % str(src_fol_id))
                             validated_cxfolosinta_reopen_ids.append(src_fol_id)
-                    transfer_rows.append(( invuselineid, itemnum, 1.0, mat_rotasset, tostoreloc, matrectransid, transfer_unitcost, transfer_date, dest_fifo_id, source_curbal_before, dest_curbal_before, origin_id, origin_costdate )); validated_matrectrans_ids.append(matrectransid)
+                    transfer_rows.append(( invuselineid, itemnum, 1.0, mat_rotasset, tostoreloc, matrectransid, transfer_unitcost, transfer_date, dest_fifo_id, source_curbal_before, dest_curbal_before )); validated_matrectrans_ids.append(matrectransid)
                 line = linesSet.moveNext()
             if len(transfer_rows) == 0:
                 raise Exception("CXCANBC v13.7: nu exista tranzactii validate pentru COMPLETE TRANSFER")
@@ -347,10 +336,10 @@ try:
             # v17: fara rebase CXCURBAL / fara UPDATE INVBALANCES — CHECK FIFO manual dupa.
             service.log_info( '*** CXCANBC v17 - PRECHECK OK pentru %s linii, speta=%s, rotating ***' % (str(len(transfer_rows)), str(detected_case)) )
             # -----------------------------------------------------------------
-            # EXECUTIE v17 rotating=1 — cronologie:
+            # EXECUTIE v17.2 rotating=1 — cronologie:
             #   1) UPDATE ASSET.LOCATION -> FROMSTORELOC
-            #   2) UPDATE INVLIFOFIFOCOST (acelasi ID destinatie): LOCATION->FROMSTORELOC
-            #      + REFOBJECTID/COSTDATE origine (fara DELETE, fara INSERT FIFO)
+            #   2) UPDATE INVLIFOFIFOCOST: LOCATION->FROMSTORELOC (fara provenienta,
+            #      fara DELETE/INSERT FIFO)
             #   3a) UPDATE CXFOLOSINTA sursa: REOPEN (NULL CXLADATA/CXREFMBOTO/CXREFIDTO)
             #   3b) DELETE CXFOLOSINTA dest (CXREFMBO=MATRECTRANS)
             #   3c) DELETE ASSETTRANS / CXSTOCURI(x2 pe CXREFID) / MATRECTRANS
@@ -359,24 +348,24 @@ try:
             # -----------------------------------------------------------------
             phase = "execution"
             for row in transfer_rows:
-                invuselineid = row[0]; itemnum = row[1]; quantity = row[2]; rotasset = row[3]; tostoreloc = row[4]; matrectransid = row[5]; transfer_unitcost = row[6]; transfer_date = row[7]; dest_fifo_id = row[8]; origin_id = row[11]; origin_costdate = row[12]
+                invuselineid = row[0]; itemnum = row[1]; quantity = row[2]; rotasset = row[3]; tostoreloc = row[4]; matrectransid = row[5]; dest_fifo_id = row[8]
                 # 1) Asset inapoi in sursa.
                 assetUpdate = ( "UPDATE ASSET SET LOCATION = '%s' " "WHERE ASSETNUM = '%s' AND SITEID = '%s' AND LOCATION = '%s'" % ( fromstoreloc.replace("'", "''"), rotasset.replace("'", "''"), siteid.replace("'", "''"), tostoreloc.replace("'", "''") ) ); service.log_info('*** V17 ASSET UPDATE *** ' + assetUpdate)
                 if s.executeUpdate(assetUpdate) != 1:
                     raise Exception("ASSET UPDATE nu a modificat exact 1 rand pentru ASSET=%s" % rotasset)
-                # 2) FIFO: mutam stratul destinatie inapoi pe FROMSTORELOC (UPDATE, nu DELETE+INSERT).
-                fifoUpdate = ( "UPDATE INVLIFOFIFOCOST SET LOCATION='%s', REFOBJECT='MATRECTRANS', REFOBJECTID=%s, COSTDATE=TIMESTAMP('%s') " "WHERE INVLIFOFIFOCOSTID=%s AND LOCATION='%s' AND QUANTITY=1 AND SITEID='%s' AND ITEMNUM='%s'" % ( fromstoreloc.replace("'", "''"), str(origin_id), str(origin_costdate), str(dest_fifo_id), tostoreloc.replace("'", "''"), siteid.replace("'", "''"), itemnum.replace("'", "''") ) )
-                service.log_info('*** V17 FIFO UPDATE LOCATION->FROMSTORELOC *** ' + fifoUpdate)
+                # 2) FIFO: mutam stratul destinatie pe FROMSTORELOC (doar LOCATION).
+                fifoUpdate = ( "UPDATE INVLIFOFIFOCOST SET LOCATION='%s' " "WHERE INVLIFOFIFOCOSTID=%s AND LOCATION='%s' AND QUANTITY=1 AND SITEID='%s' AND ITEMNUM='%s'" % ( fromstoreloc.replace("'", "''"), str(dest_fifo_id), tostoreloc.replace("'", "''"), siteid.replace("'", "''"), itemnum.replace("'", "''") ) )
+                service.log_info('*** V17.2 FIFO UPDATE LOCATION->FROMSTORELOC *** ' + fifoUpdate)
                 if s.executeUpdate(fifoUpdate) != 1:
                     raise Exception("FIFO UPDATE nu a modificat exact 1 rand, ID=%s ASSET=%s" % (str(dest_fifo_id), rotasset))
-                # Postcheck: asset + FIFO pe sursa (fara INVBALANCES).
+                # Postcheck: asset + FIFO pe sursa (fara INVBALANCES, fara provenienta).
                 postAssetSql = ( "SELECT LOCATION FROM ASSET WHERE ASSETNUM='%s' AND SITEID='%s' FETCH FIRST 1 ROW ONLY" % (rotasset.replace("'", "''"), siteid.replace("'", "''")) ); rsPostAsset = s.executeQuery(postAssetSql)
                 if not rsPostAsset.next() or rsPostAsset.getString(1) != fromstoreloc:
                     rsPostAsset.close()
                     raise Exception("POSTCHECK ASSET esuat pentru ASSET=%s" % rotasset)
                 rsPostAsset.close()
-                postFifoSql = ( "SELECT LOCATION, QUANTITY, REFOBJECT, REFOBJECTID, COSTDATE FROM INVLIFOFIFOCOST WHERE INVLIFOFIFOCOSTID=%s" % str(dest_fifo_id) ); rsPostFifo = s.executeQuery(postFifoSql)
-                if not rsPostFifo.next() or rsPostFifo.getString(1) != fromstoreloc or rsPostFifo.getDouble(2) != 1.0 or rsPostFifo.getString(3) != 'MATRECTRANS' or rsPostFifo.getLong(4) != origin_id or not rsPostFifo.getTimestamp(5).equals(origin_costdate):
+                postFifoSql = ( "SELECT LOCATION, QUANTITY FROM INVLIFOFIFOCOST WHERE INVLIFOFIFOCOSTID=%s" % str(dest_fifo_id) ); rsPostFifo = s.executeQuery(postFifoSql)
+                if not rsPostFifo.next() or rsPostFifo.getString(1) != fromstoreloc or rsPostFifo.getDouble(2) != 1.0:
                     rsPostFifo.close()
                     raise Exception("POSTCHECK FIFO UPDATE esuat pentru ASSET=%s ID=%s" % (rotasset, str(dest_fifo_id)))
                 rsPostFifo.close()
