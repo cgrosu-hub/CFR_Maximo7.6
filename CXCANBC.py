@@ -2,7 +2,7 @@
 #
 #   CXCANBC script - INVUSE
 #   Author: Cristian Grosu / Irina Prodan
-#   Version: 17 DRAFT - rotating SQL rules
+#   Version: 17.1 DRAFT - rotating SQL rules + mesaj eroare relevant
 #   Launchpoint: Buton CXCANBC de pe Bon Consum (INVUSE)
 #   Anulare Bon Consum / Transfer CFR
 #   v13.6: fix postcheck pentru mai multe linii cu acelasi ITEMNUM
@@ -84,14 +84,13 @@ def apply_cxcurbal_rebase_plan(plan):
         update_sql = ( "UPDATE CXSTOCURI SET CXCURBAL=%s " "WHERE CXSTOCURIID=%s AND CXCURBAL=%s" % (str(new_balance), str(rowid), str(old_balance)) )
         if s.executeUpdate(update_sql) != 1: raise Exception("CXCURBAL: rand modificat concurent, CXSTOCURIID=%s" % str(rowid))
 def preflight_reason(error):
-    """Motiv scurt pentru utilizator; diagnosticul complet ramane in jurnal."""
-    detail = str(error)
-    if "CXFOLOSINTA dupa acest bon" in detail: return detail
-    if "nu mai este in destinatia" in detail: return detail
-    if "nu este inca validat" in detail or "neimplementat" in detail: return "Acest tip de bon nu este inca acoperit de anularea automata."
-    if "sold" in detail.lower() or "curbal" in detail.lower(): return "Soldurile nu permit confirmarea unei anulari automate sigure."
-    if "FIFO" in detail: return "Provenienta sau cantitatea stratului de cost necesita verificare."
-    return "Verificarile automate au gasit date sau dependinte ce necesita analiza."
+    """Motiv relevant pentru utilizator = textul exceptiei (scurtat); jurnalul pastreaza tot."""
+    detail = str(error).strip()
+    if not detail: return "Verificarile automate au esuat fara detalii."
+    # Mesajele de exceptie din script sunt deja in romana si actionabile.
+    # Nu le mai comprimam in formule generice (ex. FIFO -> "stratului de cost").
+    if len(detail) > 240: return detail[:237] + "..."
+    return detail
 phase = "setup"; committed = False
 try:
     service.log_info('*** CXCANBC - START DB OPERATIONS ***')
