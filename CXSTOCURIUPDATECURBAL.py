@@ -1,6 +1,6 @@
 # SCRIPT: CXSTOCURIUPDATECURBAL
 # AUTOR: Fernando Prajitura; aliniat la ledger-ul FIFO de Cristian Grosu
-# VERSIUNE: 2026.11.19-NO-CHRONO-REORDER
+# VERSIUNE: 2026.11.23-NULL-NO-DAYS-FILTER
 # ISSUE legat de MATRECTRANS: diferenta de pret de 0.001 si LINECOST egal cu
 # valoarea receptiei -> UNITCOST din jurnal devine pretul receptiei.
 # Urma: DESCRIPTION_LONGDESCRIPTION, linie "PU-RECEPTIE:". Apoi se recalculeaza
@@ -11,8 +11,9 @@
 # Ordine ledger: CXDOCUMENTDATE, CXREFID (null=0), CXSTOCURIID.
 #
 # cfr.inventory.updateAllCxStocuri = true  -> toate partitiile
-# altfel -> doar partitiile cu cel putin un CXCURBAL null
-# cfr.inventory.numHistoryDaysToUpdate = N -> in modul null, ultimele N zile
+# altfel -> toate partitiile cu cel putin un CXCURBAL null (fara fereastra pe zile)
+# cfr.inventory.numHistoryDaysToUpdate: ignorat in modul null
+#   (receptiile antedatate au CXDOCUMENTDATE=ACTUALDATE vechi, dar soldul e null)
 # cfr.inventory.sameDayReorder / sameDayReorderMax: ignorate (reorder off)
 
 from java.math import BigDecimal
@@ -129,6 +130,12 @@ def self_check():
         raise ValueError("self-check snap linecost")
     if snap_issue_cost("43.280", "43.280", "-0.520", "-22.506") is not None:
         raise ValueError("self-check snap egal")
+    if seed_where(True) != "1=1":
+        raise ValueError("self-check seed_where full")
+    if seed_where(False) != "cxcurbal is null":
+        raise ValueError("self-check seed_where null")
+    if seed_where(False, 7) != "cxcurbal is null":
+        raise ValueError("self-check seed_where ignora days")
 
 
 def running_balances(rows):
@@ -303,13 +310,12 @@ def positive_days(value):
     return number
 
 
-def seed_where(full, days):
+def seed_where(full, days=None):
+    # Modul null: orice CXCURBAL null, indiferent de vechimea CXDOCUMENTDATE.
+    # days e ignorat (receptii antedatate: ACTUALDATE vechi, TRANSDATE recent).
     if full:
         return "1=1"
-    where = "cxcurbal is null"
-    if days is not None:
-        where += " and cxdocumentdate > current timestamp - %s days" % days
-    return where
+    return "cxcurbal is null"
 
 
 def clean_text(value):
@@ -938,13 +944,15 @@ def main():
         raise ValueError("runAsUserInfo lipsa")
     server = MXServer.getMXServer()
     full = prop_true(server, "cfr.inventory.updateAllCxStocuri")
-    days = None if full else positive_days(server.getProperty("cfr.inventory.numHistoryDaysToUpdate"))
-    where = seed_where(full, days)
+    # numHistoryDaysToUpdate: citit doar pentru log; seed_where il ignora in modul null.
+    days_prop = None if full else positive_days(server.getProperty("cfr.inventory.numHistoryDaysToUpdate"))
+    where = seed_where(full)
     # Reordonare cronologica oprita (aliniat la CXINVAUDIT CHRONO_REORDER_ENABLED=False).
     same_day = False
     same_day_max = prop_positive(server, "cfr.inventory.sameDayReorderMax", DEFAULT_SAME_DAY_MAX)
-    service.log_error("CXSTOCURIUPDATECURBAL start mod=%s filtru=%s sameDay=%s max=%s" % (
-        "complet" if full else "null", where, same_day, same_day_max))
+    service.log_error(
+        "CXSTOCURIUPDATECURBAL start mod=%s filtru=%s daysProp=%s(ignorat) sameDay=%s max=%s" % (
+            "complet" if full else "null", where, days_prop, same_day, same_day_max))
     extra, snapped = snap_existing(user)
     moved = 0
     bal_fixed = 0
