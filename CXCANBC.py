@@ -2,7 +2,7 @@
 #
 #   CXCANBC script - INVUSE
 #   Author: Cristian Grosu / Irina Prodan
-#   Version: 17.2 DRAFT - rotating: fara blocare pe provenienta FIFO
+#   Version: 17.3 DRAFT - rotating: fara blocare pe cost FIFO vs MATRECTRANS
 #   Launchpoint: Buton CXCANBC de pe Bon Consum (INVUSE)
 #   Anulare Bon Consum / Transfer CFR
 #   v13.6: fix postcheck pentru mai multe linii cu acelasi ITEMNUM
@@ -223,8 +223,10 @@ try:
                         raise Exception("Exista mai multe FIFO-uri destinatie pentru MATRECTRANSID=%s" % str(matrectransid))
                     rsFifo.close()
                     if dest_fifo_qty != 1.0: raise Exception( "FIFO rotating destinatie trebuie sa aiba QUANTITY=1. MATRECTRANSID=%s QTY=%s" % (str(matrectransid), str(dest_fifo_qty)) )
+                    # v17.3: diferenta de cost FIFO vs MATRECTRANS NU blocheaza anularea —
+                    # mutam doar LOCATION; CHECK FIFO manual dupa. Logam pentru audit.
                     if abs(dest_fifo_cost - transfer_unitcost) > 0.000001:
-                        raise Exception( "FIFO destinatie are cost diferit de MATRECTRANSID=%s" % str(matrectransid) )
+                        service.log_info( '*** V17.3 WARN FIFO cost diferit de MATRECTRANS (nu blocheaza): MATRECTRANSID=%s FIFO_COST=%s MAT_COST=%s ***' % (str(matrectransid), str(dest_fifo_cost), str(transfer_unitcost)) )
                     # v17.2: nu mai validam provenienta origine FIFO — UPDATE muta doar LOCATION
                     # pe FROMSTORELOC; CHECK FIFO manual dupa anulare.
                     # CXSTOCURI exact -1 sursa / +1 destinatie.
