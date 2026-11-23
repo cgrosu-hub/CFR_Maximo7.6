@@ -2,7 +2,7 @@
 #
 #   CXCANBC script - INVUSE
 #   Author: Cristian Grosu / Irina Prodan
-#   Version: 17.3 DRAFT - rotating: fara blocare pe cost FIFO vs MATRECTRANS
+#   Version: 17.4 DRAFT - rotating: fara blocare pe cost CXSTOCURI vs MATRECTRANS
 #   Launchpoint: Buton CXCANBC de pe Bon Consum (INVUSE)
 #   Anulare Bon Consum / Transfer CFR
 #   v13.6: fix postcheck pentru mai multe linii cu acelasi ITEMNUM
@@ -239,7 +239,13 @@ try:
                         cx_rows.append((rsCx.getString(1), rsCx.getString(2), rsCx.getString(3), rsCx.getString(4), rsCx.getDouble(5), cx_cost_decimal, rsCx.getString(7), rsCx.getLong(8)))
                     rsCx.close(); source_cx_ok = False; dest_cx_ok = False
                     for (cx_item, cx_site, cx_location, cx_ref, cx_qty, cx_cost, cx_group, cx_id) in cx_rows:
-                        if cx_item != itemnum or cx_site != siteid or cx_ref != "TRANSFER" or abs(cx_cost.doubleValue() - transfer_unitcost) > 0.000001: raise Exception( "CXSTOCURI nu corespunde articolului/site-ului/tipului/costului pentru MATRECTRANSID=%s" % str(matrectransid) )
+                        # v17.4: cost CXSTOCURI pe destinatie poate diferi de MATRECTRANS
+                        # (ex. 19.5 sursa / 24.214 CASARE) — DELETE pe CXREFID tot e valid;
+                        # diferenta de cost doar se logheaza, nu blocheaza.
+                        if cx_item != itemnum or cx_site != siteid or cx_ref != "TRANSFER":
+                            raise Exception( "CXSTOCURI nu corespunde articolului/site-ului/tipului pentru MATRECTRANSID=%s" % str(matrectransid) )
+                        if abs(cx_cost.doubleValue() - transfer_unitcost) > 0.000001:
+                            service.log_info( '*** V17.4 WARN CXSTOCURI cost diferit de MATRECTRANS (nu blocheaza): MATRECTRANSID=%s LOCATION=%s CX_COST=%s MAT_COST=%s ***' % (str(matrectransid), str(cx_location), str(cx_cost), str(transfer_unitcost)) )
                         if not cx_group: raise Exception("CXSTOCURI COMMODITYGROUP lipsa pentru MATRECTRANSID=%s" % str(matrectransid))
                         if cx_location == fromstoreloc and cx_qty == -1.0: source_cx_ok = True
                         if cx_location == tostoreloc and cx_qty == 1.0: dest_cx_ok = True
