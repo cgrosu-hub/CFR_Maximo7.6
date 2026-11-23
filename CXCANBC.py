@@ -2,13 +2,24 @@
 #
 #   CXCANBC script - INVUSE
 #   Author: Cristian Grosu / Irina Prodan
-#   Version: 16 DRAFT - CANCELLED keep INVUSE/INVUSELINE
+#   Version: 17 DRAFT - rotating SQL rules
 #   Launchpoint: Buton CXCANBC de pe Bon Consum (INVUSE)
 #   Anulare Bon Consum / Transfer CFR
 #   v13.6: fix postcheck pentru mai multe linii cu acelasi ITEMNUM
 #   v13.9: SHIPPED precheck stoc + suport multi-split rotating per transfer/receipt
 #   v13.9.1: cleanup ASSETTRANS + CXFOLOSINTA legat exact de SHIPRECEIPT
-#   v16: nu sterge INVUSE/INVUSELINE/INVUSELINESPLIT; STATUS=CANCELLED
+#   v16: INVUSE/INVUSELINE pastrate; STATUS=CANCELLED
+#   v17 rotating=1:
+#     - sterge INVUSELINESPLIT; pastreaza INVUSELINE
+#     - FARA UPDATE CXSTOCURI.CXCURBAL / INVBALANCES (CHECK FIFO manual)
+#     - INVLIFOFIFOCOST: UPDATE LOCATION->FROMSTORELOC (fara DELETE, fara INSERT)
+#     - INSERT doar INVUSESTATUS
+#     - DELETE: ASSETTRANS, CXFOLOSINTA(dest), CXSTOCURI x2, MATRECTRANS
+#     - CXFOLOSINTA (reguli CXADDTOCXFOLOSINTA):
+#         * dest (CXREFMBO=MATRECTRANS) trebuie sa fie varful lantului
+#           (CXLADATA/CXREFMBOTO/CXREFIDTO NULL, fara copil CXREFMBO=CXFOLOSINTA)
+#         * daca exista sursa inchisa pe CXREFMBOTO/CXREFIDTO -> REOPEN
+#           (NULL pe CXLADATA/CXREFMBOTO/CXREFIDTO), apoi DELETE dest
 #
 ###############################################
 from psdi.server import MXServer
@@ -119,7 +130,7 @@ try:
                 raise Exception("Nu exista LOCATIONS pentru FROMSTORELOC=%s, SITEID=%s" % (fromstoreloc, siteid))
             source_type = rsSourceType.getString(1); rsSourceType.close()
             if source_type not in ("STOREROOM", "LABOR"): raise Exception( "CXCANBC v13.3: COMPLETE TRANSFER neimplementat pentru sursa TYPE=%s." % source_type )
-            transfer_rows = []; detected_case = None; validated_matrectrans_ids = []; validated_assettrans_ids = []; validated_cxfolosinta_ids = []; validated_cx_partitions = set(); validated_cx_ids = set(); line = linesSet.moveFirst()
+            transfer_rows = []; detected_case = None; validated_matrectrans_ids = []; validated_assettrans_ids = []; validated_cxfolosinta_ids = []; validated_cxfolosinta_reopen_ids = []; validated_cx_partitions = set(); validated_cx_ids = set(); line = linesSet.moveFirst()
             while line:
                 invuselineid = line.getLong("INVUSELINEID"); itemnum      = line.getString("ITEMNUM"); quantity     = line.getDouble("QUANTITY"); rotasset     = line.getString("ROTASSETNUM"); line_fromstoreloc = line.getString("FROMSTORELOC"); tostoreloc   = line.getString("TOSTORELOC"); tositeid     = line.getString("TOSITEID")
                 if line_fromstoreloc != fromstoreloc: raise Exception( "INVUSELINEID=%s are FROMSTORELOC diferit de antet: %s / %s" % (str(invuselineid), line_fromstoreloc, fromstoreloc) )
@@ -265,21 +276,48 @@ try:
                         if later_asset_count != 0: raise Exception( "Activul %s are %s miscari ASSETTRANS dupa acest bon; anularea trebuie tratata in ordinea miscarilor" % (mat_rotasset, str(later_asset_count)) )
                         if at[0] in validated_assettrans_ids: raise Exception( "ASSETTRANSID duplicat=%s" % str(at[0]) )
                         validated_assettrans_ids.append(at[0])
-                    cxFolosintaSql = ( "SELECT CXFOLOSINTAID, ITEMNUM, LOCATION, QUANTITY, ROTASSETNUM, SITEID, ORGID " "FROM CXFOLOSINTA WHERE CXREFMBO='MATRECTRANS' AND CXREFID=%s ORDER BY CXFOLOSINTAID" % str(matrectransid) ); rsCxFolosinta = s.executeQuery(cxFolosintaSql); cxfol_rows = []
-                    while rsCxFolosinta.next(): cxfol_rows.append((rsCxFolosinta.getLong(1), rsCxFolosinta.getString(2), rsCxFolosinta.getString(3), rsCxFolosinta.getDouble(4), rsCxFolosinta.getString(5), rsCxFolosinta.getString(6), rsCxFolosinta.getString(7)))
+                    # CXFOLOSINTA dest creat de transfer (CXREFMBO=MATRECTRANS).
+                    # Reguli CXADDTOCXFOLOSINTA: mutarile ulterioare inchid dest-ul
+                    # (CXLADATA/CXREFMBOTO/CXREFIDTO) si creeaza copil CXREFMBO=CXFOLOSINTA.
+                    # Anularea e permisa doar daca dest e varful lantului.
+                    cxFolosintaSql = ( "SELECT CXFOLOSINTAID, ITEMNUM, LOCATION, QUANTITY, ROTASSETNUM, SITEID, ORGID, " "CXLADATA, CXREFMBOTO, CXREFIDTO " "FROM CXFOLOSINTA WHERE CXREFMBO='MATRECTRANS' AND CXREFID=%s ORDER BY CXFOLOSINTAID" % str(matrectransid) ); rsCxFolosinta = s.executeQuery(cxFolosintaSql); cxfol_rows = []
+                    while rsCxFolosinta.next():
+                        cxf_refidto = rsCxFolosinta.getLong(10)
+                        if rsCxFolosinta.wasNull(): cxf_refidto = None
+                        cxfol_rows.append((rsCxFolosinta.getLong(1), rsCxFolosinta.getString(2), rsCxFolosinta.getString(3), rsCxFolosinta.getDouble(4), rsCxFolosinta.getString(5), rsCxFolosinta.getString(6), rsCxFolosinta.getString(7), rsCxFolosinta.getTimestamp(8), rsCxFolosinta.getString(9), cxf_refidto))
                     rsCxFolosinta.close()
                     if len(cxfol_rows) > 1: raise Exception( "Mai multe CXFOLOSINTA pentru rotating MATRECTRANSID=%s" % str(matrectransid) )
                     if len(cxfol_rows) == 1:
-                        cxf = cxfol_rows[0]
+                        cxf = cxfol_rows[0]; dest_cxfolosintaid = cxf[0]
                         if cxf[1] != itemnum or cxf[2] != tostoreloc or abs(cxf[3] - 1.0) > 0.000001 or cxf[4] != mat_rotasset or cxf[5] != siteid or (cxf[6] and cxf[6] != orgid): raise Exception( "CXFOLOSINTA nu corespunde transferului MATRECTRANSID=%s" % str(matrectransid) )
-                        laterFolosintaSql = ( "SELECT COUNT(*) FROM CXFOLOSINTA WHERE ROTASSETNUM='%s' AND SITEID='%s' AND CXFOLOSINTAID>%s" % (mat_rotasset.replace("'", "''"), siteid.replace("'", "''"), str(cxf[0])) ); rsLaterFolosinta = s.executeQuery(laterFolosintaSql)
+                        if cxf[7] is not None or (cxf[8] and str(cxf[8]).strip() != "") or cxf[9] is not None:
+                            raise Exception( "CXFOLOSINTA dest ID=%s a fost deja inchisa/mutata (CXLADATA/CXREFMBOTO/CXREFIDTO); anulare blocata (regula CXADDTOCXFOLOSINTA)" % str(dest_cxfolosintaid) )
+                        childFolosintaSql = ( "SELECT COUNT(*) FROM CXFOLOSINTA WHERE CXREFMBO='CXFOLOSINTA' AND CXREFID=%s" % str(dest_cxfolosintaid) ); rsChildFol = s.executeQuery(childFolosintaSql)
+                        if not rsChildFol.next():
+                            rsChildFol.close()
+                            raise Exception("Nu s-au putut verifica copiii CXFOLOSINTA pentru ID=%s" % str(dest_cxfolosintaid))
+                        child_fol_count = rsChildFol.getInt(1); rsChildFol.close()
+                        if child_fol_count != 0: raise Exception( "CXFOLOSINTA dest ID=%s are %s mutari CXADDTOCXFOLOSINTA; anulare blocata" % (str(dest_cxfolosintaid), str(child_fol_count)) )
+                        laterFolosintaSql = ( "SELECT COUNT(*) FROM CXFOLOSINTA WHERE ROTASSETNUM='%s' AND SITEID='%s' AND CXFOLOSINTAID>%s" % (mat_rotasset.replace("'", "''"), siteid.replace("'", "''"), str(dest_cxfolosintaid)) ); rsLaterFolosinta = s.executeQuery(laterFolosintaSql)
                         if not rsLaterFolosinta.next():
                             rsLaterFolosinta.close()
                             raise Exception( "Nu s-a putut verifica folosinta ulterioara a activului %s" % mat_rotasset )
                         later_folosinta_count = rsLaterFolosinta.getInt(1); rsLaterFolosinta.close()
                         if later_folosinta_count != 0: raise Exception( "Activul %s are %s inregistrari CXFOLOSINTA dupa acest bon" % (mat_rotasset, str(later_folosinta_count)) )
-                        if cxf[0] in validated_cxfolosinta_ids: raise Exception( "CXFOLOSINTAID duplicat=%s" % str(cxf[0]) )
-                        validated_cxfolosinta_ids.append(cxf[0])
+                        if dest_cxfolosintaid in validated_cxfolosinta_ids: raise Exception( "CXFOLOSINTAID duplicat=%s" % str(dest_cxfolosintaid) )
+                        validated_cxfolosinta_ids.append(dest_cxfolosintaid)
+                        # Sursa inchisa de acest transfer: redeschidem la anulare.
+                        # a) CXREFMBOTO=MATRECTRANS + CXREFIDTO=matrectransid
+                        # b) CXREFMBOTO=CXFOLOSINTA + CXREFIDTO=dest_cxfolosintaid (pattern CXADDTO)
+                        sourceFolSql = ( "SELECT CXFOLOSINTAID FROM CXFOLOSINTA " "WHERE ROTASSETNUM='%s' AND SITEID='%s' AND CXFOLOSINTAID<>%s AND (" " (CXREFMBOTO='MATRECTRANS' AND CXREFIDTO=%s) OR " " (CXREFMBOTO='CXFOLOSINTA' AND CXREFIDTO=%s) " ") ORDER BY CXFOLOSINTAID" % (mat_rotasset.replace("'", "''"), siteid.replace("'", "''"), str(dest_cxfolosintaid), str(matrectransid), str(dest_cxfolosintaid)) )
+                        rsSourceFol = s.executeQuery(sourceFolSql); source_fol_ids = []
+                        while rsSourceFol.next(): source_fol_ids.append(rsSourceFol.getLong(1))
+                        rsSourceFol.close()
+                        if len(source_fol_ids) > 1: raise Exception( "Mai multe CXFOLOSINTA sursa inchise pe MATRECTRANSID=%s / dest=%s" % (str(matrectransid), str(dest_cxfolosintaid)) )
+                        if len(source_fol_ids) == 1:
+                            src_fol_id = source_fol_ids[0]
+                            if src_fol_id in validated_cxfolosinta_reopen_ids: raise Exception("CXFOLOSINTA reopen ID duplicat=%s" % str(src_fol_id))
+                            validated_cxfolosinta_reopen_ids.append(src_fol_id)
                     transfer_rows.append(( invuselineid, itemnum, 1.0, mat_rotasset, tostoreloc, matrectransid, transfer_unitcost, transfer_date, dest_fifo_id, source_curbal_before, dest_curbal_before, origin_id, origin_costdate )); validated_matrectrans_ids.append(matrectransid)
                 line = linesSet.moveNext()
             if len(transfer_rows) == 0:
@@ -307,98 +345,77 @@ try:
                 required_dest_qty[pre_dest_key] += pre_qty
             for pre_dest_key, pre_total_qty in required_dest_qty.items():
                 if dest_initial_bal[pre_dest_key] < pre_total_qty: raise Exception( "CXCANBC v13.7: sold destinatie insuficient pentru anulare multi-line / qty>1. " "ITEMNUM=%s LOCATION=%s CURBAL=%s QTY_TOTAL=%s" % (pre_dest_key[0], pre_dest_key[1], str(dest_initial_bal[pre_dest_key]), str(pre_total_qty)) )
-            cxcurbal_rebase_plan = build_cxcurbal_rebase_plan(validated_cx_partitions, validated_cx_ids); service.log_info( '*** CXCANBC v13.3 - PRECHECK OK pentru %s linii, speta=%s, rotating ***' % (str(len(transfer_rows)), str(detected_case)) )
+            # v17: fara rebase CXCURBAL / fara UPDATE INVBALANCES — CHECK FIFO manual dupa.
+            service.log_info( '*** CXCANBC v17 - PRECHECK OK pentru %s linii, speta=%s, rotating ***' % (str(len(transfer_rows)), str(detected_case)) )
             # -----------------------------------------------------------------
-            # EXECUTIE - numai dupa ce toate liniile au trecut PRECHECK-ul.
+            # EXECUTIE v17 rotating=1 — cronologie:
+            #   1) UPDATE ASSET.LOCATION -> FROMSTORELOC
+            #   2) UPDATE INVLIFOFIFOCOST (acelasi ID destinatie): LOCATION->FROMSTORELOC
+            #      + REFOBJECTID/COSTDATE origine (fara DELETE, fara INSERT FIFO)
+            #   3a) UPDATE CXFOLOSINTA sursa: REOPEN (NULL CXLADATA/CXREFMBOTO/CXREFIDTO)
+            #   3b) DELETE CXFOLOSINTA dest (CXREFMBO=MATRECTRANS)
+            #   3c) DELETE ASSETTRANS / CXSTOCURI(x2 pe CXREFID) / MATRECTRANS
+            #   4) DELETE INVUSELINESPLIT (INVUSELINE ramane)
+            #   5) INSERT INVUSESTATUS CANCELLED + UPDATE INVUSE.STATUS=CANCELLED
             # -----------------------------------------------------------------
-            phase = "execution"; restored_fifo_ids = []
-            # v13.6: cantitati procesate cumulativ pentru postcheck multi-line.
-            # In PRECHECK toate liniile aceluiasi item citesc acelasi CURBAL initial;
-            # dupa prima linie, postcheck-ul trebuie sa tina cont de liniile deja procesate.
-            source_processed_qty = {}; dest_processed_qty = {}
+            phase = "execution"
             for row in transfer_rows:
-                invuselineid = row[0]; itemnum = row[1]; quantity = row[2]; rotasset = row[3]; tostoreloc = row[4]; matrectransid = row[5]; transfer_unitcost = row[6]; transfer_date = row[7]; dest_fifo_id = row[8]; source_curbal_before = row[9]; dest_curbal_before = row[10]; origin_id = row[11]; origin_costdate = row[12]
-                # 3.T1 Readucem assetul in locatia sursa (STOREROOM sau LABOR).
-                assetUpdate = ( "UPDATE ASSET SET LOCATION = '%s' " "WHERE ASSETNUM = '%s' AND SITEID = '%s' AND LOCATION = '%s'" % ( fromstoreloc.replace("'", "''"), rotasset.replace("'", "''"), siteid.replace("'", "''"), tostoreloc.replace("'", "''") ) ); service.log_info('*** V13.3 ASSET UPDATE *** ' + assetUpdate)
+                invuselineid = row[0]; itemnum = row[1]; quantity = row[2]; rotasset = row[3]; tostoreloc = row[4]; matrectransid = row[5]; transfer_unitcost = row[6]; transfer_date = row[7]; dest_fifo_id = row[8]; origin_id = row[11]; origin_costdate = row[12]
+                # 1) Asset inapoi in sursa.
+                assetUpdate = ( "UPDATE ASSET SET LOCATION = '%s' " "WHERE ASSETNUM = '%s' AND SITEID = '%s' AND LOCATION = '%s'" % ( fromstoreloc.replace("'", "''"), rotasset.replace("'", "''"), siteid.replace("'", "''"), tostoreloc.replace("'", "''") ) ); service.log_info('*** V17 ASSET UPDATE *** ' + assetUpdate)
                 if s.executeUpdate(assetUpdate) != 1:
                     raise Exception("ASSET UPDATE nu a modificat exact 1 rand pentru ASSET=%s" % rotasset)
-                # 3.T2 +1 in sursa.
-                sourceBalanceUpdate = ( "UPDATE INVBALANCES SET CURBAL = CURBAL + %s " "WHERE ITEMNUM = '%s' AND LOCATION = '%s' AND SITEID = '%s'" % ( str(quantity), itemnum.replace("'", "''"), fromstoreloc.replace("'", "''"), siteid.replace("'", "''") ) ); service.log_info('*** V13.3 SOURCE INVBALANCES UPDATE *** ' + sourceBalanceUpdate)
-                if s.executeUpdate(sourceBalanceUpdate) != 1:
-                    raise Exception("SOURCE INVBALANCES UPDATE nu a modificat exact 1 rand pentru ITEMNUM=%s" % itemnum)
-                # 3.T3 -1 in destinatia LABOR (folosinta sau CASARE).
-                destBalanceUpdate = ( "UPDATE INVBALANCES SET CURBAL = CURBAL - %s " "WHERE ITEMNUM = '%s' AND LOCATION = '%s' AND SITEID = '%s'" % ( str(quantity), itemnum.replace("'", "''"), tostoreloc.replace("'", "''"), siteid.replace("'", "''") ) ); service.log_info('*** V13.3 DEST INVBALANCES UPDATE *** ' + destBalanceUpdate)
-                if s.executeUpdate(destBalanceUpdate) != 1:
-                    raise Exception("DEST INVBALANCES UPDATE nu a modificat exact 1 rand pentru ITEMNUM=%s" % itemnum)
-                # 3.T4 Stergem DOAR FIFO-ul exact al transferului din destinatie.
-                destFifoDelete = ( "DELETE FROM INVLIFOFIFOCOST WHERE INVLIFOFIFOCOSTID = %s AND QUANTITY = 1" % str(dest_fifo_id) ); service.log_info('*** V13.3 DEST FIFO DELETE *** ' + destFifoDelete)
-                if s.executeUpdate(destFifoDelete) != 1:
-                    raise Exception("DEST FIFO DELETE nu a sters exact 1 rand, ID=%s" % str(dest_fifo_id))
-                # 3.T5 Pentru rotating reconstruim FIFO cu data si referinta de origine validate.
-                # Generam ID-ul inainte pentru a-l putea valida dupa INSERT.
-                rsSeq = s.executeQuery("SELECT NEXT VALUE FOR INVLIFOFIFOCOSTSEQ FROM SYSIBM.SYSDUMMY1")
-                if not rsSeq.next():
-                    rsSeq.close()
-                    raise Exception("Nu s-a putut obtine NEXT VALUE FOR INVLIFOFIFOCOSTSEQ")
-                restored_fifo_id = rsSeq.getLong(1); rsSeq.close()
-                fifoInsert = ( "INSERT INTO INVLIFOFIFOCOST " "(ORGID, ITEMNUM, ITEMSETID, CONDITIONCODE, COSTTYPE, COSTDATE, " " UNITCOST, QUANTITY, REFOBJECT, CONDRATE, SITEID, LOCATION, " " REFOBJECTID, CONTENTUID, CXNRFISAVECHI, INVLIFOFIFOCOSTID) " "VALUES ('%s','%s','SET1',NULL,'FIFO',TIMESTAMP('%s'),%s,1,'MATRECTRANS',NULL,'%s','%s'," "%s,HEX(GENERATE_UNIQUE()),NULL,%s)" % ( orgid.replace("'", "''"), itemnum.replace("'", "''"), str(origin_costdate), str(transfer_unitcost), siteid.replace("'", "''"), fromstoreloc.replace("'", "''"), str(origin_id), str(restored_fifo_id) ) )
-                service.log_info('*** V13.3 ROTATING FIFO INSERT QTY=1 *** ' + fifoInsert)
-                if s.executeUpdate(fifoInsert) != 1: raise Exception("FIFO INSERT nu a inserat exact 1 rand pentru ASSET=%s" % rotasset)
-                restored_fifo_ids.append(restored_fifo_id)
-                # v13.6: actualizam delta cumulativa procesata pentru acelasi item / destinatie.
-                source_key = itemnum; dest_key = (itemnum, tostoreloc)
-                if source_key not in source_processed_qty: source_processed_qty[source_key] = 0.0
-                source_processed_qty[source_key] += quantity
-                if dest_key not in dest_processed_qty: dest_processed_qty[dest_key] = 0.0
-                dest_processed_qty[dest_key] += quantity
-                # 3.T6 Postcheck imediat pe asset + solduri + FIFO nou.
+                # 2) FIFO: mutam stratul destinatie inapoi pe FROMSTORELOC (UPDATE, nu DELETE+INSERT).
+                fifoUpdate = ( "UPDATE INVLIFOFIFOCOST SET LOCATION='%s', REFOBJECT='MATRECTRANS', REFOBJECTID=%s, COSTDATE=TIMESTAMP('%s') " "WHERE INVLIFOFIFOCOSTID=%s AND LOCATION='%s' AND QUANTITY=1 AND SITEID='%s' AND ITEMNUM='%s'" % ( fromstoreloc.replace("'", "''"), str(origin_id), str(origin_costdate), str(dest_fifo_id), tostoreloc.replace("'", "''"), siteid.replace("'", "''"), itemnum.replace("'", "''") ) )
+                service.log_info('*** V17 FIFO UPDATE LOCATION->FROMSTORELOC *** ' + fifoUpdate)
+                if s.executeUpdate(fifoUpdate) != 1:
+                    raise Exception("FIFO UPDATE nu a modificat exact 1 rand, ID=%s ASSET=%s" % (str(dest_fifo_id), rotasset))
+                # Postcheck: asset + FIFO pe sursa (fara INVBALANCES).
                 postAssetSql = ( "SELECT LOCATION FROM ASSET WHERE ASSETNUM='%s' AND SITEID='%s' FETCH FIRST 1 ROW ONLY" % (rotasset.replace("'", "''"), siteid.replace("'", "''")) ); rsPostAsset = s.executeQuery(postAssetSql)
                 if not rsPostAsset.next() or rsPostAsset.getString(1) != fromstoreloc:
                     rsPostAsset.close()
                     raise Exception("POSTCHECK ASSET esuat pentru ASSET=%s" % rotasset)
-                rsPostAsset.close(); postSourceSql = ( "SELECT CURBAL FROM INVBALANCES WHERE ITEMNUM='%s' AND LOCATION='%s' AND SITEID='%s'" % (itemnum.replace("'", "''"), fromstoreloc.replace("'", "''"), siteid.replace("'", "''")) ); rsPostSource = s.executeQuery(postSourceSql)
-                if not rsPostSource.next():
-                    rsPostSource.close()
-                    raise Exception("POSTCHECK sold sursa lipsa pentru ITEMNUM=%s" % itemnum)
-                source_after = rsPostSource.getDouble(1); rsPostSource.close(); expected_source_after = source_curbal_before + source_processed_qty[source_key]
-                if abs(source_after - expected_source_after) > 0.000001: raise Exception( "POSTCHECK sold sursa esuat pentru ITEMNUM=%s. ACTUAL=%s EXPECTED=%s" % (itemnum, str(source_after), str(expected_source_after)) )
-                postDestSql = ( "SELECT CURBAL FROM INVBALANCES WHERE ITEMNUM='%s' AND LOCATION='%s' AND SITEID='%s'" % (itemnum.replace("'", "''"), tostoreloc.replace("'", "''"), siteid.replace("'", "''")) ); rsPostDest = s.executeQuery(postDestSql)
-                if not rsPostDest.next():
-                    rsPostDest.close()
-                    raise Exception("POSTCHECK sold destinatie lipsa pentru ITEMNUM=%s" % itemnum)
-                dest_after = rsPostDest.getDouble(1); rsPostDest.close(); expected_dest_after = dest_curbal_before - dest_processed_qty[dest_key]
-                if abs(dest_after - expected_dest_after) > 0.000001: raise Exception( "POSTCHECK sold destinatie esuat pentru ITEMNUM=%s LOCATION=%s. ACTUAL=%s EXPECTED=%s" % (itemnum, tostoreloc, str(dest_after), str(expected_dest_after)) )
-                postFifoSql = ( "SELECT QUANTITY, REFOBJECT, REFOBJECTID, COSTDATE FROM INVLIFOFIFOCOST WHERE INVLIFOFIFOCOSTID=%s" % str(restored_fifo_id) ); rsPostFifo = s.executeQuery(postFifoSql)
-                if not rsPostFifo.next() or rsPostFifo.getDouble(1) != 1.0 or rsPostFifo.getString(2) != 'MATRECTRANS' or rsPostFifo.getLong(3) != origin_id or not rsPostFifo.getTimestamp(4).equals(origin_costdate):
+                rsPostAsset.close()
+                postFifoSql = ( "SELECT LOCATION, QUANTITY, REFOBJECT, REFOBJECTID, COSTDATE FROM INVLIFOFIFOCOST WHERE INVLIFOFIFOCOSTID=%s" % str(dest_fifo_id) ); rsPostFifo = s.executeQuery(postFifoSql)
+                if not rsPostFifo.next() or rsPostFifo.getString(1) != fromstoreloc or rsPostFifo.getDouble(2) != 1.0 or rsPostFifo.getString(3) != 'MATRECTRANS' or rsPostFifo.getLong(4) != origin_id or not rsPostFifo.getTimestamp(5).equals(origin_costdate):
                     rsPostFifo.close()
-                    raise Exception("POSTCHECK FIFO qty=1 esuat pentru ASSET=%s" % rotasset)
+                    raise Exception("POSTCHECK FIFO UPDATE esuat pentru ASSET=%s ID=%s" % (rotasset, str(dest_fifo_id)))
                 rsPostFifo.close()
-            # -----------------------------------------------------------------
-            # Curatare istorica v16: stergem efectele de stoc/tranzactie,
-            # dar PASTAM INVUSE + INVUSELINE + INVUSELINESPLIT.
-            # Bonul trece in CANCELLED (nu ENTERED).
-            # -----------------------------------------------------------------
+            # 3) Curatare istoric (fara INVLIFOFIFOCOST DELETE, fara CXCURBAL).
             ids_csv = ",".join([str(x) for x in validated_matrectrans_ids])
+            # 3a) REOPEN CXFOLOSINTA sursa inchisa de transfer / CXADDTO (inversul close).
+            if len(validated_cxfolosinta_reopen_ids) > 0:
+                reopen_ids_csv = ",".join([str(x) for x in validated_cxfolosinta_reopen_ids])
+                cxfolosintaReopen = ( "UPDATE CXFOLOSINTA SET CXLADATA=NULL, CXREFMBOTO=NULL, CXREFIDTO=NULL " "WHERE CXFOLOSINTAID IN (%s) AND (CXREFMBOTO='MATRECTRANS' OR CXREFMBOTO='CXFOLOSINTA')" % reopen_ids_csv )
+                service.log_info('*** V17 CXFOLOSINTA REOPEN (clear CXLADATA/CXREFMBOTO/CXREFIDTO) *** ' + cxfolosintaReopen)
+                if s.executeUpdate(cxfolosintaReopen) != len(validated_cxfolosinta_reopen_ids):
+                    raise Exception("CXFOLOSINTA REOPEN nu a modificat toate randurile sursa validate")
+            # 3b) DELETE CXFOLOSINTA dest (doar varful lantului, CXREFMBO=MATRECTRANS).
+            if len(validated_cxfolosinta_ids) > 0:
+                cxfolosinta_ids_csv = ",".join([str(x) for x in validated_cxfolosinta_ids]); cxfolosintaDelete = ( "DELETE FROM CXFOLOSINTA WHERE CXFOLOSINTAID IN (%s) AND CXREFMBO='MATRECTRANS' AND CXREFID IN (%s) " "AND CXLADATA IS NULL AND CXREFMBOTO IS NULL AND CXREFIDTO IS NULL" % (cxfolosinta_ids_csv, ids_csv) )
+                service.log_info('*** V17 CXFOLOSINTA DEST DELETE *** ' + cxfolosintaDelete)
+                if s.executeUpdate(cxfolosintaDelete) != len(validated_cxfolosinta_ids): raise Exception("CXFOLOSINTA DELETE nu a sters toate randurile dest validate")
+            # 3c) ASSETTRANS + CXSTOCURI x2 + MATRECTRANS.
             if len(validated_assettrans_ids) > 0:
                 assettrans_ids_csv = ",".join([str(x) for x in validated_assettrans_ids]); assettransDelete = ( "DELETE FROM ASSETTRANS WHERE ASSETTRANSID IN (%s) AND MATRECTRANSID IN (%s)" % (assettrans_ids_csv, ids_csv) )
                 if s.executeUpdate(assettransDelete) != len(validated_assettrans_ids): raise Exception("ASSETTRANS DELETE nu a sters toate randurile validate")
-            if len(validated_cxfolosinta_ids) > 0:
-                cxfolosinta_ids_csv = ",".join([str(x) for x in validated_cxfolosinta_ids]); cxfolosintaDelete = ( "DELETE FROM CXFOLOSINTA WHERE CXFOLOSINTAID IN (%s) AND CXREFMBO='MATRECTRANS' AND CXREFID IN (%s)" % (cxfolosinta_ids_csv, ids_csv) )
-                if s.executeUpdate(cxfolosintaDelete) != len(validated_cxfolosinta_ids): raise Exception("CXFOLOSINTA DELETE nu a sters toate randurile validate")
-            cxstocuriDelete = ( "DELETE FROM CXSTOCURI " "WHERE CXREFMBO = 'MATRECTRANS' AND CXREFID IN (%s)" % ids_csv ); service.log_info('*** V16 CXSTOCURI DELETE VALIDATED MATRECTRANS *** ' + cxstocuriDelete)
+            cxstocuriDelete = ( "DELETE FROM CXSTOCURI " "WHERE CXREFMBO = 'MATRECTRANS' AND CXREFID IN (%s)" % ids_csv ); service.log_info('*** V17 CXSTOCURI DELETE (2 pe CXREFID) *** ' + cxstocuriDelete)
             if s.executeUpdate(cxstocuriDelete) != 2 * len(validated_matrectrans_ids):
                 raise Exception("CXSTOCURI DELETE nu a sters cele doua randuri validate pentru fiecare transfer")
-            # Ajustam numai soldurile ulterioare afectate de randurile eliminate.
-            apply_cxcurbal_rebase_plan(cxcurbal_rebase_plan); matrectransDelete = ( "DELETE FROM MATRECTRANS WHERE MATRECTRANSID IN (%s)" % ids_csv ); service.log_info('*** V16 MATRECTRANS DELETE VALIDATED *** ' + matrectransDelete); deleted_matrec = s.executeUpdate(matrectransDelete)
+            matrectransDelete = ( "DELETE FROM MATRECTRANS WHERE MATRECTRANSID IN (%s)" % ids_csv ); service.log_info('*** V17 MATRECTRANS DELETE *** ' + matrectransDelete); deleted_matrec = s.executeUpdate(matrectransDelete)
             if deleted_matrec != len(validated_matrectrans_ids): raise Exception( "MATRECTRANS DELETE a sters %s randuri, asteptat %s" % (str(deleted_matrec), str(len(validated_matrectrans_ids))) )
-            # v16: nu stergem INVUSELINESPLIT / INVUSELINE — raman pe bonul CANCELLED.
-            service.log_info('*** V16 KEEP INVUSELINESPLIT (count=%s) INVUSELINE (count=%s) ***' % (str(split_count_expected), str(len(validated_line_ids))))
+            # 4) Stergem spliturile; INVUSELINE ramane pe bonul CANCELLED.
+            if split_count_expected > 0:
+                invuselinesplitDelete = ( "DELETE FROM INVUSELINESPLIT WHERE INVUSELINEID IN (%s)" % line_ids_csv ); service.log_info('*** V17 INVUSELINESPLIT DELETE *** ' + invuselinesplitDelete)
+                if s.executeUpdate(invuselinesplitDelete) != split_count_expected: raise Exception("INVUSELINESPLIT DELETE nu a sters toate randurile bonului")
+            service.log_info('*** V17 KEEP INVUSELINE (count=%s) ***' % str(len(validated_line_ids)))
+            # 5) Status CANCELLED.
             invusestatusInsert = ( "INSERT INTO INVUSESTATUS (INVUSESTATUSID, INVUSENUM, SITEID, ORGID, STATUS, CHANGEDATE, CHANGEBY) " "VALUES (NEXT VALUE FOR INVUSESTATUSSEQ, '%s', '%s', '%s', 'CANCELLED', CURRENT TIMESTAMP, '%s')" % (invusenum.replace("'", "''"), siteid.replace("'", "''"), orgid.replace("'", "''"), userInfo.getUserName().replace("'", "''")) )
-            service.log_info('*** V16 INVUSESTATUS CANCELLED INSERT *** ' + invusestatusInsert)
+            service.log_info('*** V17 INVUSESTATUS CANCELLED INSERT *** ' + invusestatusInsert)
             if s.executeUpdate(invusestatusInsert) != 1: raise Exception("INVUSESTATUS INSERT CANCELLED a esuat pentru INVUSENUM=%s" % invusenum)
-            invuseUpdate = ( "UPDATE INVUSE SET STATUS = 'CANCELLED', STATUSDATE = CURRENT TIMESTAMP " "WHERE INVUSEID = %s" % str(invuseid) ); service.log_info('*** V16 INVUSE COMPLETE TRANSFER -> CANCELLED *** ' + invuseUpdate)
+            invuseUpdate = ( "UPDATE INVUSE SET STATUS = 'CANCELLED', STATUSDATE = CURRENT TIMESTAMP " "WHERE INVUSEID = %s" % str(invuseid) ); service.log_info('*** V17 INVUSE COMPLETE TRANSFER -> CANCELLED *** ' + invuseUpdate)
             if s.executeUpdate(invuseUpdate) != 1: raise Exception("INVUSE UPDATE nu a modificat exact 1 rand pentru INVUSEID=%s" % str(invuseid))
-            service.log_info( '*** CXCANBC v16 - COMPLETE TRANSFER rotating finished OK, speta=%s ***' % str(detected_case) )
+            service.log_info( '*** CXCANBC v17 - COMPLETE TRANSFER rotating finished OK, speta=%s ***' % str(detected_case) )
         else:
             # Ramura v12 de mai jos nu clasifica tranzactiile reale. Pe TEST exista
             # bonuri COMPLETE/MIXED cu MATUSETRANS ISSUE, iar USETYPE nu este un
