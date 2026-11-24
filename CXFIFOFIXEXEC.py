@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.56-RETURN-BEFORE-ISSUE
+# VERSIUNE: 3.57-POSITIVE-ENTRY-TO-EXIT
 # Partea 2 a CXFIFOFIXISSUE. Fara launch point. Nu se ruleaza singur.
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # ISSUE rotating=1: corectie UNITCOST/CXCURBAL in CXSTOCURI (NOLOT, fara condition).
@@ -1357,9 +1357,21 @@ def fix_issue(context, query, state):
         return fix_issue_standalone(context, query, state, first, itemset)
     return fix_issue_invuse(context, query, state, first, itemset, lineset, lines)
 
+def redirect_positive_entry(context, query):
+    cxset,raw=query("CXSTOCURI", scope_where(context,"CXSTOCURI"))
+    journal=sorted([journal_row(m) for m in raw], key=order)
+    me=[r for r in journal if r["id"]==context.getLong("CXSTOCURIID")]
+    if len(me)!=1:
+        fail("Randul apasat nu e in jurnalul articolului")
+    bad=match_exit_for_positive(journal, me[0], lambda prior: issue_of_returns(prior, query))
+    if len(bad)!=1:
+        fail("Linia %s este intrare. Iesiri ulterioare cu acelasi pret si FIFO diferit: %s." % (me[0]["kind"], len(bad)))
+    return bad[0]["mbo"]
+
 def execute(context):
     check_matrectrans_exit_cost()
     message=None
+    defer_positive=False
     if context is None or context.getName().upper()!="CXSTOCURI":
         fail("Butonul 2 trebuie sa transmita randul CXSTOCURI")
     if not context.getProfile().hasAppOption(APP,OPTION):
@@ -1386,7 +1398,9 @@ def execute(context):
         elif kind not in MATREC_EXITS:
             fail("MATRECTRANS: SHIPTRANSFER/TRANSFER, RECEIPT/SHIPRECEIPT (qty<0), SHIPRETURN (qty<0) sau SHIPCANCEL (qty>0)")
         elif number(context,"CXQTY")>=ZERO:
-            fail("Selecteaza randul de iesire (cantitate negativa) din jurnal")
+            if kind not in ("RECEIPT","SHIPRECEIPT","TRANSFER"):
+                fail("Selecteaza randul de iesire (cantitate negativa) din jurnal")
+            defer_positive=True
     else:
         fail("Selecteaza iesire/retur MATUSETRANS sau iesire/SHIPCANCEL/SHIPRETURN MATRECTRANS")
     if context.isNull("CXREFID"):
@@ -1407,6 +1421,10 @@ def execute(context):
         content=protection[0].getString("SOURCE")
         if "def shouldCreateMatUseJournal" not in content or "and shouldCreateMatUseJournal()" not in content:
             fail("Instaleaza protectia CXADDTOCXSTOCURI")
+        if defer_positive:
+            context=redirect_positive_entry(context, query)
+            kind=context.getString("CXREF")
+            refmbo=context.getString("CXREFMBO")
         if refmbo=="MATRECTRANS" and kind=="SHIPCANCEL":
             message=fix_shipcancel(context, query, state)
         elif refmbo=="MATRECTRANS" and kind=="SHIPRETURN":

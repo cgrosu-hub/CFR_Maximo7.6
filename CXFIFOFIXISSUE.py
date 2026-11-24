@@ -1,6 +1,6 @@
 # SCRIPT: CXFIFOFIXISSUE
 # AUTOR: Cristian Grosu
-# VERSIUNE: 3.56-RETURN-BEFORE-ISSUE
+# VERSIUNE: 3.57-POSITIVE-ENTRY-TO-EXIT
 # Partea 1. def execute este in CXFIFOFIXEXEC (limita Jython method/caractere).
 # Multi-pret pe RECEIPT negativ sau SHIPTRANSFER/TRANSFER: split doar in CXSTOCURI.
 # SHIPRETURN (+qty) in replay = intrare/restabilire, ca SHIPCANCEL.
@@ -786,6 +786,32 @@ def cascade_following_issues(journal,start_pos,group,changes,query,max_n=None):
         fixed.append(r["ref"])
     return fixed,stop,planned
 
+def match_exit_for_positive(journal, me, links_for=None):
+    # Intrare (qty>0) apasata: iesirea ulterioara cu acelasi pret inregistrat,
+    # dar cu pret FIFO diferit. Una singura, altfel nu alegem.
+    bad=[]
+    me_cost=me.get("cost")
+    if me_cost is None:
+        return bad
+    for r in journal:
+        if order(r)<=order(me):
+            continue
+        if r.get("qty") is None or r["qty"]>=ZERO or r.get("cost") is None:
+            continue
+        if r.get("kind") not in MATREC_EXITS and r.get("kind")!="ISSUE":
+            continue
+        if different(r["cost"], me_cost, PRICE_EPS):
+            continue
+        prior=[x for x in journal if order(x)<order(r)]
+        links=None if links_for is None else links_for(prior)
+        try:
+            cost,allocation=single_fifo_cost(prior, r["qty"], links)
+        except Exception:
+            continue
+        if allocation and different(cost, r["cost"], PRICE_EPS):
+            bad.append(r)
+    return bad
+
 def single_fifo_cost(prior,exit_qty,links=None):
     if exit_qty is None or exit_qty>=ZERO:
         fail("Iesirea trebuie sa aiba cantitate negativa")
@@ -912,6 +938,16 @@ def check_matrectrans_exit_cost():
     ],ExactNumber("-1"),{164580:163459})
     if different(cost,ExactNumber("10.950"),PRICE_EPS):
         raise ValueError("self-check: dupa RETURN-before-ISSUE FIFO pe iesire ulterioara")
+    # SHIPRECEIPT + la 66.723: iesirea ulterioara cu acelasi pret, FIFO 66.700.
+    clicked=row(2,"2026-04-29 00:00:00.000000000",2,"SHIPRECEIPT","1","66.723","5")
+    bad_exit=row(3,"2026-07-05 00:00:00.000000000",3,"SHIPTRANSFER","-1","66.723","4")
+    found=match_exit_for_positive([
+        row(1,"2026-02-01 00:00:00.000000000",1,"SHIPRECEIPT","4","66.700","4"),
+        clicked,bad_exit,
+        row(4,"2026-08-01 00:00:00.000000000",4,"TRANSFER","-1","66.700","3"),
+    ], clicked)
+    if len(found)!=1 or found[0]["ref"]!=3:
+        raise ValueError("self-check: intrarea pozitiva trebuie sa indice iesirea cu FIFO diferit")
 
 
 EXEC_SCRIPT="CXFIFOFIXEXEC"
