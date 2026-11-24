@@ -1,6 +1,6 @@
 # SCRIPT: CXINVAUDITEXEC
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.40-RETURN-BEFORE-ISSUE
+# VERSIUNE: 5.41-ROTATING-ASSET-FIFO
 # Partea 2 a CXINVAUDIT. Fara launch point. Nu se ruleaza singur.
 # CHRONO_REORDER_ENABLED=False: nu muta CXDOCUMENTDATE/ACTUALDATE/CXCURBAL.
 # RETURN inaintea ISSUE (ISSUEID): OK + put_back daca pret/cantitate aliniate.
@@ -803,8 +803,75 @@ def plan_rotating_invlifo(desired,current):
 
 def _sql_ts(value):
     from java.sql import Timestamp
+    if isinstance(value, Timestamp):
+        return value
     d=parse_layer_date(value)
     return None if d is None else Timestamp(d.getTime())
+
+def rotating_layers_from_pairs(pairs):
+    # pairs: (assetnum, matrectransid, cost, date). Un activ = un strat qty=1.
+    layers=[]
+    seen_assets,seen_refs=set(),set()
+    for asset, ref_id, cost, date in pairs:
+        if not asset:
+            raise ValueError("ROTATING: ASSETNUM lipsa")
+        if asset in seen_assets:
+            raise ValueError("ROTATING: ASSETNUM duplicat %s" % asset)
+        seen_assets.add(asset)
+        if ref_id is None or cost is None or date is None:
+            raise ValueError("ROTATING: activ %s fara MATRECTRANS de intrare in gestiune" % asset)
+        if ref_id in seen_refs:
+            raise ValueError("ROTATING: MATRECTRANSID %s legat de mai multe active" % ref_id)
+        seen_refs.add(ref_id)
+        layers.append({"cost":cost,"qty":ONE,"ref_mbo":"MATRECTRANS","ref_id":long(ref_id),
+                       "date":date,"source":None,"priority":("A",asset,0),"initial":False})
+    return layers
+
+def rotating_asset_fifo_layers(inventory):
+    # Ultima MATRECTRANS QTY=1 cu TOSTORELOC=gestiunea curenta, per activ ACTIVE.
+    from psdi.server import MXServer
+    if inventory.isNull("ITEMNUM") or inventory.isNull("SITEID") or inventory.isNull("LOCATION"):
+        raise ValueError("ITEMNUM/SITEID/LOCATION lipsa pe INVENTORY")
+    itemnum,siteid,location=inventory.getString("ITEMNUM"),inventory.getString("SITEID"),inventory.getString("LOCATION")
+    itemset="" if inventory.isNull("ITEMSETID") else inventory.getString("ITEMSETID")
+    def q(value):
+        return txt(value).replace("'","''")
+    itemset_sql=(" AND a.ITEMSETID='%s'" % q(itemset)) if itemset else ""
+    sql=("SELECT a.ASSETNUM, m.MATRECTRANSID, m.UNITCOST, m.ACTUALDATE "
+         "FROM ASSET a LEFT JOIN MATRECTRANS m ON m.MATRECTRANSID=("
+         "SELECT MAX(m2.MATRECTRANSID) FROM MATRECTRANS m2 "
+         "WHERE m2.ROTASSETNUM=a.ASSETNUM AND m2.ITEMNUM=a.ITEMNUM "
+         "AND m2.TOSTORELOC=a.LOCATION AND m2.SITEID=a.SITEID AND m2.QUANTITY=1) "
+         "WHERE a.ITEMNUM='%s' AND a.LOCATION='%s' AND a.SITEID='%s' AND a.STATUS='ACTIVE'%s "
+         "ORDER BY a.ASSETNUM" % (q(itemnum),q(location),q(siteid),itemset_sql))
+    db=MXServer.getMXServer().getDBManager()
+    key=inventory.getUserInfo().getConnectionKey()
+    con=st=rs=None
+    pairs=[]
+    try:
+        con=db.getConnection(key)
+        st=con.createStatement()
+        rs=st.executeQuery(sql)
+        while rs.next():
+            if len(pairs)>=MAX_ROWS:
+                raise ValueError("Limita ASSET rotating depasita")
+            ref_id=rs.getLong(2)
+            if rs.wasNull():
+                ref_id=None
+            cost=None if rs.getBigDecimal(3) is None else ExactNumber(rs.getBigDecimal(3))
+            pairs.append((rs.getString(1), ref_id, cost, rs.getTimestamp(4)))
+    finally:
+        if rs is not None:
+            try: rs.close()
+            except Exception: pass
+        if st is not None:
+            try: st.close()
+            except Exception: pass
+        if con is not None:
+            db.freeConnection(key)
+    if not pairs:
+        raise ValueError("Niciun ASSET ACTIVE in gestiune")
+    return rotating_layers_from_pairs(pairs)
 
 def _sql_set_nullish(ps,idx,value,sql_type,as_long=False):
     from java.sql import Types
@@ -857,7 +924,7 @@ def apply_rotating_invlifo_sql(inventory,keeps,updates,deletes,creates,script_se
                 "INSERT INTO INVLIFOFIFOCOST (ORGID,ITEMNUM,ITEMSETID,CONDITIONCODE,COSTTYPE,"
                 "COSTDATE,UNITCOST,QUANTITY,REFOBJECT,CONDRATE,SITEID,LOCATION,REFOBJECTID,"
                 "CONTENTUID,INVLIFOFIFOCOSTID) VALUES "
-                "(?,?,?,NULL,'FIFO',?,?,?,?,100,?,?,?,?,NEXT VALUE FOR INVUSELINESPLITSEQ)")
+                "(?,?,?,NULL,'FIFO',?,?,?,?,100,?,?,?,?,NEXT VALUE FOR INVLIFOFIFOCOSTSEQ)")
             for layer in creates:
                 ps_ins.setString(1,orgid); ps_ins.setString(2,itemnum); ps_ins.setString(3,itemset)
                 _sql_set_nullish(ps_ins,4,_sql_ts(layer.get("date")),Types.TIMESTAMP)
@@ -886,19 +953,15 @@ def apply_rotating_invlifo_sql(inventory,keeps,updates,deletes,creates,script_se
             db.freeConnection(key)
 
 def sync_invlifofifocost_rotating(inventory,rows,audit,script_service):
-    ok,reason=journal_fifo_complete(audit)
-    if not ok:
-        msg="CORECTIE INVLIFOFIFOCOST ROTATING: sarita (%s)" % reason
-        script_service.log_info("CXINVAUDIT "+msg); return msg
     try:
-        desired=expand_rotating_desired(desired_fifo_layers(rows,audit))
+        desired=rotating_asset_fifo_layers(inventory)
         curbal=read_invbalances_curbal(inventory)
     except Exception as exc:
         msg="CORECTIE INVLIFOFIFOCOST ROTATING: sarita (%s)" % txt(exc)
         script_service.log_info("CXINVAUDIT "+msg); return msg
     layers_qty=sum((u["qty"] for u in desired),ZERO)
     if far(curbal,layers_qty,QTY_TOLERANCE):
-        msg="CORECTIE INVLIFOFIFOCOST ROTATING: sarita (CURBAL %s != CXSTOCURI %s)" % (
+        msg="CORECTIE INVLIFOFIFOCOST ROTATING: sarita (CURBAL %s != ASSET ACTIVE %s)" % (
             fmt_ro(curbal),fmt_ro(layers_qty))
         script_service.log_info("CXINVAUDIT "+msg); return msg
     ms=None
@@ -924,8 +987,8 @@ def sync_invlifofifocost_rotating(inventory,rows,audit,script_service):
         reused=sum(1 for i in updates if i.get("reuse"))
         msg="\n".join([
             "CORECTIE INVLIFOFIFOCOST ROTATING (SQL)",
-            "  Conditie: fara BADFIFO=Y/U; CURBAL=CXSTOCURI=%s" % fmt_ro(curbal),
-            "  Tinta: %s x QUANTITY=1" % len(desired),
+            "  Conditie: 1 strat / ASSET ACTIVE; CURBAL=%s" % fmt_ro(curbal),
+            "  Tinta: %s x QUANTITY=1, REFOBJECT=MATRECTRANS" % len(desired),
             "  Pastrate: %s | Update: %s (reuse %s) | Delete: %s | Insert: %s" % (
                 len(keeps),len(updates),reused,len(deletes),len(creates))])
         script_service.log_info("CXINVAUDIT "+msg.replace("\n"," | ")); return msg
@@ -1679,6 +1742,19 @@ def check_layer_invlifo_plans():
         raise ValueError("self-check: suma pe pret gresita")
     if by_cost[price_label(ExactNumber("261.900"))]["ref_id"]!=1337451934:
         raise ValueError("self-check: trebuie cel mai vechi MATRECTRANSID")
+    rot_pairs=[("99628",1337345444,ExactNumber("4.600"),"2026-07-05 15:30:52"),
+               ("99705",1337345521,ExactNumber("4.700"),"2026-07-05 15:31:16")]
+    rot_asset_layers=rotating_layers_from_pairs(rot_pairs)
+    if [layer["ref_id"] for layer in rot_asset_layers]!=[1337345444,1337345521]:
+        raise ValueError("self-check: ROTATING trebuie un MATRECTRANSID per activ")
+    if far(rot_asset_layers[1]["cost"],ExactNumber("4.700"),COST_TOLERANCE):
+        raise ValueError("self-check: ROTATING pastreaza costul intrarii, nu il comaseaza")
+    try:
+        rotating_layers_from_pairs([("99628",None,ExactNumber("4.600"),"2026-07-05 15:30:52")])
+        raise ValueError("self-check: activ fara intrare trebuia blocat")
+    except ValueError as exc:
+        if "fara MATRECTRANS" not in txt(exc):
+            raise
     inv_current=[
         {"id":21,"cost":ExactNumber("261.900"),"qty":ExactNumber("1000"),"ref_mbo":"MATRECTRANS","ref_id":1337451934},
         {"id":22,"cost":ExactNumber("200.000"),"qty":ExactNumber("3000"),"ref_mbo":"MATRECTRANS","ref_id":1337451940},

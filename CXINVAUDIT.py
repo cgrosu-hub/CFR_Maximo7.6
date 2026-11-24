@@ -1,8 +1,9 @@
 # SCRIPT: CXINVAUDIT
 # AUTOR: Cristian Grosu
-# VERSIUNE: 5.40-RETURN-BEFORE-ISSUE
+# VERSIUNE: 5.41-ROTATING-ASSET-FIFO
 # Partea 1 (launch). def run_local este in CXINVAUDITEXEC (BMXAA7836E Mark invalid).
-# INVLIFO ROTATING=0: MBO update/delete. ROTATING=1: SQL dupa BADFIFO curat + CURBAL.
+# INVLIFO ROTATING=0: MBO update/delete dupa CXSTOCURI.
+# ROTATING=1: un strat qty=1 per ASSET activ, REFOBJECTID=ultima MATRECTRANS de intrare.
 # Reordonarea cronologica (date + CXCURBAL din reorder) este OPRITA.
 # RETURN inaintea ISSUE legat: OK daca pret+cantitate aliniate (nu blocheaza U).
 # Necesita CXINVAUDITEXEC.
@@ -75,7 +76,7 @@ class ExactNumber(object):
     def fixed(self, scale):
         return str(self.value.setScale(scale, RoundingMode.HALF_EVEN).toPlainString())
 
-VERSION = "5.37-RETURN-AFTER-ISSUE-MIN"
+VERSION = "5.41-ROTATING-ASSET-FIFO"
 FIFO_TABLE_ID = "1792055730066"
 MAX_ROWS = 5000
 MAX_DESCRIPTION = 32000

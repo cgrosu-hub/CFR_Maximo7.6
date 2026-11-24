@@ -105,7 +105,7 @@ var row=0;
         </scalar-parameter>
         <scalar-parameter name="StartData" id="5223">
             <property name="valueType">static</property>
-            <property name="dataType">date</property>
+            <property name="dataType">dateTime</property>
             <property name="distinct">true</property>
             <simple-property-list name="defaultValue">
                 <value type="constant">Feb 26, 2025</value>
@@ -360,6 +360,16 @@ if(params["balanta"].value) {
 	where += " and " + MXReportSqlFormat.createParamWhereClause("loc.CXBALGESTIUNE", params["balanta"].toUpperCase());
 }
 
+// ponytail: ca FISAEVIDENTA — TIMESTAMP('yyyy-MM-dd 23:59:59.999') pe ziua StartData (DB2)
+var calLimit = new java.util.GregorianCalendar();
+calLimit.setTime(params["StartData"].value);
+calLimit.set(java.util.Calendar.HOUR_OF_DAY, 23);
+calLimit.set(java.util.Calendar.MINUTE, 59);
+calLimit.set(java.util.Calendar.SECOND, 59);
+calLimit.set(java.util.Calendar.MILLISECOND, 999);
+var sdfLimit = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+var dataLimitSql = "TIMESTAMP('" + sdfLimit.format(calLimit.getTime()) + "')";
+
 var sqlText = new String();
 
 sqlText = "SELECT  cxf.location as location, cxf.itemnum as itemnum, "
@@ -375,27 +385,12 @@ sqlText = "SELECT  cxf.location as location, cxf.itemnum as itemnum, "
 +" LEFT JOIN item i ON cxf.itemnum = i.itemnum "
 +" LEFT JOIN l_item li ON i.itemid = li.ownerid "
 +" LEFT JOIN locations loc ON cxf.location = loc.location AND cxf.SITEID =loc.siteid " 
-//+" WHERE "+ where +" and (cxf.cxladata is null or cxf.cxladata > "+ MXReportSqlFormat.getEndDayTimestampFunction(params["StartData"]) +")" 
-//+" AND cxf.cxfromdate <= "+ MXReportSqlFormat.getStartDayTimestampFunction(params["StartData"])
-//+" and cxf.SITEID in (select maxuser.defsite from maxuser where maxuser.userid = '" + params["userName"].toUpperCase() +"') "
 
 +" WHERE " + where
-+" AND cxf.cxfromdate <= "
-+ MXReportSqlFormat.getEndDayTimestampFunction(params["StartData"])
-+" AND ( cxf.CXLADATA > "
-+ MXReportSqlFormat.getStartDayTimestampFunction(params["StartData"])
++" AND cxf.cxfromdate <= " + dataLimitSql
++" AND ( cxf.CXLADATA > " + dataLimitSql
 +" OR cxf.CXLADATA IS NULL ) and cxf.rotassetnum is not null "
 
-//+" AND NOT EXISTS ( "
-//+"   SELECT 1 "
-//+"   FROM cxfolosinta ccas "
-//+"   WHERE ccas.ROTASSETNUM = cxf.ROTASSETNUM "
-//+"   AND RTRIM(ccas.location) LIKE '%CASARE' "
-//+" )"
-
-//+" AND RTRIM(cxf.location) NOT LIKE '%CASARE' "
-
-//+" AND NOT exists ( SELECT ccc.cxfromdate FROM CXFOLOSINTA ccc WHERE ccc.ROTASSETNUM=cxf.ROTASSETNUM AND ccc.CXFROMDATE > cxf.CXFROMDATE) "
 +" ORDER BY datadocument asc, itemnum, location, issueto, commoditygroup, unitcost, cxfolosintaid  "
 
 
