@@ -7,7 +7,8 @@
 # UPDATE:               21.09.2026 - Bug #1690 Corectie SHIPTRANSFER/SHIPCANCEL
 # UPDATE:               30.10.2026 - Cristian Grosu - protectie update MATUSETRANS
 # UPDATE:               16.11.2026 - ISSUE: pretul receptiei daca diferenta e 0.001
-# VERSION:              2026.11.16-PU-RECEPTIE
+# UPDATE:               25.11.2026 - TRANSFER LABOR -> CASARE: CXFOLOSINTA
+# VERSION:              2026.11.25-CASARE-FOLOSINTA
 #-------------------------------------------------------------
 # Pentru magaziile sursa normale, CXSTOCURI foloseste COMMODITYGROUP din MATRECTRANS;
 # pentru gestiunile speciale se pastreaza codul secundar conform configuratiei LOCATIONS.
@@ -185,6 +186,164 @@ def shouldCreateMatRecJournal():
         return False
     return True
 
+
+# --- casare folosinta rules ---
+def sql_quote(value):
+    return str(value).replace("'", "''")
+
+def is_labor_casare_transfer(issue_type, rotasset, qty, from_type, to_type, to_loc, from_site, to_site):
+    # Doar rotating qty 1, acelasi site, LABOR -> LABOR cu CASARE in numele destinatiei.
+    if issue_type != "TRANSFER":
+        return False
+    if rotasset is None or not str(rotasset).strip():
+        return False
+    try:
+        qty_value = float(qty)
+    except Exception:
+        return False
+    if abs(qty_value - 1.0) > 0.000001:
+        return False
+    if from_type != "LABOR" or to_type != "LABOR":
+        return False
+    if to_loc is None or "CASARE" not in str(to_loc).upper():
+        return False
+    if not from_site or not to_site or from_site != to_site:
+        return False
+    return True
+
+def casare_folosinta_action(dest_exists, open_count):
+    # Un singur rand deschis si niciun rand deja legat de acest MATRECTRANS.
+    if dest_exists or open_count != 1:
+        return "skip"
+    return "write"
+
+def _casare_folosinta_self_check():
+    ok = is_labor_casare_transfer
+    assert ok("TRANSFER", "162215", 1.0, "LABOR", "LABOR", "C01104CASARE", "S", "S")
+    assert ok("TRANSFER", "162215", 1.0, "LABOR", "LABOR", "c01104casare", "S", "S")
+    assert not ok("TRANSFER", "162215", 1.0, "LABOR", "LABOR", "C01104", "S", "S")
+    assert not ok("ISSUE", "162215", 1.0, "LABOR", "LABOR", "C01104CASARE", "S", "S")
+    assert not ok("TRANSFER", "", 1.0, "LABOR", "LABOR", "C01104CASARE", "S", "S")
+    assert not ok("TRANSFER", None, 1.0, "LABOR", "LABOR", "C01104CASARE", "S", "S")
+    assert not ok("TRANSFER", "162215", 2.0, "LABOR", "LABOR", "C01104CASARE", "S", "S")
+    assert not ok("TRANSFER", "162215", 1.0, "STOREROOM", "LABOR", "C01104CASARE", "S", "S")
+    assert not ok("TRANSFER", "162215", 1.0, "LABOR", "STOREROOM", "C01104CASARE", "S", "S")
+    assert not ok("TRANSFER", "162215", 1.0, "LABOR", "LABOR", "C01104CASARE", "A", "B")
+    assert not ok("TRANSFER", "162215", 1.0, "LABOR", "LABOR", "C01104CASARE", "S", "")
+    assert casare_folosinta_action(True, 1) == "skip"
+    assert casare_folosinta_action(False, 0) == "skip"
+    assert casare_folosinta_action(False, 2) == "skip"
+    assert casare_folosinta_action(False, 1) == "write"
+    assert sql_quote("O'Brien") == "O''Brien"
+# --- end casare folosinta rules ---
+
+def location_type(mx_server, user_info, location, siteid):
+    if not location or not siteid:
+        return ""
+    loc_set = mx_server.getMboSet("LOCATIONS", user_info)
+    try:
+        loc_set.setWhere("LOCATION='%s' AND SITEID='%s'" % (sql_quote(location), sql_quote(siteid)))
+        loc_set.reset()
+        loc = loc_set.getMbo(0)
+        if loc is None:
+            return ""
+        return loc.getString("TYPE")
+    finally:
+        loc_set.close()
+
+def sync_labor_casare_folosinta(mbo, mx_server, user_info):
+    # Inchide fișa deschisă de pe FROMSTORELOC și scrie rândul de casare
+    # CXREFMBO/CXREFID = MATRECTRANS, contractul pe care CXCANBC îl anulează.
+    # ponytail: exceptia nu iese din script. Jurnalul CXSTOCURI e deja save()-uit,
+    # iar o exceptie aici ar da inapoi MATRECTRANS si ar lasa jurnalul scris.
+    # Plafon: eroarea ramane in log. Daca apare des, muta apelul inainte de save-ul jurnalului.
+    try:
+        to_loc = "" if mbo.isNull("TOSTORELOC") else mbo.getString("TOSTORELOC")
+        rot = "" if mbo.isNull("ROTASSETNUM") else mbo.getString("ROTASSETNUM")
+        from_site = "" if mbo.isNull("FROMSITEID") else mbo.getString("FROMSITEID")
+        to_site = "" if mbo.isNull("SITEID") else mbo.getString("SITEID")
+        from_loc = "" if mbo.isNull("FROMSTORELOC") else mbo.getString("FROMSTORELOC")
+        from_type = location_type(mx_server, user_info, from_loc, from_site)
+        to_type = location_type(mx_server, user_info, to_loc, to_site)
+        if not is_labor_casare_transfer(
+                mbo.getString("ISSUETYPE"), rot, mbo.getDouble("QUANTITY"),
+                from_type, to_type, to_loc, from_site, to_site):
+            return
+        if mbo.isNull("MATRECTRANSID") or int(mbo.getLong("MATRECTRANSID")) <= 0:
+            service.log_info("*** CASARE CXFOLOSINTA skip, MATRECTRANSID lipsa ROTASSETNUM=%s ***" % rot)
+            return
+        if mbo.isNull("ACTUALDATE"):
+            service.log_info("*** CASARE CXFOLOSINTA skip, ACTUALDATE lipsa ROTASSETNUM=%s ***" % rot)
+            return
+        mat_id = int(mbo.getLong("MATRECTRANSID"))
+        actual = mbo.getDate("ACTUALDATE")
+        dest_set = mx_server.getMboSet("CXFOLOSINTA", user_info)
+        try:
+            dest_set.setWhere("CXREFMBO='MATRECTRANS' AND CXREFID=%s" % mat_id)
+            dest_set.reset()
+            dest_exists = dest_set.getMbo(0) is not None
+        finally:
+            dest_set.close()
+        open_set = mx_server.getMboSet("CXFOLOSINTA", user_info)
+        try:
+            open_set.setWhere(
+                "ROTASSETNUM='%s' AND SITEID='%s' AND LOCATION='%s' AND CXLADATA IS NULL"
+                % (sql_quote(rot), sql_quote(to_site), sql_quote(from_loc)))
+            open_set.reset()
+            ids = []
+            index = 0
+            row = open_set.getMbo(index)
+            while row is not None and index < 5:
+                ids.append(str(row.getLong("CXFOLOSINTAID")))
+                index += 1
+                row = open_set.getMbo(index)
+            if casare_folosinta_action(dest_exists, index) != "write":
+                service.log_info(
+                    "*** CASARE CXFOLOSINTA skip ROTASSETNUM=%s MATRECTRANSID=%s FROM=%s open=%s ids=%s dest=%s ***"
+                    % (rot, mat_id, from_loc, index, ",".join(ids), dest_exists))
+                return
+            src = open_set.getMbo(0)
+            person = "" if src.isNull("PERSONID") else src.getString("PERSONID")
+            if src.isNull("COMMODITYGROUP"):
+                commodity = "" if mbo.isNull("COMMODITYGROUP") else mbo.getString("COMMODITYGROUP")
+            else:
+                commodity = src.getString("COMMODITYGROUP")
+            if src.isNull("UNITCOST"):
+                unitcost = mbo.getDouble("UNITCOST")
+            else:
+                unitcost = src.getDouble("UNITCOST")
+            src.setValue("CXLADATA", actual)
+            src.setValue("CXREFMBOTO", "MATRECTRANS")
+            src.setValue("CXREFIDTO", mat_id)
+            dest = open_set.addAtEnd()
+            flags = MboConstants.NOACCESSCHECK | MboConstants.NOVALIDATION_AND_NOACTION
+            dest.setValue("HASLD", 0, flags)
+            if person:
+                dest.setValue("PERSONID", person)
+            dest.setValue("ROTASSETNUM", rot)
+            dest.setValue("ITEMNUM", mbo.getString("ITEMNUM"))
+            dest.setValue("SITEID", to_site)
+            dest.setValue("ORGID", mbo.getString("ORGID"))
+            dest.setValue("LOCATION", to_loc)
+            if commodity:
+                dest.setValue("COMMODITYGROUP", commodity)
+            dest.setValue("CXFROMDATE", actual)
+            dest.setValue("QUANTITY", 1.0)
+            dest.setValue("UNITCOST", unitcost)
+            if not src.isNull("CXNRDOC"):
+                dest.setValue("CXNRDOC", src.getString("CXNRDOC"))
+            if not src.isNull("DESCRIPTION"):
+                dest.setValue("DESCRIPTION", src.getString("DESCRIPTION"))
+            dest.setValue("CXREFMBO", "MATRECTRANS")
+            dest.setValue("CXREFID", mat_id)
+            open_set.save()
+            service.log_info(
+                "*** CASARE CXFOLOSINTA write ROTASSETNUM=%s MATRECTRANSID=%s FROM=%s TO=%s ***"
+                % (rot, mat_id, from_loc, to_loc))
+        finally:
+            open_set.close()
+    except Exception as ex:
+        service.log_info("*** CASARE CXFOLOSINTA eroare (transferul continua): %s ***" % ex)
 
 
 #####################################
@@ -693,6 +852,7 @@ if launchPoint == 'CXNEWMATRECTRANS':
                     linieStocMbo.setValue("ROTASSETNUM",mbo.getString("ROTASSETNUM"))                                                    
                 
                 linieStocMbo.getThisMboSet().save()
+                sync_labor_casare_folosinta(mbo, mxServer, userInfo)
         LocSet.close()   
     #   speta RETURN
     if mbo.getString('ISSUETYPE') == 'RETURN':
