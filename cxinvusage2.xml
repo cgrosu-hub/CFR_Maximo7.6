@@ -1,0 +1,813 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<presentation apphelp="com.ibm.mbs.doc,invusage/c_invusage_app.html" beanclass="psdi.webclient.beans.invusage.InvUseAppBean" id="cxinvusage2" ismobile="false" mboname="INVUSE" resultstableid="results_showlist" version="7.5.0.0">
+	<page id="mainrec" scroll="false">
+		<include controltoclone="pageHeader" id="INCLUDE-pageHeader"/>
+		<clientarea id="clientarea">
+			<tabgroup id="maintabs" style="form">
+				<tab default="true" id="results" label="Listă" type="list">
+					<menubar event="search" id="actiontoolbar" sourcemethod="getAppSearchOptions"/>
+					<table datasrc="results_showlist" id="results_showlist" inputmode="readonly" label="Utilizarea inventarului" mboname="INVUSE" orderby="invusenum" selectmode="multiple">
+						<tablebody displayrowsperpage="20" filterable="true" filterexpanded="true" id="results_showlist_tablebody">
+							<tablecol dataattribute="invusenum" filterable="false" id="results_showlist_tablebody_1" mxevent="toggleselectrow" mxevent_desc="Selectați rândul {0}" sortable="false" type="event"/>
+							<tablecol dataattribute="invusenum" id="results_showlist_tablebody_2" mxevent="selectrecord" mxevent_desc="Accesați %1" type="link"/>
+							<tablecol dataattribute="CXBONCONSUM" id="1696496791465" sortable="false"/>
+							<tablecol dataattribute="CXDATABON" id="1790594724375" label="Data BON CFR" lookup="DATELOOKUP"/>
+							<tablecol dataattribute="FROMSTORELOC" id="1701775320040"/>
+							<tablecol dataattribute="DESCRIPTION" id="1790317862906"/>
+							<tablecol dataattribute="INVUSELINE.TOSTORELOC" id="1701775323212"/>
+							<tablecol dataattribute="CXTOTALCOST" id="1790595422456" label="Costo TOTAL"/>
+							<tablecol dataattribute="usetype" id="results_showlist_tablebody_5" linkedcontrolid="qbe_grid2_1_1_grid3_9" lookup="valuelist"/>
+							<tablecol dataattribute="status" id="results_showlist_tablebody_4" linkedcontrolid="qbe_grid2_1_1_grid3_8" lookup="valuelist"/>
+							<tablecol dataattribute="SHIPMENT.SHIPMENTNUM" id="1791739398705" label="EXPEDIERE" sigoption="SHIPSTATUS" sortable="false"/>
+							<tablecol dataattribute="CHANGEBY" id="1790318025010" label="Introdus DE"/>
+							<tablecol dataattribute="CHANGEDATE" id="results_showlist_tablebody_3" label="Data INTROD"/>
+							<tablecol dataattribute="siteid" id="results_showlist_tablebody_6" linkedcontrolid="qbe_grid2_1_1_grid3_12" lookup="site"/>
+							<tablecol filterable="false" id="results_bookmark" mxevent="BOOKMARK" mxevent_desc="Adăugați la Marcaje" mxevent_icon="btn_addtobookmarks.gif" sortable="false" type="event"/>
+						</tablebody>
+					</table>
+				</tab>
+				<tab id="main_invuse" label="Consum/Transfer" type="insert">
+					<section border="true" id="invuse_mainsection_1">
+						<sectionrow id="invuse_mainsection_1_row_1">
+							<sectioncol id="invuse_mainsection_1_col1">
+								<section id="invuse_mainsection_1a">
+									<multiparttextbox dataattribute="invusenum" defaultfocus="true" descdataattribute="DESCRIPTION" id="invuse_main_grid1_1" longdescription="true"/>
+									<textbox dataattribute="CXBONCONSUM" id="1687443592398" inputmode="required"/>
+									<textbox dataattribute="CXDATABON" id="1689694409999" inputmode="required" lookup="DATELOOKUP"/>
+									<multiparttextbox dataattribute="fromstoreloc" descdataattribute="locations.description" descinputmode="readonly" id="invuse_main_grid1_2" lookup="CXFROMSTORE" menutype="normal"/>
+									<textbox dataattribute="invowner" id="invuse_main_grid1_3" lookup="person"/>
+									<defaultvalue dataattribute="usetype" id="1773166843260" value="ISSUE"/>
+									<textbox dataattribute="usetype" id="invuse_main_grid2_1" lookup="valuelist"/>
+								</section>
+							</sectioncol>
+							<sectioncol id="mainsection_1_col2">
+								<section id="mainsection_1b">
+									<textbox dataattribute="shiptoattn" id="invuse_main_grid2_3" lookup="person" sigoption="SHIPSTATUS"/>
+									<textbox dataattribute="shipment.shipmentnum" id="invuse_main_grid2_4" inputmode="READONLY" sigoption="SHIPSTATUS"/>
+									<textbox dataattribute="SHIPMENT.PACKINGSLIPNUM" id="1696447392743" inputmode="readonly"/>
+									<textbox dataattribute="shipmentdate" id="invuse_main_grid3_3" sigoption="SHIPSTATUS"/>
+									<textbox dataattribute="SHIPMENT.CARRIER" id="1696447378133" inputmode="readonly"/>
+									<textbox dataattribute="cxtotalcost" id="1708348553492" inputmode="readonly" label="Cost total"/>
+								</section>
+								<pushbutton id="1760521569649" label="Adauga Articole in Gestiunea Destinatie" mxevent="CXADDTOINVENTORY"/>
+							</sectioncol>
+							<sectioncol id="mainsection_1_col3">
+								<section border="false" id="main_attachments">
+									<attachments id="doclinks"/>
+									<textbox dataattribute="status" id="invuse_main_grid3_1"/>
+									<pushbutton id="1784126472709" label="Anuleaza BonC" mxevent="CXCANBC" sigoption="CXCANBC"/>
+									<pushbutton id="1793630348527" label="Verifica transfer" mxevent="CXCHECKBC" sigoption="CXCHECKBC"/>
+									<pushbutton id="1793625619411" label="Anuleaza transfer" mxevent="CXCANTRAN" sigoption="CXCANTRAN"/>
+									<textbox dataattribute="receipts" id="invuse_main_grid3_2" sigoption="SHIPSTATUS"/>
+									<textbox dataattribute="siteid" id="invuse_main_grid2_2"/>
+								</section>
+								<section border="false" id="1743604329464">
+									<textbox dataattribute="CXTOSITEID" id="1743599438316" label="Spre Site" lookup="CXSITE"/>
+									<multiparttextbox applink="CXSTOREROOM, CXLOCATION" dataattribute="CXTOSTORELOC" descdataattribute="TOLOCATIONS.DESCRIPTION" descinputmode="readonly" id="1743599244991" label="In Gestiune" lookup="LOCATIONS" menutype="NORMAL"/>
+									<multiparttextbox applink="PERSON" dataattribute="CXISSUETO" descdataattribute="CXPERSON.DISPLAYNAME" descinputmode="readonly" id="1743599500213" label="Predat către" lookup="PERSON" menutype="NORMAL"/>
+									<multiparttextbox dataattribute="CXISSUEFROM" descdataattribute="CXPERSOANADELA.DISPLAYNAME" descinputmode="readonly" id="1743599464187" label="Preluat de la" lookup="PERSON"/>
+								</section>
+							</sectioncol>
+						</sectionrow>
+					</section>
+					<table beanclass="psdi.webclient.beans.invusage.InvUseLineDataBean" id="main_invuselinetab_table" label="Linii de utilizare" orderby="invuselinenum" relationship="INVUSELINE">
+						<tablebody displayrowsperpage="10" filterable="true" id="main_invuselinetab_table_tablebody">
+							<tablecol filterable="false" id="main_invuselinetab_table_tablebody_1" mxevent="toggledetailstate" mxevent_desc="Arată detalii" sortable="false" type="event"/>
+							<tablecol dataattribute="invuselinenum" id="main_invuselinetab_table_tablebody_1a"/>
+							<tablecol dataattribute="itemnum" id="main_invuselinetab_table_tablebody_2" lookup="item" menutype="item"/>
+							<tablecol dataattribute="description" id="main_invuselinetab_table_tablebody_3" lookup="longdesc"/>
+							<tablecol dataattribute="usetype" id="main_invuselinetab_table_tablebody_6" linkedcontrolid="main_invuselinetab_table_1_grid4_row_1_col_1_sec1_1"/>
+							<tablecol dataattribute="quantity" id="main_invuselinetab_table_tablebody_7" linkedcontrolid="main_invuselinetab_table_1_grid4_row_1_col_3_sec1_1"/>
+							<tablecol dataattribute="DISPLAYUNITCOST" id="1694177585436"/>
+							<tablecol dataattribute="DISPLAYLINECOST" id="1783599975797"/>
+							<tablecol dataattribute="ROTASSETNUM" filterable="true" id="1694177590108" lookup="ROTATINGASSET" menutype="ASSETMAIN" sortable="true"/>
+							<tablecol dataattribute="ISSUETO" id="1791477412469" label="Predat CATRE" lookup="PERSON" menutype="NORMAL"/>
+							<tablecol applink="ASSET,IPC" dataattribute="CXASSET.CXNRINVENTAR" id="1792168443554" label="MIJLOC FIX" lookup="ASSET" menutype="ASSETMAIN"/>
+							<tablecol filterable="false" id="main_invuselinetab_table_tablebody_11" mxevent="validateinfo" mxevent_desc="Informații de validare" mxevent_icon="information.gif" sortable="false" type="event"/>
+							<tablecol filterable="false" id="main_invuselinetab_table_tablebody_10" mxevent="toggledeleterow" mxevent_desc="Marcați rândul pentru ștergere" mxevent_icon="btn_garbage.gif" sortable="false" type="event"/>
+						</tablebody>
+						<tabledetails id="main_invuselinetab_table_1">
+							<section id="main_invuselinetab_table_1_grid4_sec1">
+								<sectionrow id="main_invuselinetab_table_1_grid4_sec1_row1">
+									<sectioncol id="main_invuselinetab_table_1_grid4_sec1_col1">
+										<section id="main_invuselinetab_table_1_grid4_sec1_col1_sec1a" label="Element rând">
+											<combobox dataattribute="usetype" id="main_invuselinetab_table_1_grid4_row_1_col_1_sec1_1"/>
+											<combobox dataattribute="linetype" id="main_invuselinetab_table_1_grid4_row_2_col_1_sec1_2"/>
+											<multiparttextbox dataattribute="itemnum" defaultfocus="true" descdataattribute="description" id="main_invuselinetab_table_1_grid4_row_2_col_1_sec1_3" lookup="item" menutype="item"/>
+											<textbox dataattribute="FROMBIN" id="1776330916220" label="Din Bin" lookup="binnum" smartfilloff="true"/>
+											<textbox dataattribute="FROMLOT" id="1776330877795" label="Din Lot" lookup="invballot" smartfilloff="true"/>
+											<textbox dataattribute="commoditygroup" id="1687862806307" inputmode="readonly" label="Cod Tip Gestiune (Primar)" lookup="COMMODITYGROUP"/>
+											<textbox dataattribute="CXCODCUSTODIE" id="1694776715519" inputmode="readonly" label="Cod Tip Gestiune (Secundar)" lookup="COMMODITYGROUP" sigoption="READ"/>
+											<textbox dataattribute="rotassetnum" id="main_invuselinetab_table_1_grid4_row_4_col_2_sec1_4" lookup="rotatingasset" menutype="assetmain"/>
+										</section>
+									</sectioncol>
+									<sectioncol id="main_invuselinetab_table_1_grid4_sec2_col_3a">
+										<section id="main_invuselinetab_table_1_grid4_row_1_col_3a_sec1" label="Cantitate și costuri">
+											<textbox dataattribute="quantity" id="main_invuselinetab_table_1_grid4_row_1_col_3a_sec1_1"/>
+											<textbox dataattribute="receivedqty" id="main_invuselinetab_table_1_grid4_row_1_col_3a_sec1_1a" sigoption="SHIPSTATUS" sigoptiondatasrc="MAINRECORD"/>
+											<textbox dataattribute="displayreturnedqty" id="main_invuselinetab_table_1_grid4_row_1_col_3a_sec1_1b" sigoption="SHIPSTATUS" sigoptiondatasrc="MAINRECORD"/>
+											<textbox dataattribute="inventory.issueunit" id="main_invuselinetab_table_1_grid4_row_6_col_3a_sec1_2" inputmode="readonly" sigoption="TRANSFER"/>
+											<textbox dataattribute="conversion" id="main_invuselinetab_table_1_grid4_row_7_col_3a_sec1_5" inputmode="required" sigoption="TRANSFER"/>
+											<textbox dataattribute="displayunitcost" id="main_invuselinetab_table_1_grid4_row_3_col_3a_sec1_7"/>
+											<textbox dataattribute="displaylinecost" id="main_invuselinetab_table_1_grid4_row_4_col_3a_sec1_8"/>
+											<textbox dataattribute="inventory.category" id="main_invuselinetab_table_1_grid4_row_4_col_1_sec1_4" inputmode="readonly"/>
+										</section>
+									</sectioncol>
+								</sectionrow>
+							</section>
+							<section id="main_invuselinetab_table_1_grid4_sec2" label="Detalii destinatie" sigoption="TRANSFER">
+								<sectionrow id="main_invuselinetab_table_1_grid4_sec2_row2">
+									<sectioncol id="main_invuselinetab_table_1_grid4_row_1_col_4_row_1_c1">
+										<section id="main_invuselinetab_table_1_grid4_row_1_col_4_row_1_c1_sec1">
+											<multiparttextbox applink="CXSTOREROOM, CXLOCATION" dataattribute="tostoreloc" descdataattribute="TOLOCATIONS.DESCRIPTION" descinputmode="readonly" id="1703424122974" lookup="LOCATIONS" menutype="NORMAL"/>
+											<textbox dataattribute="TOLOT" id="1776330979470" label="In Lot" lookup="invballot" smartfilloff="true"/>
+											<textbox dataattribute="tobin" id="1776330975712" label="In Bin" lookup="binnum" smartfilloff="true"/>
+										</section>
+									</sectioncol>
+									<sectioncol id="main_invuselinetab_table_1_grid4_row_1_col_4_row_1_c2">
+										<section id="1694767804469">
+											<multiparttextbox dataattribute="CXISSUEFROM" descdataattribute="CXPERSOANADELA.DISPLAYNAME" descinputmode="readonly" id="1710931029413" lookup="CXPERSOANAFLS" sigoption="READ"/>
+											<multiparttextbox applink="PERSON" dataattribute="issueto" descdataattribute="CXPERSON.DISPLAYNAME" descinputmode="readonly" id="1706087884090" label="Predat către" lookup="PERSON" menutype="NORMAL"/>
+											<textbox dataattribute="tositeid" id="main_invuselinetab_table_1_grid4_row_2_col_4_sec1_2" lookup="site"/>
+											<checkbox dataattribute="CXCUSTDLATERTI" id="1694767827396" sigoption="READ"/>
+										</section>
+									</sectioncol>
+									<sectioncol id="main_invuselinetab_table_1_grid4_row_1_col_4_row_1_c3"/>
+								</sectionrow>
+							</section>
+							<section id="main_invuselinetab_table_1_grid4a">
+								<sectionrow id="main_invuselinetab_table_1_grid4_row_22">
+									<sectioncol id="main_invuselinetab_table_1_grid4_row_2_col_5">
+										<section id="main_invuselinetab_table_1_grid4_row_2_col_5_sec1" label="Informații de taxare">
+											<sectionrow id="main_invuselinetab_table_1_grid4_row_21_col_5_sec">
+												<sectioncol id="main_invuselinetab_table_1_grid4_row_2_col_5_sec_row1_c1">
+													<section id="main_invuselinetab_table_1_grid4_row_2_col_5_sec_row1_sec_c1">
+														<textbox dataattribute="tositeid" id="main_invuselinetab_table_1_grid4_row_1_col_5_sec1_1" lookup="CXSITE"/>
+														<checkbox dataattribute="CXALIMLOCO" id="1759999503086" label="Consum locomotiva in TRANZIT?" sigoption="READ"/>
+														<checkbox dataattribute="CXVANZARERECHIZITE" id="1736951111792" sigoption="READ"/>
+														<multiparttextbox applink="ASSET,IPC" dataattribute="ASSETNUM" descdataattribute="CXASSET.CXNRINVENTAR" id="1687861689866" lookup="ASSET" menutype="ASSETMAIN"/>
+														<multiparttextbox applink="LOCATION,IPC" dataattribute="CXTMPLOCATION" descdataattribute="CXTMPLOCATION.DESCRIPTION" descinputmode="readonly" id="1703424512272" lookup="CXSTOREROOM" menutype="LOCATIONS" sigoption="ISSUERETURN"/>
+														<textbox dataattribute="gldebitacct" id="main_invuselinetab_table_1_grid4_row_6_col_5_sec1_6" lookup="glnavigator" size="50"/>
+														<textbox dataattribute="glcreditacct" id="1687880022333" lookup="glnavigator" size="50"/>
+														<textbox dataattribute="CXDEBITOBINV" id="1687880014005" lookup="glnavigator" sigoption="CXASCUNDE" size="50"/>
+														<textbox dataattribute="CXCREDITOBINV" id="main_invuselinetab_table_1_grid4_row_7_col_5_sec1_7" inputmode="readonly" lookup="glnavigator" sigoption="CXASCUNDE" size="50"/>
+													</section>
+												</sectioncol>
+												<sectioncol id="main_invuselinetab_table_1_grid4_row_2_col_5_sec_row1_c2">
+													<section id="main_invuselinetab_table_1_grid4_row_2_col_5_sec_row1_sec_c2">
+														<textbox applink="po" dataattribute="ponum" dynamic="true" id="main_invuselinetab_table_1_grid4_row_9_col_5_sec1_9" inputmode="readonly" menutype="normal" sigoption="TRANSFER"/>
+														<textbox dataattribute="polinenum" id="main_invuselinetab_table_1_grid4_row_9_col_5_sec1_10" inputmode="readonly" sigoption="TRANSFER"/>
+														<checkbox dataattribute="RETURNAGAINSTISSUE" id="main_invuselinetab_table_1_grid4_row_11_col_5_sec1_12c" sigoption="SAVE"/>
+														<textbox applink="PERSON" dataattribute="issueto" id="1713960719949" lookup="PERSON" menutype="NORMAL"/>
+													</section>
+												</sectioncol>
+											</sectionrow>
+										</section>
+									</sectioncol>
+									<sectioncol id="main_invuselinetab_table_1_grid4_row_2_col_6">
+										<section id="main_invuselinetab_table_1_grid4_row_2_col_6_sec1" label="Detalii tranzacție">
+											<textbox dataattribute="enterby" id="main_invuselinetab_table_1_grid4_row_1_col_6_sec1_3"/>
+											<textbox dataattribute="actualdate" id="main_invuselinetab_table_1_grid4_row_1_col_6_sec1_4" lookup="datelookup"/>
+											<textbox dataattribute="remark" displaytype="DESCRIPTION" id="main_invuselinetab_table_1_grid4_row_1_col_6_sec1_5"/>
+										</section>
+									</sectioncol>
+								</sectionrow>
+							</section>
+						</tabledetails>
+						<buttongroup id="main_invuselinetab_table_2">
+							<pushbutton datasrc="MAINRECORD" id="main_invuselinetab_table_2_1" label="Selectați Elemente" mxevent="selectitems" sigoption="SELITEMS"/>
+							<pushbutton datasrc="MAINRECORD" id="main_invuselinetab_table_2_2" label="Selectați articole pentru returnare" mxevent="selectitemsforreturnissue" sigoption="RETURNS"/>
+							<pushbutton datasrc="MAINRECORD" default="true" id="main_invuselinetab_table_2_5" label="Rând nou" mxevent="addrow" sigoption="NEWINVUSAGE"/>
+						</buttongroup>
+					</table>
+				</tab>
+			</tabgroup>
+		</clientarea>
+		<include controltoclone="pageFooter" id="INCLUDE-pageFooter"/>
+	</page>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.QbeWOBean" id="searchmore" inputmode="query" label="Mai multe câmpuri de căutare">
+		<section id="qbe_grid2">
+			<sectioncol id="qbe_grid2_1_1">
+				<section id="qbe_grid2_1_1_grid3">
+					<multiparttextbox dataattribute="invusenum" defaultfocus="true" descdataattribute="description" descinputmode="query" id="qbe_grid2_1_1_grid3_1" inputmode="query"/>
+					<textbox dataattribute="invuseline.itemnum" id="qbe_grid2_1_1_grid3_2" inputmode="query" lookup="item" menutype="item"/>
+					<textbox dataattribute="invuseline.fromconditioncode" id="qbe_grid2_1_1_grid3_3" inputmode="query" lookup="conditioncode"/>
+					<textbox dataattribute="invuseline.fromlot" id="qbe_grid2_1_1_grid3_4" inputmode="query" lookup="invballot"/>
+					<textbox applink="wotrack" dataattribute="invuseline.refwo" id="qbe_grid2_1_1_grid3_5" inputmode="query" lookup="workorder" menutype="workorder"/>
+					<textbox applink="asset,ipc" dataattribute="invuseline.assetnum" id="qbe_grid2_1_1_grid3_6" inputmode="query" lookup="asset" menutype="assetmain"/>
+					<textbox applink="location,ipc" dataattribute="invuseline.location" id="qbe_grid2_1_1_grid3_7" inputmode="query" lookup="locations" menutype="locations"/>
+				</section>
+			</sectioncol>
+			<sectioncol id="qbe_grid2_1_2">
+				<section id="qbe_grid2_1_2_grid3">
+					<textbox dataattribute="status" id="qbe_grid2_1_1_grid3_8" inputmode="query" lookup="valuelist"/>
+					<textbox dataattribute="usetype" id="qbe_grid2_1_1_grid3_9" inputmode="query" lookup="valuelist"/>
+					<textbox applink="storeroom,location" dataattribute="fromstoreloc" id="qbe_grid2_1_1_grid3_10" inputmode="query" label="Din Gestiune" lookup="locations"/>
+					<textbox applink="storeroom,location" dataattribute="invuseline.tostoreloc" id="qbe_grid2_1_1_grid3_11" inputmode="query" label="La Gestiune" lookup="locations"/>
+					<textbox dataattribute="siteid" id="qbe_grid2_1_1_grid3_12" inputmode="query" lookup="site"/>
+					<textbox dataattribute="invuseline.tositeid" id="qbe_grid2_1_1_grid3_13" inputmode="query" lookup="site"/>
+					<textbox dataattribute="invuseline.gldebitacct" id="qbe_grid2_1_1_grid3_14" inputmode="query" lookup="glnavigator"/>
+				</section>
+			</sectioncol>
+			<section id="1701776006529" label="Date">
+				<sectionrow id="1701776354460">
+					<sectioncol id="1701776360726">
+						<statictext align="left" id="1701776409427" label="Dată bon"/>
+					</sectioncol>
+					<sectioncol id="1701776379202">
+						<statictext align="left" id="1701776461205" label="Din"/>
+						<textbox dataattribute="CXDATABON" hidelabel="true" id="1701776513557" inputmode="query" lookup="DATELOOKUP" prepend="&gt;="/>
+					</sectioncol>
+					<sectioncol id="17017763544602">
+						<statictext align="left" id="1701776479627" label="La"/>
+						<textbox dataattribute="CXDATABON" hidelabel="true" id="1701776608560" inputmode="query" lookup="DATELOOKUP" prepend="&lt;="/>
+					</sectioncol>
+				</sectionrow>
+			</section>
+		</section>
+		<buttongroup id="qbe_grid2_1_1_grid5">
+			<pushbutton default="true" id="qbe_grid2_1_1_grid5_1" label="Găsi" mxevent="dialogok"/>
+			<pushbutton id="qbe_restoreappdefault_button" label="Restabiliți valorile implicite ale aplicației" mxevent="qbeclear"/>
+			<pushbutton id="qbe_revisebutton" label="Revizui" menutype="SEARCHMOREREVISE" targetid="searchmore"/>
+			<pushbutton id="qbe_grid2_1_1_grid5_3" label="Anulare" mxevent="qbecancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.ValidateReservationDataBean" id="VALIDATERESERVATIONS" label="REZERVĂRI" parentdatasrc="main_invuselinetab_table" relationship="RESERVATION">
+		<helpgrid id="ValidateReservation_help" innerhtml="One or more reservations exist with similar details to the inventory usage line. If applicable, select a reservation to reference on the inventory usage line. To maintain the quantity entered on the inventory usage line, select the Keep Current Quantity box. If left unchecked, the quantity is updated to the remaining reserved quantity."/>
+		<table id="validatereserveditems_invreserve_Table" label="Articole rezervate" selectmode="single" width="900">
+			<tablebody displayrowsperpage="15" filterable="true" id="validatereserveditems_invreserve_Table_tablebody">
+				<tablecol filterable="false" id="validatereserveditems_invreserve_Table_tablebody_1" mxevent="toggleselectrow" sortable="false" type="event"/>
+				<tablecol dataattribute="requestnum" id="validatereserveditems_invreserve_Table_tablebody_2" inputmode="readonly"/>
+				<tablecol dataattribute="itemnum" id="validatereserveditems_invreserve_Table_tablebody_4" inputmode="readonly"/>
+				<tablecol dataattribute="conditioncode" id="validatereserveditems_invreserve_Table_tablebody_5" inputmode="readonly"/>
+				<tablecol dataattribute="reservedqty" id="validatereserveditems_invreserve_Table_tablebody_6" inputmode="readonly"/>
+				<tablecol applink="wotrack" dataattribute="wonum" id="validatereserveditems_invreserve_Table_tablebody_7" inputmode="readonly" label="Comandă de lucru" menutype="hyperlink" showfilterfield="true" sortable="true"/>
+				<tablecol dataattribute="assetnum" id="validatereserveditems_invreserve_Table_tablebody_8" inputmode="readonly"/>
+				<tablecol dataattribute="location" id="validatereserveditems_invreserve_Table_tablebody_9" inputmode="readonly"/>
+				<tablecol dataattribute="ponum" id="validatereserveditems_invreserve_Table_tablebody_10" inputmode="readonly"/>
+				<tablecol dataattribute="polinenum" id="validatereserveditems_invreserve_Table_tablebody_11" inputmode="readonly"/>
+				<tablecol applink="viewdr" dataattribute="mrnum" id="validatereserveditems_invreserve_Table_tablebody_12" inputmode="readonly" menutype="hyperlink" sortable="true"/>
+				<tablecol dataattribute="requestedby" id="validatereserveditems_invreserve_Table_tablebody_13" inputmode="readonly"/>
+				<tablecol dataattribute="storeloc" id="validatereserveditems_invreserve_Table_tablebody_14" inputmode="readonly" showfilterfield="true"/>
+				<tablecol dataattribute="siteid" id="validatereserveditems_invreserve_Table_tablebody_15" inputmode="readonly" showfilterfield="true"/>
+			</tablebody>
+		</table>
+		<section id="validatereserveditems_section_2">
+			<checkbox dataattribute="keepcurqty" id="validatereserveritems_col1_16"/>
+		</section>
+		<buttongroup id="validatereserveditems_2">
+			<pushbutton default="true" id="validatereserveditems_2_1" label="Bine" mxevent="dialogok"/>
+			<pushbutton id="validatereserveditems_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.system.beans.MultiselectDataBean" id="selectitemsforreturnissue" label="Selectați articole pentru returnare" parentdatasrc="MAINRECORD" relationship="MATUSETRANSRETURN">
+		<table id="selectitemsforreturnissue_invuseline_Table" label="Articole" selectmode="multiple" width="900">
+			<tablebody displayrowsperpage="15" filterable="true" id="selectitemsforreturnissue_invuseline_Table_tablebody" inputmode="readonly">
+				<tablecol filterable="false" id="selectitemsforreturnissue_invuseline_Table_tablebody_1" mxevent="toggleselectrow" sortable="false" type="event"/>
+				<tablecol dataattribute="itemnum" id="selectitemsforreturnissue_invuseline_Table_tablebody_2" sortable="true"/>
+				<tablecol dataattribute="item.itemtype" id="selectitemsforreturnissue_invuseline_Table_tablebody_3" sortable="true"/>
+				<tablecol dataattribute="item.description" id="selectitemsforreturnissue_invuseline_Table_tablebody_4" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="conditioncode" id="selectitemsforreturnissue_invuseline_Table_tablebody_5" sortable="true"/>
+				<tablecol dataattribute="quantity" id="selectitemsforreturnissue_invuseline_Table_tablebody_6" sortable="true"/>
+				<tablecol dataattribute="CXBONCONSUM" id="1790270418201" label="Nr bon CFR" sortable="true"/>
+				<tablecol dataattribute="UNITCOST" id="1790258931062" label="COST UNITAR" sortable="true"/>
+				<tablecol dataattribute="qtyreturned" id="selectitemsforreturnissue_invuseline_Table_tablebody_7" sortable="true"/>
+				<tablecol dataattribute="issueto" id="selectitemsforreturnissue_invuseline_Table_tablebody_8" sortable="true"/>
+				<tablecol dataattribute="refwo" id="selectitemsforreturnissue_invuseline_Table_tablebody_9" sortable="true"/>
+				<tablecol dataattribute="mrnum" id="selectitemsforreturnissue_invuseline_Table_tablebody_10" sortable="true"/>
+				<tablecol dataattribute="gldebitacct" id="selectitemsforreturnissue_invuseline_Table_tablebody_11" sortable="true"/>
+				<tablecol dataattribute="actualdate" id="selectitemsforreturnissue_invuseline_Table_tablebody_12" sortable="true"/>
+			</tablebody>
+		</table>
+		<buttongroup id="selectitemsforreturnissue_2">
+			<pushbutton default="true" id="selectitemsforreturnissue_2_1" label="Bine" mxevent="dialogok" value="copyInvUseLineSetForReturn"/>
+			<pushbutton id="selectitemsforreturnissue_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.system.beans.ViewBookmarksBean" id="searchbook" label="Marcajele mele" mboname="INVUSE">
+		<table id="bookmarks_table" inputmode="readonly" label="Utilizarea inventarului" selectmode="single">
+			<tablebody displayrowsperpage="20" filterable="true" id="bookmarks_table_tablebody">
+				<tablecol dataattribute="invusenum" id="bookmarks_tablebody_1" mxevent="selectrecord" type="link"/>
+				<tablecol dataattribute="description" id="bookmarks_table_tablebody_2"/>
+				<tablecol filterable="false" id="bookmarks_table_tablebody_delete" mxevent="instantdelete" mxevent_desc="Șterge" mxevent_icon="btn_delete.gif" sortable="false" type="event"/>
+			</tablebody>
+		</table>
+		<buttongroup id="bookmarks_2">
+			<pushbutton default="true" id="bookmarks_2_1" label="Bine" mxevent="dialogok"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.common.SparePartsBean" id="selectspareparts" label="Selectați Piese de schimb pentru active" parentdatasrc="MAINRECORD" relationship="INVUSESPAREPART">
+		<section border="true" id="sparepart_grid1">
+			<sectionrow id="sparepart_grid1_1">
+				<sectioncol id="sparepart_grid1_1_1">
+					<section id="sparepart_grid1_1_1_grid2">
+						<textbox dataattribute="assetnum" id="sparepart_grid1_1_1_grid2_1" inputmode="query" lookup="asset" menutype="assetmain" title="Asset"/>
+					</section>
+				</sectioncol>
+				<sectioncol id="sparepart_grid1_1_2">
+					<pushbutton id="sparepart_grid1_1_1_grid3_1" label="Reîmprospăta" mxevent="doRefresh"/>
+				</sectioncol>
+			</sectionrow>
+		</section>
+		<table id="sparepart_Spare_PartsTable" inputmode="readonly" label="Piese de schimb" selectmode="multiple">
+			<tablebody displayrowsperpage="15" filterable="true" id="sparepart_Spare_PartsTable_tablebody">
+				<tablecol filterable="false" id="sparepart_Spare_PartsTable_tablebody_1" mxevent="toggleselectrow" sortable="false" type="event"/>
+				<tablecol dataattribute="itemnum" id="sparepart_Spare_PartsTable_tablebody_2" sortable="true"/>
+				<tablecol dataattribute="item.description" id="sparepart_Spare_PartsTable_tablebody_3" showfilterfield="true" sortable="false"/>
+				<tablecol dataattribute="quantity" id="sparepart_Spare_PartsTable_tablebody_4" sortable="true"/>
+				<tablecol dataattribute="description" id="sparepart_Spare_PartsTable_tablebody_5" sortable="true"/>
+			</tablebody>
+		</table>
+		<buttongroup id="sparepart_2">
+			<pushbutton default="true" id="sparepart_2_1" label="Bine" mxevent="dialogok" value="copySparePartSetForInvUse"/>
+			<pushbutton id="sparepart_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.ValidateUserPreferenceBean" datasrc="MAINRECORD" id="VALIDPREF" label="Setați opțiunile de validare a utilizatorului" width="400">
+		<helpgrid id="VALIDPREF_help" innerhtml="Puteți verifica dacă detaliile introduse pentru o nouă înregistrare se potrivesc cu orice înregistrări existente de rezervare și returnare."/>
+		<section id="resvpref_col_1_section1">
+			<checkbox dataattribute="resvpref" id="usrpref_1" label="Afișați validările rezervărilor"/>
+			<checkbox dataattribute="returnpref" id="usrpref_2" label="Afișați validările de returnare"/>
+		</section>
+		<buttongroup id="usrpref_button">
+			<pushbutton default="true" id="usrpref_button_1" label="Bine" mxevent="dialogok" value="setUserPreference"/>
+			<pushbutton id="usrpref_button_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog id="viewstatus" inputmode="readonly" label="Vedeți Istoricul stării" relationship="INVUSESTATUS">
+		<table id="viewstatus_invstatus_table" inputmode="readonly" label="Istoricul stării" orderby="changedate desc">
+			<tablebody displayrowsperpage="20" filterable="true" filterexpanded="true" id="invstatus_table_tablebody">
+				<tablecol dataattribute="status" id="viewinvstatus_tablebody_1" sortable="false"/>
+				<tablecol dataattribute="changedate" id="viewinvstatus_tablebody_2" sortable="false"/>
+				<tablecol dataattribute="changeby" id="viewinvstatus_tablebody_3" sortable="false"/>
+				<tablecol dataattribute="memo" id="viewinvstatus_tablebody_4" sortable="false"/>
+			</tablebody>
+		</table>
+		<buttongroup id="viewstatus_contracts_2">
+			<pushbutton default="true" id="viewstatus_contracts_2_1" label="Bine" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.InvUseLineSplitBean" id="SPLITUSAGEQTY" label="Împărțiți cantitatea de utilizare" parentdatasrc="MAINRECORD">
+		<helpgrid id="splitusageqty_help" innerhtml="Cantitatea solicitată depășește soldul curent al coșului. Selectați mai multe compartimente din care să surseați articole sau specificați active rotative pentru linia de utilizare curentă. Puteți să faceți clic pe Auto-Split pentru a selecta automat binurile suplimentare sau activele rotative."/>
+		<table id="splituselines" label="Linii de utilizare" ondatachange="resetchildren" parentdatasrc="MAINRECORD" relationship="SPLITUSELINE">
+			<tablebody filterable="true" filterexpanded="false" id="splitusageqty_grid3_1_1_tablebody">
+				<tablecol dataattribute="invuselinenum" id="splituselines_tablebody_1"/>
+				<tablecol dataattribute="rotating" id="splituselines_tablebody_1a"/>
+				<tablecol dataattribute="itemnum" id="splituselines_tablebody_2"/>
+				<tablecol dataattribute="description" id="splituselines_tablebody_3"/>
+				<tablecol dataattribute="usetype" id="splituselines_tablebody_4"/>
+				<tablecol dataattribute="quantity" id="splituselines_tablebody_5"/>
+				<tablecol dataattribute="frombin" id="splituselines_tablebody_6"/>
+				<tablecol dataattribute="fromlot" id="splituselines_tablebody_6a"/>
+				<tablecol dataattribute="curbal" id="splituselines_tablebody_7"/>
+				<tablecol dataattribute="totcurbal" id="splituselines_tablebody_8"/>
+				<tablecol dataattribute="totavlbalance" id="splituselines_tablebody_9"/>
+				<tablecol filterable="false" id="splituselines_tablebody_10" mxevent="toggledeleterow" mxevent_desc="Marcați rândul pentru ștergere" mxevent_icon="btn_garbage.gif" sortable="false" type="event"/>
+			</tablebody>
+		</table>
+		<table id="splitteduselinesRotCost" label="Selectați Rotația activelor pentru {0}" parentdatasrc="splituselines" parentemptylabel="Selectați Rotația activelor" relationship="LINESPLIT" sigoption="INVASSETCOST" sigoptiondatasrc="splituselines" titleattributes="itemnum">
+			<sectionheader id="splitteduselines_cost_table_h1">
+				<paramvalues id="splitteduselines_cost_table_h_1" property="label">
+					<paramvalue dataattribute="itemnum" id="splitteduselines_table_cost_h_1_1" position="0"/>
+				</paramvalues>
+			</sectionheader>
+			<tablebody displayrowsperpage="5" filterable="true" filterexpanded="false" id="splitteduselines_cost_tablebody">
+				<tablecol dataattribute="invuselinenum" id="splitteduselines_cost_tablebody_1"/>
+				<tablecol dataattribute="frombin" id="splitteduselines_cost_tablebody_2" lookup="binnum"/>
+				<tablecol dataattribute="quantity" id="splitteduselines_cost_tablebody_3" synchronous="true"/>
+				<tablecol dataattribute="rotassetnum" id="splitteduselines_cost_tablebody_4" label="Activ rotativ" lookup="rotatingasset"/>
+				<tablecol dataattribute="newassetnum" id="splitteduselines_cost_tablebody_5" label="Noul număr de activ"/>
+				<tablecol dataattribute="unitcost" id="splitteduselines_cost_tablebody_6"/>
+				<tablecol filterable="false" id="splitteduselines_cost_tablebody_7" mxevent="toggledeleterow" mxevent_desc="Marcați rândul pentru ștergere" mxevent_icon="btn_garbage.gif" sortable="false" type="event"/>
+			</tablebody>
+			<buttongroup id="splitteduselines_cost_but">
+				<pushbutton default="true" id="splitteduselines_cost_but_1" label="Rând nou" mxevent="addrow"/>
+			</buttongroup>
+		</table>
+		<table id="splitteduselinesRot" label="Selectați Rotație active1 pentru {0}" parentdatasrc="splituselines" parentemptylabel="Selectați Rotația activelor" relationship="LINESPLIT" sigoption="INVNOTASSET" sigoptiondatasrc="splituselines" titleattributes="itemnum">
+			<sectionheader id="splitteduselines_table_h1">
+				<paramvalues id="splitteduselines_table_h1_1" property="label">
+					<paramvalue dataattribute="itemnum" id="splitteduselines_table_h1_1_1" position="0"/>
+				</paramvalues>
+			</sectionheader>
+			<tablebody displayrowsperpage="5" filterable="true" filterexpanded="false" id="splitteduselines_tablebody">
+				<tablecol dataattribute="invuselinenum" id="splitteduselines_tablebody_1"/>
+				<tablecol dataattribute="frombin" id="splitteduselines_tablebody_2" lookup="binnum"/>
+				<tablecol dataattribute="quantity" id="splitteduselines_tablebody_3" synchronous="true"/>
+				<tablecol dataattribute="rotassetnum" id="splitteduselines_tablebody_4" label="Activ rotativ" lookup="rotatingasset"/>
+				<tablecol dataattribute="newassetnum" id="splitteduselines_tablebody_5" label="Noul număr de activ"/>
+				<tablecol filterable="false" id="splitteduselines_tablebody_7" mxevent="toggledeleterow" mxevent_desc="Marcați rândul pentru ștergere" mxevent_icon="btn_garbage.gif" sortable="false" type="event"/>
+			</tablebody>
+			<buttongroup id="splitteduselines1a_but">
+				<pushbutton default="true" id="splitteduselines_but_1" label="Rând nou" mxevent="addrow"/>
+			</buttongroup>
+		</table>
+		<table id="splitteduselines" label="Împărțit în mai multe containere pentru {0}" parentdatasrc="splituselines" parentemptylabel="Împărțit în mai multe containere" relationship="LINESPLIT" sigoption="NONROTITEM" sigoptiondatasrc="splituselines" titleattributes="itemnum">
+			<sectionheader id="splitteduselines_table_h2">
+				<paramvalues id="splitteduselines_table_h_2" property="label">
+					<paramvalue dataattribute="itemnum" id="splitteduselines_table_h_2_1" position="0"/>
+				</paramvalues>
+			</sectionheader>
+			<tablebody displayrowsperpage="5" filterable="true" filterexpanded="false" id="splitteduselines2_tablebody">
+				<tablecol dataattribute="invuselinenum" id="splitteduselines2_tablebody_1"/>
+				<tablecol dataattribute="frombin" id="splitteduselines_tablebody_2a" lookup="binnum"/>
+				<tablecol dataattribute="quantity" id="splitteduselines2_tablebody_3" synchronous="true"/>
+				<tablecol dataattribute="newphyscnt" id="splitteduselines2_tablebody_4"/>
+				<tablecol dataattribute="newphyscntdate" id="splitteduselines2_tablebody_5" lookup="datelookup"/>
+				<tablecol filterable="false" id="splitteduselines2_tablebody_6" mxevent="toggledeleterow" mxevent_desc="Marcați rândul pentru ștergere" mxevent_icon="btn_garbage.gif" sortable="false" type="event"/>
+			</tablebody>
+			<buttongroup id="splitteduselines2_but">
+				<pushbutton default="true" id="splitteduselines2_but_1" label="Rând nou" mxevent="addrow"/>
+			</buttongroup>
+		</table>
+		<buttongroup id="splitusageqty_2">
+			<pushbutton default="true" id="splitusageqty_2_1" label="Distribuire automată" mxevent="AUTOSPLITQTY"/>
+			<pushbutton default="true" id="splitusageqty_2_2" label="Bine" mxevent="VALIDATEQTY"/>
+			<pushbutton id="splitusageqty_2_3" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.InvUseChangeStatusBean" id="list_status" label="Schimba status" relationship="INVUSECHANGESTATUS" savemode="ONUNLOAD">
+		<section id="list_changesinvstatus_grid1">
+			<sectionrow id="list_changesinvstatus_grid1_1">
+				<sectioncol id="list_changesinvstatus_grid1_1_1">
+					<section id="list_changesinvstatus_grid1_1_1_grid4">
+						<combobox dataattribute="status" id="list_changesinvstatus_grid1_1_1_grid4_1"/>
+						<textbox align="left" dataattribute="Memo" id="list_changesinvstatus_grid1_1_3_grid4_3"/>
+					</section>
+					<section id="list_stagedstatus_radio_grid1_1_2" sigoption="STAGEDSTATUS" sigoptiondatasrc="MAINRECORD">
+						<radiobuttongroup dataattribute="binflag" hidelabel="true" id="list_stagedstatus_radio_gride1_1_2" label=".">
+							<radiobutton id="list_stagedstatus_radio_1" label="Utilizați coșul prestabilit pentru fiecare articol de inventar" value="0"/>
+							<radiobutton id="list_stagedstatus_radio_2" label="Introduceți un nou număr de casetă de etapă pentru a fi utilizat de toate rândurile care vor fi organizate" value="1"/>
+							<textbox dataattribute="Stagebin" id="list_changesinvstatus_grid1_1_3_grid4_4"/>
+							<radiobutton id="list_stagedstatus_radio_3" label="Utilizați coșul actual" value="2"/>
+						</radiobuttongroup>
+					</section>
+				</sectioncol>
+			</sectionrow>
+		</section>
+		<buttongroup id="list_changesinvstatus_2">
+			<pushbutton default="true" id="list_changesinvstatus_2_1" label="Bine" mxevent="dialogok"/>
+			<pushbutton id="list_changesinvstatus_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.ValidateIssuedItemForReturnDataBean" id="VALIDATEISSUEDITEMFORRETURN" label="Emite articole pentru returnare" parentdatasrc="main_invuselinetab_table" relationship="ISSUEDITEMFORRETURN">
+		<helpgrid id="ValidateReturn_help" innerhtml="One or more of the previous issue transactions exist with similar details to the return line. If applicable, select an issue to reference on the inventory usage line. To maintain the quantity entered on the inventory usage line, select the Keep Current Quantity box. If left unchecked, the quantity is updated to the remaining unreturned quantity."/>
+		<table id="validateissueitemsforreturn_invuseline_Table" label="Articole" selectmode="single" width="900">
+			<tablebody displayrowsperpage="15" filterable="true" id="validateissueitemsforreturn_invuseline_Table_tablebody" inputmode="readonly">
+				<tablecol filterable="false" id="validateissueitemsforreturn_invuseline_Table_tablebody_1" mxevent="toggleselectrow" sortable="false" type="event"/>
+				<tablecol dataattribute="itemnum" id="validateissueitemsforreturn_invuseline_Table_tablebody_2"/>
+				<tablecol dataattribute="item.itemtype" id="validateissueitemsforreturn_invuseline_Table_tablebody_3"/>
+				<tablecol dataattribute="item.description" id="validateissueitemsforreturn_invuseline_Table_tablebody_4"/>
+				<tablecol dataattribute="conditioncode" id="validateissueitemsforreturn_invuseline_Table_tablebody_5"/>
+				<tablecol dataattribute="quantity" id="validateissueitemsforreturn_invuseline_Table_tablebody_6"/>
+				<tablecol dataattribute="qtyreturned" id="validateissueitemsforreturn_invuseline_Table_tablebody_7"/>
+				<tablecol dataattribute="refwo" id="validateissueitemsforreturn_invuseline_Table_tablebody_8"/>
+				<tablecol dataattribute="assetnum" id="validateissueitemsforreturn_invuseline_Table_tablebody_9"/>
+				<tablecol dataattribute="location" id="validateissueitemsforreturn_invuseline_Table_tablebody_10"/>
+				<tablecol dataattribute="mrnum" id="validateissueitemsforreturn_invuseline_Table_tablebody_11"/>
+				<tablecol dataattribute="gldebitacct" id="validateissueitemsforreturn_invuseline_Table_tablebody_12"/>
+				<tablecol dataattribute="issueto" id="validateissueitemsforreturn_invuseline_Table_tablebody_13"/>
+				<tablecol dataattribute="storeloc" id="validateissueitemsforreturn_invuseline_Table_tablebody_14"/>
+				<tablecol dataattribute="siteid" id="validateissueitemsforreturn_invuseline_Table_tablebody_15"/>
+			</tablebody>
+		</table>
+		<section id="validateissueitemsforreturn_mainsection_2">
+			<checkbox dataattribute="keepcurqty" id="validateissueitemsforreturn_col1_16"/>
+		</section>
+		<buttongroup id="validateissueitemsforreturn_2">
+			<pushbutton default="true" id="validateissueitemsforreturn_2_1" label="Bine" mxevent="dialogok"/>
+			<pushbutton id="validateissueitemsforreturn_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.InvUseChangeStatusBean" id="status" label="Schimba status" relationship="INVUSECHANGESTATUS" savemode="ONLOAD">
+		<section id="changesinvstatus_grid1">
+			<sectionrow id="changesinvstatus_grid1_1">
+				<sectioncol id="changesinvstatus_grid1_1_1">
+					<section border="true" id="changesinvstatus_grid1_1_1_grid3">
+						<multiparttextbox dataattribute="invusenum" descdataattribute="description" descinputmode="readonly" id="changesinvstatus_grid1_1_1_grid3_1" inputmode="readonly"/>
+						<multiparttextbox dataattribute="invusestatus" descdataattribute="statusdesc.description" descinputmode="readonly" id="changesinvstatus_grid1_1_1_grid3_2" inputmode="readonly"/>
+					</section>
+					<section id="changesinvstatus_grid1_1_1_grid4">
+						<combobox dataattribute="status" id="changesinvstatus_grid1_1_1_grid4_1"/>
+						<textbox align="left" dataattribute="Memo" id="changesinvstatus_grid1_1_3_grid4_3"/>
+					</section>
+					<section id="stagedstatus_radio_grid1_1_2" sigoption="STAGEDSTATUS" sigoptiondatasrc="MAINRECORD">
+						<radiobuttongroup dataattribute="binflag" hidelabel="true" id="stagedstatus_radio_gride1_1_2" label="." synchronous="true">
+							<radiobutton id="stagedstatus_radio_1" label="Utilizați coșul prestabilit pentru fiecare articol de inventar" value="0"/>
+							<radiobutton id="stagedstatus_radio_2" label="Introduceți un nou număr de casetă de etapă pentru a fi utilizat de toate rândurile care vor fi organizate" value="1"/>
+							<sectioncol id="changesinvstatus_sectcol_spacer1"/>
+							<sectioncol id="changesinvstatus_sectcol_spacer2"/>
+							<sectioncol id="changesinvstatus_sectcol_1">
+								<textbox dataattribute="stagebin" id="changesinvstatus_grid1_1_3_grid4_4"/>
+							</sectioncol>
+							<radiobutton id="stagedstatus_radio_3" label="Utilizați coșul actual" value="2"/>
+						</radiobuttongroup>
+					</section>
+				</sectioncol>
+			</sectionrow>
+		</section>
+		<buttongroup id="changesinvstatus_2">
+			<pushbutton default="true" id="changesinvstatus_2_1" label="Bine" mxevent="dialogok"/>
+			<pushbutton id="changesinvstatus_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.ReservationDataBean" id="RESERVATIONS" label="REZERVĂRI" parentdatasrc="main_invuselinetab_table" relationship="RESERVATION">
+		<helpgrid id="Reservation1_help" innerhtml="Una sau mai multe rezervări au detalii similare cu linia actuală de utilizare a inventarului. Puteți selecta o rezervare de referință pe linia de utilizare a inventarului. Pentru a păstra cantitatea specificată pe linia de utilizare a inventarului, selectați Păstrați cantitatea curentă."/>
+		<table id="reserveditems_invreserve_Table" label="Articole rezervate" selectmode="single" width="900">
+			<tablebody displayrowsperpage="15" filterable="true" id="reserveditems_invreserve_Table_tablebody">
+				<tablecol filterable="false" id="reserveditems_invreserve_Table_tablebody_1" mxevent="toggleselectrow" sortable="false" type="event"/>
+				<tablecol dataattribute="requestnum" id="reserveditems_invreserve_Table_tablebody_2" inputmode="readonly"/>
+				<tablecol dataattribute="itemnum" id="reserveditems_invreserve_Table_tablebody_3" inputmode="readonly"/>
+				<tablecol dataattribute="conditioncode" id="reserveditems_invreserve_Table_tablebody_4" inputmode="readonly"/>
+				<tablecol dataattribute="reservedqty" id="reserveditems_invreserve_Table_tablebody_5" inputmode="readonly"/>
+				<tablecol applink="wotrack" dataattribute="wonum" id="reserveditems_invreserve_Table_tablebody_6" inputmode="readonly" label="Comandă de lucru" menutype="hyperlink" showfilterfield="true" sortable="true"/>
+				<tablecol dataattribute="assetnum" id="reserveditems_invreserve_Table_tablebody_7" inputmode="readonly"/>
+				<tablecol dataattribute="location" id="reserveditems_invreserve_Table_tablebody_8" inputmode="readonly"/>
+				<tablecol dataattribute="ponum" id="reserveditems_invreserve_Table_tablebody_9" inputmode="readonly"/>
+				<tablecol dataattribute="polinenum" id="reserveditems_invreserve_Table_tablebody_10" inputmode="readonly"/>
+				<tablecol applink="viewdr" dataattribute="mrnum" id="reserveditems_invreserve_Table_tablebody_11" inputmode="readonly" menutype="hyperlink" sortable="true"/>
+				<tablecol dataattribute="requestedby" id="reserveditems_invreserve_Table_tablebody_12" inputmode="readonly"/>
+				<tablecol dataattribute="storeloc" id="reserveditems_invreserve_Table_tablebody_13" inputmode="readonly" showfilterfield="true"/>
+				<tablecol dataattribute="siteid" id="reserveditems_invreserve_Table_tablebody_14" inputmode="readonly" showfilterfield="true"/>
+			</tablebody>
+		</table>
+		<section id="reserveditems_section_2">
+			<sectionrow id="reserveditems_section_2_row1">
+				<sectioncol id="reserveditems_section_2_col1">
+					<checkbox dataattribute="keepcurqty" id="reserveritems_col1_15"/>
+				</sectioncol>
+				<sectioncol id="reserveditems_section_2_col2">
+					<checkbox dataattribute="showagainpref" id="reserveritems_col2_16"/>
+				</sectioncol>
+			</sectionrow>
+		</section>
+		<buttongroup id="reserveditems_2">
+			<pushbutton default="true" id="reserveditems_2_1" label="Bine" mxevent="dialogok"/>
+			<pushbutton id="reserveditems_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.InvUseLineShipmentBean" id="createshipment" label="Creați expedierea" parentdatasrc="MAINRECORD">
+		<section id="shipment" label="Expediere" parentdatasrc="MAINRECORD" relationship="SHIPMENT">
+			<sectionrow id="shipment_row1">
+				<sectioncol id="shipment_1_col1">
+					<section id="shipment_main_1a">
+						<textbox dataattribute="shipmentnum" defaultfocus="true" id="shipment_main_grid1_1"/>
+						<textbox dataattribute="shipdate" id="shipment_main_grid1_2" lookup="datelookup"/>
+						<textbox dataattribute="expreceiptdate" id="shipment_main_grid1_3" inputmode="required" lookup="datelookup"/>
+					</section>
+				</sectioncol>
+				<sectioncol id="shipment_1_col2">
+					<section id="shipment_main_2a">
+						<textbox dataattribute="carrier" id="shipment_main_grid1_4"/>
+						<textbox dataattribute="packingslipnum" id="shipment_main_grid1_5" inputmode="required"/>
+						<textbox dataattribute="shiptoattn" id="shipment_main_grid1_6" lookup="person"/>
+					</section>
+				</sectioncol>
+				<sectioncol id="shipment_1_col3">
+					<section id="shipment_main_3a">
+						<textbox dataattribute="siteid" id="shipment_main_grid1_8" label="Spre site"/>
+					</section>
+				</sectioncol>
+			</sectionrow>
+		</section>
+		<table id="shipmentline_table" label="Linii de expediere" parentdatasrc="shipment" relationship="SHIPMENTLINE">
+			<tablebody displayrowsperpage="5" filterable="true" filterexpanded="false" id="shipmentline_tablebody">
+				<tablecol dataattribute="invuselinenum" id="shipmentline_tablebody_1"/>
+				<tablecol dataattribute="itemnum" id="shipmentline_tablebody_2"/>
+				<tablecol dataattribute="itemdescription" id="shipmentline_tablebody_3"/>
+				<tablecol dataattribute="rotassetnum" id="shipmentline_tablebody_6" label="Activ rotativ"/>
+				<tablecol dataattribute="shippedqty" id="shipmentline_tablebody_7"/>
+				<tablecol dataattribute="tostoreloc" id="shipmentline_tablebody_8"/>
+				<tablecol dataattribute="comments" id="shipmentline_tablebody_9"/>
+			</tablebody>
+			<tabledetails id="shipmentline_table_1">
+				<section id="shipmentline_table_1_grid1_sec1">
+					<sectionrow id="shipmentline_table_1_grid1_sec1_row1">
+						<sectioncol id="shipmentline_table_1_grid1_sec1_col1">
+							<textbox dataattribute="invuselinenum" id="shipmentline_table_grid1_1"/>
+							<textbox dataattribute="itemnum" id="shipmentline_table_grid1_2"/>
+							<textbox dataattribute="itemdescription" id="shipmentline_table_grid1_3"/>
+						</sectioncol>
+						<sectioncol id="shipmentline_table_1_grid1_sec1_col2">
+							<textbox dataattribute="shippedqty" id="shipmentline_table_grid1_6"/>
+							<textbox dataattribute="tostoreloc" id="shipmentline_table_grid1_7"/>
+							<textbox dataattribute="comments" id="shipmentline_table_grid1_8"/>
+						</sectioncol>
+					</sectionrow>
+				</section>
+			</tabledetails>
+		</table>
+		<buttongroup id="createshipment_button">
+			<pushbutton default="true" id="createshipment_button_1" label="Bine" mxevent="dialogok"/>
+			<pushbutton id="createshipment_button_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.system.beans.MultiselectDataBean" id="selectitems" label="Selectați Elemente" parentdatasrc="MAINRECORD" relationship="INVBALANCESOUT">
+		<helpgrid id="selectitems_help1" innerhtml="Selectați unul sau mai multe elemente de adăugat la linia de utilizare curentă."/>
+		<table id="selectitemsfortransferout_invbalancesout_Table" label="Articole" selectmode="multiple" width="900">
+			<tablebody displayrowsperpage="15" filterable="true" filterexpanded="true" id="selectitemsfortransferout_invbalancesout_Table_tablebody" inputmode="readonly">
+				<tablecol filterable="false" id="selectitemsfortransferout_invbalancesout_Table_tablebody_1" mxevent="toggleselectrow" sortable="false" type="event"/>
+				<tablecol dataattribute="itemnum" id="selectitemsfortransferout_invbalancesout_Table_tablebody_2" sortable="true"/>
+				<tablecol dataattribute="item.description" id="selectitemsfortransferout_invbalancesout_Table_tablebody_3" sortable="true"/>
+				<tablecol dataattribute="conditioncode" id="selectitemsfortransferout_invbalancesout_Table_tablebody_4" sortable="true"/>
+				<tablecol dataattribute="location" id="selectitemsfortransferout_invbalancesin_Table_tablebody_41" sortable="true"/>
+				<tablecol dataattribute="siteid" id="selectitemsfortransferout_invbalancesin_Table_tablebody_42" sortable="true"/>
+				<tablecol dataattribute="binnum" id="selectitemsfortransferout_invbalancesout_Table_tablebody_5" sortable="true"/>
+				<tablecol dataattribute="lotnum" id="selectitemsfortransferout_invbalancesout_Table_tablebody_6" sortable="true"/>
+				<tablecol dataattribute="curbal" id="selectitemsfortransferout_invbalancesout_Table_tablebody_7" sortable="true"/>
+				<tablecol dataattribute="invlot.mfglotnum" id="selectitemsfortransferout_invbalancesout_Table_tablebody_8" sortable="false"/>
+				<tablecol dataattribute="invlot.shelflife" id="selectitemsfortransferout_invbalancesout_Table_tablebody_9" sortable="false"/>
+				<tablecol dataattribute="invlot.useby" id="selectitemsfortransferout_invbalancesout_Table_tablebody_10" sortable="false"/>
+			</tablebody>
+		</table>
+		<buttongroup id="selectitemsfortransferout_2">
+			<pushbutton default="true" id="selectitemsfortransferout_2_1" label="Bine" mxevent="dialogok" value="copyInvBalancesSetForItems"/>
+			<pushbutton id="selectitemsfortransferout_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.InvUseLineSelectReservedItems" id="selectreserveditems" label="Selectați Articole rezervate" parentdatasrc="MAINRECORD" relationship="INVRESERVE">
+		<helpgrid id="selectreserveditems_help1" innerhtml="Puteți adăuga mai multe articole rezervate la linia de utilizare curentă."/>
+		<table id="selectreserveditems_invreserve_Table" label="Articole rezervate" selectmode="multiple" width="900">
+			<tablebody displayrowsperpage="15" filterable="true" id="selectreserveditems_invreserve_Table_tablebody">
+				<tablecol filterable="false" id="selectreserveditems_invreserve_Table_tablebody_1" mxevent="toggleselectrow" sortable="false" type="event"/>
+				<tablecol dataattribute="itemnum" id="selectreserveditems_invreserve_Table_tablebody_2" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="item.itemtype" id="selectreserveditems_invreserve_Table_tablebody_21" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="item.description" id="selectreserveditems_invreserve_Table_tablebody_3" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="conditioncode" id="selectreserveditems_invreserve_Table_tablebody_4" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="reservedqty" id="selectreserveditems_invreserve_Table_tablebody_5" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="actualqty" id="selectreserveditems_invreserve_Table_tablebody_6" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="pendingqty" id="selectreserveditems_invreserve_Table_tablebody_7" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="stagedqty" id="selectreserveditems_invreserve_Table_tablebody_8" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="shippedqty" id="selectreserveditems_invreserve_Table_tablebody_9" inputmode="readonly" sortable="true"/>
+				<tablecol applink="wotrack" dataattribute="workorder.wogroup" id="selectreserveditems_invreserve_Table_tablebody_10" inputmode="readonly" label="Comandă de lucru" menutype="hyperlink" showfilterfield="true" sortable="true"/>
+				<tablecol dataattribute="workorder.taskid" id="selectreserveditems_invreserve_Table_tablebody_11" inputmode="readonly" showfilterfield="true" sortable="true"/>
+				<tablecol dataattribute="assetnum" id="selectreserveditems_invreserve_Table_tablebody_12" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="tostoreloc" id="selectreserveditems_invreserve_Table_tablebody_14" inputmode="readonly" sortable="true"/>
+				<tablecol applink="viewdr" dataattribute="mrnum" id="selectreserveditems_invreserve_Table_tablebody_15" menutype="hyperlink" sortable="true"/>
+				<tablecol applink="po" dataattribute="ponum" id="selectreserveditems_invreserve_Table_tablebody_16" inputmode="readonly" menutype="normal" sortable="true"/>
+				<tablecol dataattribute="polinenum" id="selectreserveditems_invreserve_Table_tablebody_17" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="requestedby" id="selectreserveditems_invreserve_Table_tablebody_18" inputmode="readonly" sortable="true"/>
+				<tablecol dataattribute="requireddate" id="selectreserveditems_invreserve_Table_tablebody_19" inputmode="readonly" sortable="true"/>
+			</tablebody>
+		</table>
+		<section id="selectreserveditems_mainsection_2">
+			<checkbox dataattribute="showallreservation" id="selectreserveditems_showallreservation_11" ondatachange="resetchildren"/>
+		</section>
+		<buttongroup id="selectreserveditems_2">
+			<pushbutton default="true" id="selectreserveditems_2_1" label="Bine" mxevent="dialogok"/>
+			<pushbutton id="selectreserveditems_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog beanclass="psdi.webclient.beans.invusage.IssuedItemForReturnDataBean" id="ISSUEDITEMFORRETURN" label="Emite articole pentru returnare" parentdatasrc="main_invuselinetab_table" relationship="ISSUEDITEMFORRETURN">
+		<helpgrid id="Return_help" innerhtml="Una sau mai multe tranzacții anterioare au detalii similare cu linia curentă de utilizare a returului. Puteți selecta o problemă de referință pe linia de utilizare a inventarului. Pentru a păstra cantitatea specificată pe linia de utilizare a inventarului, selectați Păstrați cantitatea curentă."/>
+		<table id="issueitemsforreturn_invuseline_Table" label="Articole" selectmode="single" width="900">
+			<tablebody displayrowsperpage="15" filterable="true" id="issueitemsforreturn_invuseline_Table_tablebody" inputmode="readonly">
+				<tablecol filterable="false" id="issueitemsforreturn_invuseline_Table_tablebody_1" mxevent="toggleselectrow" sortable="false" type="event"/>
+				<tablecol dataattribute="itemnum" id="issueitemsforreturn_invuseline_Table_tablebody_2"/>
+				<tablecol dataattribute="item.itemtype" id="issueitemsforreturn_invuseline_Table_tablebody_3"/>
+				<tablecol dataattribute="item.description" id="issueitemsforreturn_invuseline_Table_tablebody_4"/>
+				<tablecol dataattribute="conditioncode" id="issueitemsforreturn_invuseline_Table_tablebody_5"/>
+				<tablecol dataattribute="quantity" id="issueitemsforreturn_invuseline_Table_tablebody_6"/>
+				<tablecol dataattribute="qtyreturned" id="issueitemsforreturn_invuseline_Table_tablebody_7"/>
+				<tablecol dataattribute="refwo" id="issueitemsforreturn_invuseline_Table_tablebody_8"/>
+				<tablecol dataattribute="assetnum" id="issueitemsforreturn_invuseline_Table_tablebody_9"/>
+				<tablecol dataattribute="location" id="issueitemsforreturn_invuseline_Table_tablebody_10"/>
+				<tablecol dataattribute="mrnum" id="issueitemsforreturn_invuseline_Table_tablebody_11"/>
+				<tablecol dataattribute="gldebitacct" id="issueitemsforreturn_invuseline_Table_tablebody_12"/>
+				<tablecol dataattribute="issueto" id="issueitemsforreturn_invuseline_Table_tablebody_13"/>
+				<tablecol dataattribute="storeloc" id="issueitemsforreturn_invuseline_Table_tablebody_14"/>
+				<tablecol dataattribute="siteid" id="issueitemsforreturn_invuseline_Table_tablebody_15"/>
+			</tablebody>
+		</table>
+		<section id="issueitemsforreturn_section_2">
+			<sectionrow id="issueitemsforreturn_section_2_row1">
+				<sectioncol id="issueitemsforreturn_section_2_col1">
+					<checkbox dataattribute="keepcurqty" id="issueitemsforreturn_col1_16"/>
+				</sectioncol>
+				<sectioncol id="issueitemsforreturn_section_2_col2">
+					<checkbox dataattribute="showagainpref" id="issueitemsforreturn_col1_17"/>
+				</sectioncol>
+			</sectionrow>
+		</section>
+		<buttongroup id="issueitemsforreturn_2">
+			<pushbutton default="true" id="issueitemsforreturn_2_1" label="Bine" mxevent="dialogok"/>
+			<pushbutton id="issueitemsforreturn_2_2" label="Anulare" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+
+	<dialog id="viewtrans" inputmode="readonly" label="Vedeți tranzacțiile">
+		<tabgroup id="invusetrans_viewtrans">
+			<tab default="true" id="invusetrans_viewtrans_issuereturns" label="Consumuri/Retururi">
+				<table height="380" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans" label="Consumuri și retururi" orderby="transdate desc" relationship="MATUSETRANS" startrow="0" width="860">
+					<tablebody displayrowsperpage="10" filterable="true" filterexpanded="false" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody">
+						<tablecol filterable="false" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_1" mxevent="toggledetailstate" mxevent_desc="Arată detalii" sortable="false" type="event"/>
+						<tablecol dataattribute="issuetype" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_2" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_1"/>
+						<tablecol dataattribute="actualdate" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_3" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_2"/>
+						<tablecol dataattribute="transdate" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_4" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_3"/>
+						<tablecol dataattribute="itemnum" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_5" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_4"/>
+						<tablecol dataattribute="quantity" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_6" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_5"/>
+						<tablecol dataattribute="storeloc" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_7" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_61"/>
+						<tablecol dataattribute="binnum" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_71" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_6"/>
+						<tablecol dataattribute="refwo" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_8" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_7"/>
+						<tablecol dataattribute="assetnum" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_9" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_8"/>
+						<tablecol dataattribute="location" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_10" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_9"/>
+						<tablecol dataattribute="issueto" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_11" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_10"/>
+						<tablecol dataattribute="tositeid" id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_tablebody_12" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_11"/>
+					</tablebody>
+					<tabledetails id="invusetrans_viewtrans_invuse_grid3_1_1_matusetrans_1">
+						<section id="matusetrans_table_details" label="Detalii">
+							<sectionrow id="matusetrans_table_details_row1">
+								<sectioncol id="matusetrans_table_details_row1_col1">
+									<section id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23">
+										<textbox dataattribute="issuetype" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_1"/>
+										<textbox dataattribute="actualdate" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_2"/>
+										<textbox dataattribute="transdate" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_3"/>
+										<textbox dataattribute="itemnum" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_4"/>
+										<textbox dataattribute="quantity" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_5" sizeintable="8"/>
+										<textbox dataattribute="storeloc" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_6"/>
+									</section>
+								</sectioncol>
+								<sectioncol id="matusetrans_table_details_row1_col2">
+									<section id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_2_grid23">
+										<textbox dataattribute="binnum" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_1_grid23_61"/>
+										<textbox dataattribute="refwo" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_2_grid23_7"/>
+										<textbox dataattribute="assetnum" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_2_grid23_8"/>
+										<textbox dataattribute="location" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_2_grid23_9"/>
+										<textbox dataattribute="issueto" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_2_grid23_10"/>
+										<textbox dataattribute="tositeid" id="invtrans_viewtrans_invuse_grid3_1_1_matusetrans_2_grid23_11"/>
+									</section>
+								</sectioncol>
+							</sectionrow>
+						</section>
+					</tabledetails>
+				</table>
+			</tab>
+			<tab id="invusetrans_viewtrans_transfers" label="Transferuri">
+				<table height="380" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans" label="Transferuri" orderby="transdate desc" relationship="MATRECTRANS" startrow="0" width="860">
+					<tablebody displayrowsperpage="10" filterable="true" filterexpanded="false" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody">
+						<tablecol filterable="false" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_1" mxevent="toggledetailstate" mxevent_desc="Arată detalii" sortable="false" type="event"/>
+						<tablecol dataattribute="issuetype" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_2" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_1"/>
+						<tablecol dataattribute="actualdate" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_3" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_2"/>
+						<tablecol dataattribute="transdate" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_4" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_3"/>
+						<tablecol dataattribute="itemnum" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_5" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_4"/>
+						<tablecol dataattribute="quantity" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_6" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_5"/>
+						<tablecol dataattribute="fromstoreloc" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_7" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_7"/>
+						<tablecol dataattribute="frombin" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_71" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_8"/>
+						<tablecol dataattribute="tostoreloc" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_8" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_9"/>
+						<tablecol dataattribute="tobin" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_81" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_10"/>
+						<tablecol dataattribute="issueto" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_9" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_6"/>
+						<tablecol dataattribute="siteid" id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_tablebody_10" linkedcontrolid="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_11"/>
+					</tablebody>
+					<tabledetails id="invusetrans_viewtrans_invuse_grid3_1_1_matrectrans_1">
+						<section id="matrectrans_table_details" label="Detalii">
+							<sectionrow id="matrectrans_table_details_row1">
+								<sectioncol id="matrectrans_table_details_row1_col1">
+									<section id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23">
+										<textbox dataattribute="issuetype" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_1"/>
+										<textbox dataattribute="actualdate" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_2"/>
+										<textbox dataattribute="transdate" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_3"/>
+										<textbox dataattribute="itemnum" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_4"/>
+										<textbox dataattribute="quantity" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_1_grid23_5" sizeintable="8"/>
+										<textbox dataattribute="shipmentnum" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_2_grid23_6"/>
+									</section>
+								</sectioncol>
+								<sectioncol id="matrectrans_table_details_row1_col2">
+									<section id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_2_grid23">
+										<textbox dataattribute="fromstoreloc" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_2_grid23_7"/>
+										<textbox dataattribute="frombin" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_2_grid23_8"/>
+										<textbox dataattribute="tostoreloc" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_2_grid23_9"/>
+										<textbox dataattribute="tobin" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_2_grid23_10"/>
+										<textbox dataattribute="issueto" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_2_grid23_11"/>
+										<textbox dataattribute="siteid" id="invtrans_viewtrans_invuse_grid3_1_1_matrectrans_2_grid23_12"/>
+									</section>
+								</sectioncol>
+							</sectionrow>
+						</section>
+					</tabledetails>
+				</table>
+			</tab>
+		</tabgroup>
+		<buttongroup id="invusetrans_2">
+			<pushbutton default="true" id="invusetrans_2_1" label="Bine" mxevent="dialogcancel"/>
+		</buttongroup>
+	</dialog>
+	<configurationblock id="datastore_configurationblock">
+	</configurationblock>
+</presentation>
