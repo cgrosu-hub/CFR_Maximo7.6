@@ -1,6 +1,7 @@
-# Genereaza SAF-T D406 (sectiunea PhysicalStock) din EXPORT*.csv + UOM*.csv.
-# Se ruleaza din folderul in care sunt cele doua fisiere. Windows PowerShell 5.1.
-# Verificare rapida, fara CSV: powershell -File .\Generate-PhysicalStockEntries.ps1 -SelfTest
+# Genereaza SAF-T D406: conturi, unitati, produse, stoc fizic si miscari.
+# Fisiere in acelasi folder: EXPORT*.csv, UOM*.csv si, optional, INVENTORY*.csv, GLAccounts*.xml, MOG*.csv.
+# Windows PowerShell 5.1. Verificare fara CSV:
+#   powershell -File .\Generate-PhysicalStockEntries.ps1 -SelfTest
 param(
     [switch]$SelfTest
 )
@@ -13,7 +14,7 @@ function Escape-Xml {
     return [System.Security.SecurityElement]::Escape($text)
 }
 
-# "1,25" -> 1.25. Nu scoatem separatorul de mii: "1.234,56" nu se parseaza si intra in log.
+# "1,25" si "1.25" sunt 1.25. "1.234,56" nu se parseaza si intra in log.
 function ConvertTo-InvariantDouble {
     param([string]$Value)
     $number = [double]0
@@ -78,21 +79,94 @@ function Resolve-StockUom {
             return [pscustomobject]@{ Code = $code; Fallback = $false; Raw = $raw; Source = "id" }
         }
     }
-    # Exportul CFR are deja abrevierea DUK (H87, KGM), nu MEASUREUNITID (BUC, KG).
+    # Exportul are deja abrevierea DUK (H87, KGM), nu doar MEASUREUNITID (BUC, KG).
     if (-not [string]::IsNullOrWhiteSpace($raw) -and $script:uomCodes.ContainsKey($raw)) {
         return [pscustomobject]@{ Code = $raw; Fallback = $false; Raw = $raw; Source = "abbr" }
     }
     return [pscustomobject]@{ Code = "H87"; Fallback = $true; Raw = $raw; Source = "fallback" }
 }
 
+function Add-UsedUom {
+    param([string]$Code)
+    if ([string]::IsNullOrWhiteSpace($Code)) { return }
+    if (-not $script:usedUomSet.ContainsKey($Code)) {
+        $script:usedUomSet[$Code] = $true
+        [void]$script:usedUoms.Add($Code)
+    }
+}
+
+function Add-UomFallback {
+    param(
+        [string]$Raw,
+        [string]$Detail
+    )
+    $label = $Raw
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = "(gol)" }
+    $script:fallbackCount++
+    if (-not $script:fallbackRawSet.ContainsKey($label)) {
+        $script:fallbackRawSet[$label] = $true
+        [void]$script:fallbackRawList.Add($label)
+    }
+    [void]$script:fallbackDetails.Add($Detail)
+}
+
+function Convert-MovementDate {
+    param([string]$Value)
+    $raw = ("$Value").Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { return "" }
+    $formats = @(
+        "yyyy-MM-dd",
+        "yyyy-MM-dd HH:mm:ss",
+        "yyyy-MM-ddTHH:mm:ss",
+        "dd.MM.yyyy",
+        "dd.MM.yyyy HH:mm:ss",
+        "dd/MM/yyyy",
+        "dd/MM/yyyy HH:mm:ss",
+        "dd-MM-yyyy",
+        "dd-MM-yyyy HH:mm:ss"
+    )
+    # TryParseExact cu [ref] nu se leaga in Windows PowerShell 5.1.
+    foreach ($fmt in $formats) {
+        try {
+            $dt = [datetime]::ParseExact($raw, $fmt, $script:invariant)
+            return $dt.ToString("yyyy-MM-dd", $script:invariant)
+        } catch {
+            continue
+        }
+    }
+    return $raw
+}
+
+function Read-CsvDataLines {
+    param(
+        [string]$Path,
+        [scriptblock]$Process
+    )
+    $reader = [System.IO.StreamReader]::new($Path)
+    $lineNo = 0
+    $headerRead = $false
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $lineNo++
+            if (-not $headerRead) {
+                $headerRead = $true
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace(($line + "").Replace(",", "").Trim())) { continue }
+            & $Process $line $lineNo
+        }
+    } finally {
+        $reader.Close()
+    }
+}
+
 $script:uomMapping = @{}
 $script:uomCodes = @{}
-$script:uomDescriptionByCode = @{}
-$script:usedUoms = New-Object System.Collections.Generic.List[string]
-$script:usedUomSet = @{}
 $script:unparseableCount = 0
 $script:unparseableList = New-Object System.Collections.Generic.List[string]
 $script:rowHasNegative = $false
+$script:usedUoms = New-Object System.Collections.Generic.List[string]
+$script:usedUomSet = @{}
 
 if ($SelfTest) {
     $previousCulture = [Threading.Thread]::CurrentThread.CurrentCulture
@@ -103,16 +177,18 @@ if ($SelfTest) {
     }
 
     $amount = Format-Amount -Value "12,5" -Line 2 -Column "PRET_UNITAR"
-    $amountDot = Format-Amount -Value "12.5" -Line 2 -Column "PRET_UNITAR"
-    $quantity = Format-Quantity -Value "2,5" -Line 3 -Column "STOC_FINAL"
+    $amountDot = Format-Amount -Value "0.016000" -Line 2 -Column "VALOARE_INITIALA"
+    $quantity = Format-Quantity -Value "16.000" -Line 3 -Column "STOC_FINAL"
     $negativeQty = Format-Quantity -Value "-3,5" -Line 3 -Column "STOC_INITIAL"
     $bad = Format-Amount -Value "abc" -Line 4 -Column "PRET_UNITAR"
-    if ($amount -ne "12.50" -or $amountDot -ne "12.50") { throw "Format-Amount a produs '$amount' / '$amountDot'." }
-    if ($quantity -ne "2.500") { throw "Format-Quantity a produs '$quantity'." }
+    if ($amount -ne "12.50") { throw "Format-Amount a produs '$amount'." }
+    if ($amountDot -ne "0.02") { throw "0.016000 a devenit '$amountDot'." }
+    if ($quantity -ne "16.000") { throw "16.000 a devenit '$quantity'." }
     if ($negativeQty -ne "-3.500" -or -not $script:rowHasNegative) { throw "Cantitatea negativa nu a fost formatata invariant." }
     if ($bad -ne "0.00" -or $script:unparseableCount -ne 1) { throw "Valoarea neparsabila nu a fost jurnalizata." }
-    if ($script:unparseableList[0] -notmatch "linia 4, coloana PRET_UNITAR") { throw "Logul valorii neparsabile este incomplet." }
-    if (($amount + $quantity + $negativeQty) -match ",") { throw "Un numar formatat contine virgula." }
+    if (($amount + $amountDot + $quantity + $negativeQty) -match ",") { throw "Un numar formatat contine virgula." }
+    $when = Convert-MovementDate "06.10.2026"
+    if ($when -ne "2026-10-06") { throw "Data 06.10.2026 a devenit '$when'." }
 
     $script:uomMapping = @{ BUC = "H87"; KG = "KGM"; BARA = "XBZ" }
     $script:uomCodes = @{ H87 = $true; KGM = $true; XBZ = $true }
@@ -121,18 +197,13 @@ if ($SelfTest) {
     $translated = Resolve-StockUom "BARA"
     $unknown = Resolve-StockUom "NECUNOSCUT"
     $blank = Resolve-StockUom "  "
-    if ($known.Code -ne "KGM" -or $known.Fallback -or $known.Source -ne "id") { throw "KG nu s-a mapat la KGM." }
-    if ($already.Code -ne "KGM" -or $already.Fallback -or $already.Source -ne "abbr") { throw "KGM deja cod DUK a fost rescris." }
+    if ($known.Code -ne "KGM" -or $known.Source -ne "id") { throw "KG nu s-a mapat la KGM." }
+    if ($already.Code -ne "KGM" -or $already.Fallback) { throw "KGM deja cod DUK a fost rescris." }
     if ($translated.Code -ne "XBZ" -or $translated.Fallback) { throw "BARA nu s-a mapat la XBZ." }
     if ($unknown.Code -ne "H87" -or -not $unknown.Fallback) { throw "Cod necunoscut nu a cazut pe H87." }
     if ($blank.Code -ne "H87" -or -not $blank.Fallback) { throw "UOM gol nu a cazut pe H87." }
 
-    foreach ($code in @("H87", "H87", "KGM")) {
-        if (-not $script:usedUomSet.ContainsKey($code)) {
-            $script:usedUomSet[$code] = $true
-            [void]$script:usedUoms.Add($code)
-        }
-    }
+    foreach ($code in @("H87", "H87", "KGM")) { Add-UsedUom $code }
     if ($script:usedUoms.Count -ne 2) { throw "UOMTable ar contine coduri duplicate." }
 
     [Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture
@@ -147,84 +218,228 @@ $script:usedUoms = New-Object System.Collections.Generic.List[string]
 $script:usedUomSet = @{}
 $script:unparseableCount = 0
 $script:unparseableList = New-Object System.Collections.Generic.List[string]
+$script:fallbackCount = 0
+$script:fallbackDetails = New-Object System.Collections.Generic.List[string]
+$script:fallbackRawList = New-Object System.Collections.Generic.List[string]
+$script:fallbackRawSet = @{}
+$script:skippedRecords = 0
+$script:skippedList = New-Object System.Collections.Generic.List[string]
+$script:negativeRecords = 0
+$script:negativeList = New-Object System.Collections.Generic.List[string]
+$script:mappedFromIdCount = 0
+$script:alreadyAbbrCount = 0
+$script:totalRecords = 0
+$script:successRecords = 0
+$script:totalProducts = 0
+$script:productConflicts = 0
+$script:badProductLines = 0
+$script:processedProducts = @{}
+$script:productUomSeen = @{}
+$script:productXml = New-Object System.Collections.Generic.List[string]
+$script:stockXml = New-Object System.Collections.Generic.List[string]
+$script:mogRows = New-Object System.Collections.Generic.List[object]
+$script:mogTotalLines = 0
+$script:mogTotalQtyReceived = [double]0
+$script:mogTotalQtyIssued = [double]0
+$script:stockHeader = @("SITEID","GESTIUNE_BALANTA","MAGAZIE","TIP_GESTIUNE","COD_PRODUS","DESCRIERE_PRODUS","UNITATE_MASURA","PRET_UNITAR","STOC_INITIAL","VALOARE_INITIALA","CANTITATE_INTRATA","CANTITATE_IESITA","STOC_FINAL","VALOARE_FINALA")
+$script:inventoryHeader = @("ITEMNUM","DESCRIPTION","ISSUEUNIT","ABBREVIATION")
+$script:mogHeader = @("CXCREDITOBINV","CXDEBITOBINV","MAXIMONR","DENUMIRE","DIRECTIE","COMMODITYGROUP","ITEMNUM","UNITCOST","LINECOST","RECEIVEDUNIT","ABBREVIATION","QUANTITY","TOSTORELOC","FROMSTORELOC","ISSUETYPE","DATAINTRAREIESIRE","NUMARDOC","DATADOC","NRFACT","DATAFACT","GLDEBITACCT","GLCREDITACCT")
+
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+$uomFile = Get-ChildItem -Path $scriptDirectory -Filter "UOM*.csv" -File |
+           Sort-Object LastWriteTime -Descending |
+           Select-Object -First 1
+
+if ($uomFile) {
+    Write-Host "Fisier UOM detectat: $($uomFile.Name)"
+    try {
+        $uomData = Import-Csv -Path $uomFile.FullName -Encoding UTF8
+        foreach ($row in $uomData) {
+            $key = ($row.MEASUREUNITID + "").Trim()
+            $abbr = ($row.ABBREVIATION + "").Trim()
+            $desc = ($row.DESCRIPTION + "").Trim()
+
+            if (-not [string]::IsNullOrWhiteSpace($key) -and -not [string]::IsNullOrWhiteSpace($abbr)) {
+                $script:uomMapping[$key] = $abbr
+            }
+            if (-not [string]::IsNullOrWhiteSpace($abbr)) {
+                $script:uomCodes[$abbr] = $true
+                $knownDesc = ""
+                if ($script:uomDescriptionByCode.ContainsKey($abbr)) {
+                    $knownDesc = [string]$script:uomDescriptionByCode[$abbr]
+                }
+                if (-not $script:uomDescriptionByCode.ContainsKey($abbr) -or ([string]::IsNullOrWhiteSpace($knownDesc) -and -not [string]::IsNullOrWhiteSpace($desc))) {
+                    $script:uomDescriptionByCode[$abbr] = $desc
+                }
+            }
+        }
+        Write-Host "Au fost incarcate $($script:uomMapping.Count) mapari de unitati de masura."
+    } catch {
+        Write-Warning "Eroare la citirea fisierului UOM: $_"
+    }
+} else {
+    Write-Warning "Nu a fost gasit niciun fisier UOM*.csv. Unitatiile necunoscute vor folosi H87."
+}
+
+$inventoryFile = Get-ChildItem -Path $scriptDirectory -Filter "INVENTORY*.csv" -File |
+                 Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+if ($inventoryFile) {
+    Write-Host "Fisier INVENTORY detectat: $($inventoryFile.Name)"
+} else {
+    Write-Warning "Nu a fost gasit niciun fisier INVENTORY*.csv."
+}
+
+$glAccountsFile = Get-ChildItem -Path $scriptDirectory -Filter "GLAccounts*.xml" -File |
+                  Sort-Object LastWriteTime -Descending |
+                  Select-Object -First 1
+if ($glAccountsFile) {
+    Write-Host "Fisier GLAccounts detectat: $($glAccountsFile.Name)"
+} else {
+    Write-Warning "Nu a fost gasit niciun fisier GLAccounts*.xml."
+}
+
+$mogFile = Get-ChildItem -Path $scriptDirectory -Filter "MOG*.csv" -File |
+           Sort-Object LastWriteTime -Descending |
+           Select-Object -First 1
+if ($mogFile) {
+    Write-Host "Fisier MOG detectat: $($mogFile.Name)"
+} else {
+    Write-Warning "Nu a fost gasit niciun fisier MOG*.csv."
+}
+
+$csvFile = Get-ChildItem -Path $scriptDirectory -Filter "EXPORT*" -File |
+           Sort-Object LastWriteTime -Descending |
+           Select-Object -First 1
+if (-not $csvFile) {
+    Write-Error "Nu a fost gasit niciun fisier CSV care sa inceapa cu 'EXPORT' in folderul curent: $scriptDirectory"
+    exit 1
+}
+
+$CsvPath = $csvFile.FullName
+Write-Host "Fisier CSV stocuri detectat: $($csvFile.Name)"
+
+$fileName = $csvFile.Name
+$startMatch = [regex]::Match($fileName, 'start_(\d{2})(\d{4})')
+$endMatch   = [regex]::Match($fileName, 'end_(\d{2})(\d{4})')
+if (-not $startMatch.Success -or -not $endMatch.Success) {
+    Write-Error "Numele fisierului '$fileName' nu contine start_MMYYYY si end_MMYYYY. Exemplu: EXPORT_start_062026_end_102026.csv. Scriptul se opreste."
+    exit 1
+}
+
+$periodStart = $startMatch.Groups[1].Value
+$periodStartYear = $startMatch.Groups[2].Value
+$periodEnd = $endMatch.Groups[1].Value
+$periodEndYear = $endMatch.Groups[2].Value
+Write-Host "Perioada detectata: Start $periodStart/$periodStartYear - End $periodEnd/$periodEndYear"
+
+$runDate = Get-Date
+$currentDate = $runDate.ToString("yyyyMMdd", $script:invariant)
+$auditFileDateCreated = $runDate.ToString("yyyy-MM-dd", $script:invariant)
+$logDateTime = $runDate.ToString("yyyy-MM-dd HH:mm:ss", $script:invariant)
+$OutputPath = Join-Path $scriptDirectory "SAFT_$currentDate.xml"
+Write-Host "Fisierul SAF-T va fi salvat ca: $OutputPath"
+
+function Import-ProductRows {
+    if (-not $inventoryFile) { return }
+    Read-CsvDataLines -Path $inventoryFile.FullName -Process {
+        param($line, $lineNo)
+        try {
+            $invRow = $line | ConvertFrom-Csv -Header $script:inventoryHeader
+        } catch {
+            $script:badProductLines++
+            return
+        }
+
+        $pCode = ("$($invRow.ITEMNUM)").Trim()
+        $pDesc = ("$($invRow.DESCRIPTION)").Trim()
+        $rawUom = ("$($invRow.ABBREVIATION)").Trim()
+        if ([string]::IsNullOrWhiteSpace($pCode)) { return }
+
+        if ($script:productUomSeen.ContainsKey($pCode)) {
+            if ($script:productUomSeen[$pCode] -ne $rawUom -and -not $script:processedProducts.ContainsKey($pCode)) {
+                $script:productConflicts++
+                $script:processedProducts[$pCode] = $true
+            }
+            return
+        }
+
+        $script:productUomSeen[$pCode] = $rawUom
+        $resolved = Resolve-StockUom $rawUom
+        Add-UsedUom $resolved.Code
+        if ($resolved.Fallback) {
+            $rawLabel = $rawUom
+            if ([string]::IsNullOrWhiteSpace($rawLabel)) { $rawLabel = "(gol)" }
+            Add-UomFallback -Raw $resolved.Raw -Detail "produs $pCode, $rawLabel"
+        }
+
+        $script:totalProducts++
+        $pCodeEsc = Escape-Xml $pCode
+        $pDescEsc = Escape-Xml $pDesc
+        $pUomEsc = Escape-Xml $resolved.Code
+        $prodEntry = @"
+      <Product>
+        <ProductCode>$pCodeEsc</ProductCode>
+        <GoodsServicesID>01</GoodsServicesID>
+        <Description>$pDescEsc</Description>
+        <ProductCommodityCode>99500000</ProductCommodityCode>
+        <UOMBase>$pUomEsc</UOMBase>
+        <UOMStandard>$pUomEsc</UOMStandard>
+        <UOMToUOMBaseConversionFactor>1</UOMToUOMBaseConversionFactor>
+      </Product>
+"@
+        [void]$script:productXml.Add($prodEntry)
+    }
+}
 
 function Import-StockRows {
-    param(
-        [string]$Path,
-        [ValidateSet("CollectUom", "WriteEntries")]
-        [string]$Mode
-    )
+    Read-CsvDataLines -Path $CsvPath -Process {
+        param($line, $lineNo)
+        $script:totalRecords++
+        try {
+            $row = $line | ConvertFrom-Csv -Header $script:stockHeader
+        } catch {
+            $script:skippedRecords++
+            [void]$script:skippedList.Add("linia $lineNo, rand CSV necitibil")
+            return
+        }
 
-    $reader = [System.IO.StreamReader]::new($Path)
-    $lineNo = 0
-    $headerRead = $false
-    try {
-        while ($null -ne ($line = $reader.ReadLine())) {
-            $lineNo++
-            if (-not $headerRead) {
-                $headerRead = $true
-                continue
-            }
+        $warehouseRaw = ("$($row.MAGAZIE)").Trim()
+        $productRaw = ("$($row.COD_PRODUS)").Trim()
+        if ([string]::IsNullOrWhiteSpace($warehouseRaw) -or [string]::IsNullOrWhiteSpace($productRaw)) {
+            $script:skippedRecords++
+            [void]$script:skippedList.Add("linia $lineNo, MAGAZIE='$warehouseRaw', COD_PRODUS='$productRaw'")
+            return
+        }
 
-            $row = $line | ConvertFrom-Csv -Header "SITEID","GESTIUNE_BALANTA","MAGAZIE","TIP_GESTIUNE","COD_PRODUS","DESCRIERE_PRODUS","UNITATE_MASURA","PRET_UNITAR","STOC_INITIAL","VALOARE_INITIALA","CANTITATE_INTRATA","CANTITATE_IESITA","STOC_FINAL","VALOARE_FINALA"
-            $warehouseRaw = ("$($row.MAGAZIE)").Trim()
-            $productRaw = ("$($row.COD_PRODUS)").Trim()
+        $resolved = Resolve-StockUom $row.UNITATE_MASURA
+        Add-UsedUom $resolved.Code
+        if ($resolved.Fallback) {
+            Add-UomFallback -Raw $resolved.Raw -Detail "$warehouseRaw, $productRaw, $(if ([string]::IsNullOrWhiteSpace($resolved.Raw)) { '(gol)' } else { $resolved.Raw })"
+        }
+        elseif ($resolved.Source -eq "id") {
+            $script:mappedFromIdCount++
+        }
+        else {
+            $script:alreadyAbbrCount++
+        }
 
-            if ($Mode -eq "WriteEntries") {
-                $script:totalRecords++
-            }
+        $script:rowHasNegative = $false
+        $unitPrice  = Format-Amount   -Value ("$($row.PRET_UNITAR)")      -Line $lineNo -Column "PRET_UNITAR"
+        $openingQty = Format-Quantity -Value ("$($row.STOC_INITIAL)")     -Line $lineNo -Column "STOC_INITIAL"
+        $openingVal = Format-Amount   -Value ("$($row.VALOARE_INITIALA)") -Line $lineNo -Column "VALOARE_INITIALA"
+        $closingQty = Format-Quantity -Value ("$($row.STOC_FINAL)")       -Line $lineNo -Column "STOC_FINAL"
+        $closingVal = Format-Amount   -Value ("$($row.VALOARE_FINALA)")   -Line $lineNo -Column "VALOARE_FINALA"
+        if ($script:rowHasNegative) {
+            $script:negativeRecords++
+            [void]$script:negativeList.Add("$warehouseRaw, $productRaw, $unitPrice, $openingQty, $openingVal, $closingQty, $closingVal")
+        }
 
-            if ([string]::IsNullOrWhiteSpace($warehouseRaw) -or [string]::IsNullOrWhiteSpace($productRaw)) {
-                if ($Mode -eq "WriteEntries") {
-                    $script:skippedRecords++
-                    [void]$script:skippedList.Add("linia $lineNo, MAGAZIE='$warehouseRaw', COD_PRODUS='$productRaw'")
-                }
-                continue
-            }
-
-            $resolved = Resolve-StockUom $row.UNITATE_MASURA
-            if ($Mode -eq "CollectUom") {
-                if (-not $script:usedUomSet.ContainsKey($resolved.Code)) {
-                    $script:usedUomSet[$resolved.Code] = $true
-                    [void]$script:usedUoms.Add($resolved.Code)
-                }
-                continue
-            }
-
-            if ($resolved.Fallback) {
-                $rawLabel = $resolved.Raw
-                if ([string]::IsNullOrWhiteSpace($rawLabel)) { $rawLabel = "(gol)" }
-                $script:fallbackCount++
-                if (-not $script:fallbackRawSet.ContainsKey($rawLabel)) {
-                    $script:fallbackRawSet[$rawLabel] = $true
-                    [void]$script:fallbackRawList.Add($rawLabel)
-                }
-                [void]$script:fallbackDetails.Add("$warehouseRaw, $productRaw, $rawLabel")
-            }
-            elseif ($resolved.Source -eq "id") {
-                $script:mappedFromIdCount++
-            }
-            else {
-                $script:alreadyAbbrCount++
-            }
-
-            $script:rowHasNegative = $false
-            $unitPrice  = Format-Amount   -Value $row.PRET_UNITAR      -Line $lineNo -Column "PRET_UNITAR"
-            $openingQty = Format-Quantity -Value $row.STOC_INITIAL     -Line $lineNo -Column "STOC_INITIAL"
-            $openingVal = Format-Amount   -Value $row.VALOARE_INITIALA -Line $lineNo -Column "VALOARE_INITIALA"
-            $closingQty = Format-Quantity -Value $row.STOC_FINAL       -Line $lineNo -Column "STOC_FINAL"
-            $closingVal = Format-Amount   -Value $row.VALOARE_FINALA   -Line $lineNo -Column "VALOARE_FINALA"
-
-            if ($script:rowHasNegative) {
-                $script:negativeRecords++
-                [void]$script:negativeList.Add("$warehouseRaw, $productRaw, $unitPrice, $openingQty, $openingVal, $closingQty, $closingVal")
-            }
-
-            $warehouse = Escape-Xml $warehouseRaw
-            $productCode = Escape-Xml $productRaw
-            $finalUomEsc = Escape-Xml $resolved.Code
-
-            $entry = @"
+        $warehouse = Escape-Xml $warehouseRaw
+        $productCode = Escape-Xml $productRaw
+        $finalUomEsc = Escape-Xml $resolved.Code
+        $entry = @"
       <PhysicalStockEntry>
         <WarehouseID>$warehouse</WarehouseID>
         <ProductCode>$productCode</ProductCode>
@@ -244,110 +459,83 @@ function Import-StockRows {
         </StockCharacteristics>
       </PhysicalStockEntry>
 "@
-            $script:outputStream.WriteLine($entry)
-            $script:successRecords++
-        }
-    } finally {
-        $reader.Close()
+        [void]$script:stockXml.Add($entry)
+        $script:successRecords++
     }
 }
 
-$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-$uomFile = Get-ChildItem -Path $scriptDirectory -Filter "UOM*.csv" -File |
-           Sort-Object LastWriteTime -Descending |
-           Select-Object -First 1
-
-if ($uomFile) {
-    Write-Host "Fisier UOM detectat: $($uomFile.Name)"
-    try {
-        # UTF8: fisierul real are BOM, iar Windows PowerShell 5.1 altfel citeste ANSI.
-        $uomData = Import-Csv -Path $uomFile.FullName -Encoding UTF8
-        foreach ($row in $uomData) {
-            $key = ($row.MEASUREUNITID + "").Trim()
-            $abbr = ($row.ABBREVIATION + "").Trim()
-            $desc = ($row.DESCRIPTION + "").Trim()
-
-            if (-not [string]::IsNullOrWhiteSpace($key) -and -not [string]::IsNullOrWhiteSpace($abbr)) {
-                $script:uomMapping[$key] = $abbr
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($abbr)) {
-                $script:uomCodes[$abbr] = $true
-                $knownDesc = ""
-                if ($script:uomDescriptionByCode.ContainsKey($abbr)) {
-                    $knownDesc = [string]$script:uomDescriptionByCode[$abbr]
-                }
-                if (-not $script:uomDescriptionByCode.ContainsKey($abbr) -or ([string]::IsNullOrWhiteSpace($knownDesc) -and -not [string]::IsNullOrWhiteSpace($desc))) {
-                    $script:uomDescriptionByCode[$abbr] = $desc
-                }
-            }
+function Import-MogRows {
+    if (-not $mogFile) { return }
+    Read-CsvDataLines -Path $mogFile.FullName -Process {
+        param($line, $lineNo)
+        try {
+            $row = $line | ConvertFrom-Csv -Header $script:mogHeader
+        } catch {
+            $script:unparseableCount++
+            [void]$script:unparseableList.Add("MOG linia $lineNo, rand CSV necitibil")
+            return
         }
-        Write-Host "Au fost incarcate $($script:uomMapping.Count) mapari de unitati de masura."
-    } catch {
-        Write-Warning "Eroare la citirea fisierului UOM: $_"
+
+        $qtyRaw = ("$($row.QUANTITY)").Trim()
+        $parsed = ConvertTo-InvariantDouble $qtyRaw
+        if (-not $parsed.Ok) {
+            $script:unparseableCount++
+            [void]$script:unparseableList.Add("MOG linia $lineNo, coloana QUANTITY, valoare '$qtyRaw'")
+        }
+        $qtyAbs = [Math]::Abs($parsed.Number)
+        $dir = ("$($row.DIRECTIE)").Trim()
+        if ($dir -eq "Intrare") { $script:mogTotalQtyReceived += $qtyAbs }
+        elseif ($dir -eq "Iesire") { $script:mogTotalQtyIssued += $qtyAbs }
+
+        $resolved = Resolve-StockUom $row.ABBREVIATION
+        Add-UsedUom $resolved.Code
+        if ($resolved.Fallback) {
+            $ref = ("$($row.MAXIMONR)").Trim()
+            $item = ("$($row.ITEMNUM)").Trim()
+            Add-UomFallback -Raw $resolved.Raw -Detail "MOG linia $lineNo, $ref, $item, $(if ([string]::IsNullOrWhiteSpace($resolved.Raw)) { '(gol)' } else { $resolved.Raw })"
+        }
+
+        $script:mogTotalLines++
+        [void]$script:mogRows.Add([pscustomobject]@{
+            Row = $row
+            QtyText = $qtyAbs.ToString("F3", $script:invariant)
+            MovDate = (Convert-MovementDate $row.DATADOC)
+            Uom = $resolved.Code
+        })
     }
-} else {
-    Write-Warning "Nu a fost gasit niciun fisier UOM*.csv. Unitatiile nemapate vor folosi H87."
 }
 
-$csvFile = Get-ChildItem -Path $scriptDirectory -Filter "EXPORT*" -File |
-           Sort-Object LastWriteTime -Descending |
-           Select-Object -First 1
+Import-ProductRows
+Import-StockRows
+Import-MogRows
 
-if (-not $csvFile) {
-    Write-Error "Nu a fost gasit niciun fisier CSV care sa inceapa cu 'EXPORT' in folderul curent: $scriptDirectory"
-    exit 1
+$movementTypes = @{
+    "10" = "Achizitie"
+    "20" = "Productie"
+    "30" = "Vanzare"
+    "40" = "Retur produse vandute"
+    "50" = "Retur produse achizitionate"
+    "60" = "Reduceri comerciale primite"
+    "70" = "Consum"
+    "80" = "Transfer intern"
+    "90" = "Cheltuieli ulterioare incluse in valoarea de intrare"
+    "100" = "Diferente de pret pozitive"
+    "101" = "Diferente de pret negative"
+    "110" = "Plus de inventar"
+    "120" = "Minus de inventar"
+    "130" = "Ajustari pentru deprecierea stocurilor"
+    "140" = "Reluari de ajustari pentru deprecierea stocurilor"
+    "150" = "Bunuri acordate cu titlu gratuit"
+    "160" = "Bunuri degradate"
+    "170" = "Bunuri expirate"
+    "180" = "Alte tranzactii"
 }
+$sortedMovementKeys = $movementTypes.Keys | Sort-Object { [int]$_ }
 
-$CsvPath = $csvFile.FullName
-Write-Host "Fisier CSV stocuri detectat: $($csvFile.Name)"
-
-$fileName = $csvFile.Name
-$startMatch = [regex]::Match($fileName, 'start_(\d{2})(\d{4})')
-$endMatch   = [regex]::Match($fileName, 'end_(\d{2})(\d{4})')
-
-if (-not $startMatch.Success -or -not $endMatch.Success) {
-    Write-Error "Numele fisierului '$fileName' nu contine start_MMYYYY si end_MMYYYY. Exemplu: EXPORT_start_012026_end_122026.csv. Scriptul se opreste."
-    exit 1
-}
-
-$periodStart = $startMatch.Groups[1].Value
-$periodStartYear = $startMatch.Groups[2].Value
-$periodEnd = $endMatch.Groups[1].Value
-$periodEndYear = $endMatch.Groups[2].Value
-Write-Host "Perioada detectata: Start $periodStart/$periodStartYear - End $periodEnd/$periodEndYear"
-
-$runDate = Get-Date
-$currentDate = $runDate.ToString("yyyyMMdd", $script:invariant)
-$auditFileDateCreated = $runDate.ToString("yyyy-MM-dd", $script:invariant)
-$logDateTime = $runDate.ToString("yyyy-MM-dd HH:mm:ss", $script:invariant)
-$OutputPath = Join-Path $scriptDirectory "SAFT_$currentDate.xml"
-Write-Host "Fisierul SAF-T va fi salvat ca: $OutputPath"
-
-$logPath = Join-Path $scriptDirectory\log "SAFT_Log_$currentDate.txt"
-if (!(Test-Path -Path "$scriptDirectory\log")) {
-    New-Item -ItemType Directory -Path "$scriptDirectory\log" | Out-Null
-}
-
-$script:totalRecords = 0
-$script:successRecords = 0
-$script:skippedRecords = 0
-$script:negativeRecords = 0
-$script:mappedFromIdCount = 0
-$script:alreadyAbbrCount = 0
-$script:fallbackCount = 0
-$script:skippedList = New-Object System.Collections.Generic.List[string]
-$script:negativeList = New-Object System.Collections.Generic.List[string]
-$script:fallbackDetails = New-Object System.Collections.Generic.List[string]
-$script:fallbackRawList = New-Object System.Collections.Generic.List[string]
-$script:fallbackRawSet = @{}
-
-# UOMTable se scrie inainte de PhysicalStock, deci codurile folosite se aduna intr-o prima trecere.
-Import-StockRows -Path $CsvPath -Mode CollectUom
-
-$script:outputStream = [System.IO.StreamWriter]::new($OutputPath, $false, [System.Text.Encoding]::UTF8)
+$glAccountsCopied = $false
+$script:outputStream = $null
 try {
+    $script:outputStream = [System.IO.StreamWriter]::new($OutputPath, $false, [System.Text.Encoding]::UTF8)
     $script:outputStream.WriteLine('<?xml version="1.0" encoding="UTF-8"?>')
     $script:outputStream.WriteLine('<AuditFile xmlns:xsi=''http://www.w3.org/2001/XMLSchema-instance'' xmlns=''mfp:anaf:dgti:d406:declaratie:v1''>')
     $script:outputStream.WriteLine('  <Header>')
@@ -405,8 +593,29 @@ try {
     $script:outputStream.WriteLine('    <TaxEntity>Company</TaxEntity>')
     $script:outputStream.WriteLine('  </Header>')
     $script:outputStream.WriteLine('  <MasterFiles>')
-    $script:outputStream.WriteLine('    <GeneralLedgerAccounts>')
-    $script:outputStream.WriteLine('    </GeneralLedgerAccounts>')
+
+    if ($glAccountsFile) {
+        try {
+            [xml]$glXml = Get-Content -Path $glAccountsFile.FullName -Encoding UTF8
+            $glNode = $glXml.SelectSingleNode("//*[local-name()='GeneralLedgerAccounts']")
+            if ($glNode) {
+                $script:outputStream.WriteLine($glNode.OuterXml)
+                $glAccountsCopied = $true
+            } else {
+                Write-Warning "Nodul <GeneralLedgerAccounts> nu a fost gasit in fisierul $($glAccountsFile.Name)"
+                $script:outputStream.WriteLine('    <GeneralLedgerAccounts>')
+                $script:outputStream.WriteLine('    </GeneralLedgerAccounts>')
+            }
+        } catch {
+            Write-Warning "Eroare la procesarea fisierului GLAccounts: $_"
+            $script:outputStream.WriteLine('    <GeneralLedgerAccounts>')
+            $script:outputStream.WriteLine('    </GeneralLedgerAccounts>')
+        }
+    } else {
+        $script:outputStream.WriteLine('    <GeneralLedgerAccounts>')
+        $script:outputStream.WriteLine('    </GeneralLedgerAccounts>')
+    }
+
     $script:outputStream.WriteLine('    <Customers>')
     $script:outputStream.WriteLine('    </Customers>')
     $script:outputStream.WriteLine('    <Suppliers>')
@@ -420,7 +629,6 @@ try {
             $desc = [string]$script:uomDescriptionByCode[$code]
         }
         if ([string]::IsNullOrWhiteSpace($desc)) {
-            # H87 fara descriere in UOM*.csv: denumirea din nomenclatorul folosit de D406.
             if ($code -eq "H87") { $desc = "Bucata" } else { $desc = $code }
         }
         $codeEsc = Escape-Xml $code
@@ -434,15 +642,41 @@ try {
     $script:outputStream.WriteLine('    <AnalysisTypeTable>')
     $script:outputStream.WriteLine('    </AnalysisTypeTable>')
     $script:outputStream.WriteLine('    <MovementTypeTable>')
+    foreach ($key in $sortedMovementKeys) {
+        $desc = $movementTypes["$key"]
+        $keyEsc = Escape-Xml $key
+        $descEsc = Escape-Xml $desc
+        $script:outputStream.WriteLine('      <MovementTypeTableEntry>')
+        $script:outputStream.WriteLine("        <MovementType>$keyEsc</MovementType>")
+        $script:outputStream.WriteLine("        <Description>$descEsc</Description>")
+        $script:outputStream.WriteLine('      </MovementTypeTableEntry>')
+    }
     $script:outputStream.WriteLine('    </MovementTypeTable>')
     $script:outputStream.WriteLine('    <Products>')
+    foreach ($chunk in $script:productXml) { $script:outputStream.WriteLine($chunk) }
     $script:outputStream.WriteLine('    </Products>')
     $script:outputStream.WriteLine('    <PhysicalStock>')
-
-    Import-StockRows -Path $CsvPath -Mode WriteEntries
-
+    foreach ($chunk in $script:stockXml) { $script:outputStream.WriteLine($chunk) }
     $script:outputStream.WriteLine('    </PhysicalStock>')
     $script:outputStream.WriteLine('    <Owners>')
+    $script:outputStream.WriteLine('      <Owner>')
+    $script:outputStream.WriteLine('        <CompanyStructure>')
+    $script:outputStream.WriteLine('          <RegistrationNumber>0011054545</RegistrationNumber>')
+    $script:outputStream.WriteLine('          <Name>SNTFC CFR CALATORI S.A.</Name>')
+    $script:outputStream.WriteLine('          <Address>')
+    $script:outputStream.WriteLine('            <StreetName>B-dul Dinicu Golescu</StreetName>')
+    $script:outputStream.WriteLine('            <Number>38</Number>')
+    $script:outputStream.WriteLine('            <AdditionalAddressDetail>B-dul Dinicu Golescu</AdditionalAddressDetail>')
+    $script:outputStream.WriteLine('            <Building>Palat CFR</Building>')
+    $script:outputStream.WriteLine('            <City>Bucuresti</City>')
+    $script:outputStream.WriteLine('            <PostalCode>010873</PostalCode>')
+    $script:outputStream.WriteLine('            <Region>RO-B</Region>')
+    $script:outputStream.WriteLine('            <Country>RO</Country>')
+    $script:outputStream.WriteLine('          </Address>')
+    $script:outputStream.WriteLine('        </CompanyStructure>')
+    $script:outputStream.WriteLine('        <OwnerID>0011054545</OwnerID>')
+    $script:outputStream.WriteLine('        <AccountID>1012</AccountID>')
+    $script:outputStream.WriteLine('      </Owner>')
     $script:outputStream.WriteLine('    </Owners>')
     $script:outputStream.WriteLine('    <Assets>')
     $script:outputStream.WriteLine('    </Assets>')
@@ -453,15 +687,72 @@ try {
     $script:outputStream.WriteLine('    <PurchaseInvoices></PurchaseInvoices>')
     $script:outputStream.WriteLine('    <Payments></Payments>')
     $script:outputStream.WriteLine('    <MovementOfGoods>')
+    if ($script:mogRows.Count -gt 0 -or $mogFile) {
+        $receivedText = $script:mogTotalQtyReceived.ToString("F3", $script:invariant)
+        $issuedText = $script:mogTotalQtyIssued.ToString("F3", $script:invariant)
+        $script:outputStream.WriteLine("      <NumberOfMovementLines>$($script:mogTotalLines)</NumberOfMovementLines>")
+        $script:outputStream.WriteLine("      <TotalQuantityReceived>$receivedText</TotalQuantityReceived>")
+        $script:outputStream.WriteLine("      <TotalQuantityIssued>$issuedText</TotalQuantityIssued>")
+        foreach ($entry in $script:mogRows) {
+            $r = $entry.Row
+            $ref = ("$($r.MAXIMONR)").Trim()
+            if ([string]::IsNullOrWhiteSpace($ref)) { $ref = "12345678" }
+            $docNr = ("$($r.NUMARDOC)").Trim()
+            if ([string]::IsNullOrWhiteSpace($docNr)) { $docNr = "12345678" }
+            $docType = ("$($r.ISSUETYPE)").Trim()
+            $itemNum = ("$($r.ITEMNUM)").Trim()
+            $dir = ("$($r.DIRECTIE)").Trim()
+            $movType = "180"
+            if ($dir -eq "Intrare") { $movType = "10" }
+            elseif ($dir -eq "Iesire") { $movType = "70" }
+            $refEsc = Escape-Xml $ref
+            $docNrEsc = Escape-Xml $docNr
+            $docTypeEsc = Escape-Xml $docType
+            $itemNumEsc = Escape-Xml $itemNum
+            $uomEsc = Escape-Xml $entry.Uom
+            $qty = $entry.QtyText
+            $movDateXml = $entry.MovDate
+            $stockMovement = @"
+      <StockMovement>
+        <MovementReference>$refEsc</MovementReference>
+        <MovementDate>$movDateXml</MovementDate>
+        <MovementType>$movType</MovementType>
+        <DocumentReference>
+          <DocumentType>$docTypeEsc</DocumentType>
+          <DocumentNumber>$docNrEsc</DocumentNumber>
+        </DocumentReference>
+        <StockMovementLine>
+          <LineNumber>1</LineNumber>
+          <AccountID>1011</AccountID>
+          <CustomerID>0011054545</CustomerID>
+          <SupplierID>0011054545</SupplierID>
+          <ProductCode>$itemNumEsc</ProductCode>
+          <Quantity>$qty</Quantity>
+          <UnitOfMeasure>$uomEsc</UnitOfMeasure>
+          <UOMToUOMPhysicalStockConversionFactor>1.0</UOMToUOMPhysicalStockConversionFactor>
+          <MovementSubType>$movType</MovementSubType>
+        </StockMovementLine>
+      </StockMovement>
+"@
+            $script:outputStream.WriteLine($stockMovement)
+        }
+    } else {
+        $script:outputStream.WriteLine("      <NumberOfMovementLines>0</NumberOfMovementLines>")
+        $script:outputStream.WriteLine("      <TotalQuantityReceived>0.000</TotalQuantityReceived>")
+        $script:outputStream.WriteLine("      <TotalQuantityIssued>0.000</TotalQuantityIssued>")
+    }
     $script:outputStream.WriteLine('    </MovementOfGoods>')
     $script:outputStream.WriteLine('  </SourceDocuments>')
     $script:outputStream.WriteLine('</AuditFile>')
 } finally {
-    if ($null -ne $script:outputStream) {
-        $script:outputStream.Close()
-    }
+    if ($null -ne $script:outputStream) { $script:outputStream.Close() }
 }
 
+$logDirectory = Join-Path $scriptDirectory "log"
+if (!(Test-Path -Path $logDirectory)) {
+    New-Item -ItemType Directory -Path $logDirectory | Out-Null
+}
+$logPath = Join-Path $logDirectory "SAFT_Log_$currentDate.txt"
 $distinctFallback = ($script:fallbackRawList -join ", ")
 if ([string]::IsNullOrWhiteSpace($distinctFallback)) { $distinctFallback = "-" }
 
@@ -469,21 +760,31 @@ $logLines = New-Object System.Collections.Generic.List[string]
 [void]$logLines.Add("Data si ora rularii: $logDateTime")
 [void]$logLines.Add("Fisier CSV stocuri procesat: $($csvFile.Name)")
 if ($uomFile) { [void]$logLines.Add("Fisier UOM utilizat: $($uomFile.Name)") }
+if ($inventoryFile) { [void]$logLines.Add("Fisier INVENTORY utilizat: $($inventoryFile.Name)") }
+if ($glAccountsFile) { [void]$logLines.Add("Fisier GLAccounts utilizat: $($glAccountsFile.Name)") }
+if ($mogFile) { [void]$logLines.Add("Fisier MOG utilizat: $($mogFile.Name)") }
 [void]$logLines.Add("Perioada raportata: $periodStart/$periodStartYear - $periodEnd/$periodEndYear")
 [void]$logLines.Add("Fisier XML generat: $(Split-Path $OutputPath -Leaf)")
 [void]$logLines.Add("Data crearii din antet: $auditFileDateCreated")
 [void]$logLines.Add("")
 [void]$logLines.Add("Statistici procesare:")
 [void]$logLines.Add("---------------------")
-[void]$logLines.Add("Numar total inregistrari procesate: $($script:totalRecords)")
-[void]$logLines.Add("Inregistrari scrise in XML: $($script:successRecords)")
+[void]$logLines.Add("Numar total inregistrari procesate (stocuri): $($script:totalRecords)")
+[void]$logLines.Add("Inregistrari stoc scrise in XML: $($script:successRecords)")
 [void]$logLines.Add("Inregistrari sarite (MAGAZIE sau COD_PRODUS gol): $($script:skippedRecords)")
-[void]$logLines.Add("Unitati traduse din MEASUREUNITID: $($script:mappedFromIdCount)")
-[void]$logLines.Add("Unitati deja cod DUK (ABBREVIATION): $($script:alreadyAbbrCount)")
+[void]$logLines.Add("Conturi contabile copiate din XML extern: $(if ($glAccountsCopied) {'DA'} else {'NU'})")
+[void]$logLines.Add("Numar produse unice adaugate in MasterFiles: $($script:totalProducts)")
+[void]$logLines.Add("Articole cu aceeasi cod si unitati diferite (pastrata prima): $($script:productConflicts)")
+[void]$logLines.Add("Linii produs necitibile: $($script:badProductLines)")
+[void]$logLines.Add("Unitati stoc traduse din MEASUREUNITID: $($script:mappedFromIdCount)")
+[void]$logLines.Add("Unitati stoc deja cod DUK (ABBREVIATION): $($script:alreadyAbbrCount)")
 [void]$logLines.Add("Inregistrari cu UOM in fallback H87: $($script:fallbackCount)")
 [void]$logLines.Add("UOM distincte trimise in fallback H87: $distinctFallback")
 [void]$logLines.Add("Valori numerice neparsabile: $($script:unparseableCount)")
 [void]$logLines.Add("Inregistrari cu valori negative: $($script:negativeRecords)")
+[void]$logLines.Add("Numar tranzactii MovementOfGoods (linii MOG): $($script:mogTotalLines)")
+[void]$logLines.Add("Total cantitate Intrari (MOG): $($script:mogTotalQtyReceived.ToString('F3', $script:invariant))")
+[void]$logLines.Add("Total cantitate Iesiri (MOG): $($script:mogTotalQtyIssued.ToString('F3', $script:invariant))")
 [void]$logLines.Add("")
 
 if ($script:skippedRecords -gt 0) {
@@ -491,24 +792,45 @@ if ($script:skippedRecords -gt 0) {
     $logLines.AddRange($script:skippedList)
     [void]$logLines.Add("")
 }
-
 if ($script:fallbackCount -gt 0) {
-    [void]$logLines.Add("Detalii UOM in fallback H87 (MAGAZIE, COD_PRODUS, UOM original):")
+    [void]$logLines.Add("Detalii UOM in fallback H87 (MAGAZIE, COD_PRODUS, UOM original sau produs/MOG):")
     $logLines.AddRange($script:fallbackDetails)
     [void]$logLines.Add("")
 }
-
 if ($script:unparseableCount -gt 0) {
     [void]$logLines.Add("Valorile neparsabile sunt scrise in XML ca 0.00 (pret/valoare) sau 0.000 (cantitate).")
     [void]$logLines.Add("Detalii valori neparsabile (linia, coloana, valoarea):")
     $logLines.AddRange($script:unparseableList)
     [void]$logLines.Add("")
 }
-
 if ($script:negativeRecords -gt 0) {
     [void]$logLines.Add("Detalii inregistrari negative (MAGAZIE, COD_PRODUS, PRET, STOC_INI, VAL_INI, STOC_FIN, VAL_FIN):")
     $logLines.AddRange($script:negativeList)
+    [void]$logLines.Add("")
 }
+
+[void]$logLines.Add("Reguli de mapare pentru fisierele CSV:")
+[void]$logLines.Add("--------------------------------------")
+[void]$logLines.Add("1) Fisier EXPORT* (stocuri):")
+[void]$logLines.Add("   - UNITATE_MASURA se traduce din MEASUREUNITID in ABBREVIATION daca exista in UOM*.csv.")
+[void]$logLines.Add("   - Daca valoarea este deja o ABBREVIATION din UOM*.csv, ramane neschimbata.")
+[void]$logLines.Add("   - Daca este goala sau necunoscuta, in XML se foloseste H87 si randul intra in log.")
+[void]$logLines.Add("   - Pretul si valorile au 2 zecimale. Cantitatile au 3 zecimale. Separatorul zecimal din XML este punctul.")
+[void]$logLines.Add("   - Randurile fara MAGAZIE sau COD_PRODUS sunt sarite si scrise in log.")
+[void]$logLines.Add("2) Fisier INVENTORY* (Products):")
+[void]$logLines.Add("   - ITEMNUM -> ProductCode. DESCRIPTION -> Description.")
+[void]$logLines.Add("   - ABBREVIATION -> UOMBase si UOMStandard, cu aceleasi reguli de fallback H87.")
+[void]$logLines.Add("   - ProductCommodityCode este fix 99500000.")
+[void]$logLines.Add("   - Codurile duplicate de produs se scriu o singura data; daca unitatea difera, se pastreaza prima.")
+[void]$logLines.Add("3) Fisier UOM* (UOMTable):")
+[void]$logLines.Add("   - Intra doar codurile folosite in Products, PhysicalStock si MovementOfGoods, fiecare o singura data.")
+[void]$logLines.Add("4) Fisier GLAccounts* (plan de conturi):")
+[void]$logLines.Add("   - Scriptul copiaza sectiunea GeneralLedgerAccounts din acest XML in MasterFiles.")
+[void]$logLines.Add("5) Fisier MOG* (MovementOfGoods):")
+[void]$logLines.Add("   - DIRECTIE Intrare -> tip 10; Iesire -> tip 70; altfel 180.")
+[void]$logLines.Add("   - QUANTITY este pozitiva, cu 3 zecimale si punct zecimal.")
+[void]$logLines.Add("   - ABBREVIATION urmeaza aceleasi reguli UOM; gol sau necunoscut devine H87.")
+[void]$logLines.Add("")
 
 $logLines | Out-File -FilePath $logPath -Encoding UTF8
 
