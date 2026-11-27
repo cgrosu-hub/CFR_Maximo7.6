@@ -114,7 +114,11 @@ function Convert-MovementDate {
     param([string]$Value)
     $raw = ("$Value").Trim()
     if ([string]::IsNullOrWhiteSpace($raw)) { return "" }
+    # MOG din Excel: 3/5/2026 12:00:00 AM si 8/10/2026 1:50:00 PM (luna/zi).
     $formats = @(
+        "M/d/yyyy h:mm:ss tt",
+        "M/d/yyyy hh:mm:ss tt",
+        "MM/dd/yyyy h:mm:ss tt",
         "yyyy-MM-dd",
         "yyyy-MM-dd HH:mm:ss",
         "yyyy-MM-ddTHH:mm:ss",
@@ -133,6 +137,10 @@ function Convert-MovementDate {
         } catch {
             continue
         }
+    }
+    if ($null -ne $script:badDateList) {
+        $script:badDateCount++
+        [void]$script:badDateList.Add($raw)
     }
     return $raw
 }
@@ -188,7 +196,11 @@ if ($SelfTest) {
     if ($bad -ne "0.00" -or $script:unparseableCount -ne 1) { throw "Valoarea neparsabila nu a fost jurnalizata." }
     if (($amount + $amountDot + $quantity + $negativeQty) -match ",") { throw "Un numar formatat contine virgula." }
     $when = Convert-MovementDate "06.10.2026"
+    $us = Convert-MovementDate "3/5/2026 12:00:00 AM"
+    $pm = Convert-MovementDate "8/10/2026 1:50:00 PM"
     if ($when -ne "2026-10-06") { throw "Data 06.10.2026 a devenit '$when'." }
+    if ($us -ne "2026-03-05") { throw "Data Excel AM a devenit '$us'." }
+    if ($pm -ne "2026-08-10") { throw "Data Excel PM a devenit '$pm'." }
 
     $script:uomMapping = @{ BUC = "H87"; KG = "KGM"; BARA = "XBZ" }
     $script:uomCodes = @{ H87 = $true; KGM = $true; XBZ = $true }
@@ -241,6 +253,8 @@ $script:mogRows = New-Object System.Collections.Generic.List[object]
 $script:mogTotalLines = 0
 $script:mogTotalQtyReceived = [double]0
 $script:mogTotalQtyIssued = [double]0
+$script:badDateCount = 0
+$script:badDateList = New-Object System.Collections.Generic.List[string]
 $script:stockHeader = @("SITEID","GESTIUNE_BALANTA","MAGAZIE","TIP_GESTIUNE","COD_PRODUS","DESCRIERE_PRODUS","UNITATE_MASURA","PRET_UNITAR","STOC_INITIAL","VALOARE_INITIALA","CANTITATE_INTRATA","CANTITATE_IESITA","STOC_FINAL","VALOARE_FINALA")
 $script:inventoryHeader = @("ITEMNUM","DESCRIPTION","ISSUEUNIT","ABBREVIATION")
 $script:mogHeader = @("CXCREDITOBINV","CXDEBITOBINV","MAXIMONR","DENUMIRE","DIRECTIE","COMMODITYGROUP","ITEMNUM","UNITCOST","LINECOST","RECEIVEDUNIT","ABBREVIATION","QUANTITY","TOSTORELOC","FROMSTORELOC","ISSUETYPE","DATAINTRAREIESIRE","NUMARDOC","DATADOC","NRFACT","DATAFACT","GLDEBITACCT","GLCREDITACCT")
@@ -785,6 +799,7 @@ if ($mogFile) { [void]$logLines.Add("Fisier MOG utilizat: $($mogFile.Name)") }
 [void]$logLines.Add("Numar tranzactii MovementOfGoods (linii MOG): $($script:mogTotalLines)")
 [void]$logLines.Add("Total cantitate Intrari (MOG): $($script:mogTotalQtyReceived.ToString('F3', $script:invariant))")
 [void]$logLines.Add("Total cantitate Iesiri (MOG): $($script:mogTotalQtyIssued.ToString('F3', $script:invariant))")
+[void]$logLines.Add("Date de miscare neconvertite la yyyy-MM-dd: $($script:badDateCount)")
 [void]$logLines.Add("")
 
 if ($script:skippedRecords -gt 0) {
@@ -801,6 +816,11 @@ if ($script:unparseableCount -gt 0) {
     [void]$logLines.Add("Valorile neparsabile sunt scrise in XML ca 0.00 (pret/valoare) sau 0.000 (cantitate).")
     [void]$logLines.Add("Detalii valori neparsabile (linia, coloana, valoarea):")
     $logLines.AddRange($script:unparseableList)
+    [void]$logLines.Add("")
+}
+if ($script:badDateCount -gt 0) {
+    [void]$logLines.Add("Detalii date de miscare neconvertite (valoarea din DATADOC):")
+    $logLines.AddRange($script:badDateList)
     [void]$logLines.Add("")
 }
 if ($script:negativeRecords -gt 0) {
