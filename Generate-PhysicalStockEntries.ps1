@@ -255,6 +255,8 @@ $script:mogTotalQtyReceived = [double]0
 $script:mogTotalQtyIssued = [double]0
 $script:badDateCount = 0
 $script:badDateList = New-Object System.Collections.Generic.List[string]
+$script:longDocCount = 0
+$script:longDocList = New-Object System.Collections.Generic.List[string]
 $script:stockHeader = @("SITEID","GESTIUNE_BALANTA","MAGAZIE","TIP_GESTIUNE","COD_PRODUS","DESCRIERE_PRODUS","UNITATE_MASURA","PRET_UNITAR","STOC_INITIAL","VALOARE_INITIALA","CANTITATE_INTRATA","CANTITATE_IESITA","STOC_FINAL","VALOARE_FINALA")
 $script:inventoryHeader = @("ITEMNUM","DESCRIPTION","ISSUEUNIT","ABBREVIATION")
 $script:mogHeader = @("CXCREDITOBINV","CXDEBITOBINV","MAXIMONR","DENUMIRE","DIRECTIE","COMMODITYGROUP","ITEMNUM","UNITCOST","LINECOST","RECEIVEDUNIT","ABBREVIATION","QUANTITY","TOSTORELOC","FROMSTORELOC","ISSUETYPE","DATAINTRAREIESIRE","NUMARDOC","DATADOC","NRFACT","DATAFACT","GLDEBITACCT","GLCREDITACCT")
@@ -713,6 +715,11 @@ try {
             if ([string]::IsNullOrWhiteSpace($ref)) { $ref = "12345678" }
             $docNr = ("$($r.NUMARDOC)").Trim()
             if ([string]::IsNullOrWhiteSpace($docNr)) { $docNr = "12345678" }
+            if ($docNr.Length -gt 35) {
+                $script:longDocCount++
+                [void]$script:longDocList.Add("$docNr")
+                $docNr = $docNr.Substring(0, 35)
+            }
             $docType = ("$($r.ISSUETYPE)").Trim()
             $itemNum = ("$($r.ITEMNUM)").Trim()
             $dir = ("$($r.DIRECTIE)").Trim()
@@ -800,6 +807,7 @@ if ($mogFile) { [void]$logLines.Add("Fisier MOG utilizat: $($mogFile.Name)") }
 [void]$logLines.Add("Total cantitate Intrari (MOG): $($script:mogTotalQtyReceived.ToString('F3', $script:invariant))")
 [void]$logLines.Add("Total cantitate Iesiri (MOG): $($script:mogTotalQtyIssued.ToString('F3', $script:invariant))")
 [void]$logLines.Add("Date de miscare neconvertite la yyyy-MM-dd: $($script:badDateCount)")
+[void]$logLines.Add("Numere de document taiate la 35 de caractere: $($script:longDocCount)")
 [void]$logLines.Add("")
 
 if ($script:skippedRecords -gt 0) {
@@ -816,6 +824,11 @@ if ($script:unparseableCount -gt 0) {
     [void]$logLines.Add("Valorile neparsabile sunt scrise in XML ca 0.00 (pret/valoare) sau 0.000 (cantitate).")
     [void]$logLines.Add("Detalii valori neparsabile (linia, coloana, valoarea):")
     $logLines.AddRange($script:unparseableList)
+    [void]$logLines.Add("")
+}
+if ($script:longDocCount -gt 0) {
+    [void]$logLines.Add("Detalii numere de document taiate la 35 de caractere (valoarea originala):")
+    $logLines.AddRange($script:longDocList)
     [void]$logLines.Add("")
 }
 if ($script:badDateCount -gt 0) {
@@ -850,6 +863,7 @@ if ($script:negativeRecords -gt 0) {
 [void]$logLines.Add("   - DIRECTIE Intrare -> tip 10; Iesire -> tip 70; altfel 180.")
 [void]$logLines.Add("   - QUANTITY este pozitiva, cu 3 zecimale si punct zecimal.")
 [void]$logLines.Add("   - ABBREVIATION urmeaza aceleasi reguli UOM; gol sau necunoscut devine H87.")
+[void]$logLines.Add("   - NUMARDOC mai lung de 35 de caractere este taiat la 35, limita DUK pentru DocumentNumber.")
 [void]$logLines.Add("")
 
 $logLines | Out-File -FilePath $logPath -Encoding UTF8
